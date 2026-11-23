@@ -9,12 +9,12 @@ One run per invocation against the pinned, inspected v1 oracle
 2. Producers. In the fixture profile the filler editor F (the IPC primary) starts first,
    then the older editor O, a --new-instance peer sharing F's DATA. With both alive, O
    holds c0 c1 m c2 plus an untitled marker, with m and the untitled tab dirty (U = 2),
-   and hot-exits. F then admits exactly C - U - 1 clean files and hot-exits last, so its
-   journal is the newer source.
+   and hot-exits. F then admits exactly C - U - 1 clean files and hot-exits last. The case
+   then stamps F's journal newer than O's and verifies both stamps as setup.
 3. Restore. An argument-free relaunch restores F whole and O under pressure. The case
-   observes the notice, walks every live tab with Ctrl+PageDown, copies the dirty tabs,
-   names the surviving and dropped clean tabs by path, SIGKILLs that editor, relaunches and
-   walks again.
+   reads the notice on the full-width status row, walks every live tab with Ctrl+PageDown,
+   copies the dirty tabs, names the surviving and dropped clean tabs by path, SIGKILLs that
+   editor, relaunches and walks again.
 
 Which clean tab survives is v1's stated rule, not "some": plan_partial in v1
 src/editor/recovery.c keeps unmodified tabs "in recorded tab order" (the last TABS record),
@@ -45,6 +45,7 @@ from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
 from cases.files import (GEOMETRY, SCREEN, WATCHDOG, Snapshots, describe, document_rows,
                          exited, private_display, tab_strip)
 from cases.navigation import stop
+from cases.recovery import copied_text
 import records
 from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 from test_oracle_inspector import GUARD
@@ -169,12 +170,19 @@ class Case:
         self.results.append(status)
 
     def check(self, assertion, observed, expected, wrong=None):
-        """Compare once, in inventory order; the first failure is final."""
+        """Compare once, in inventory order; the first failure is final.
+
+        A red control is credited only from a healthy run: its observation must first meet
+        the ordinary expectation, and only then is it compared with the wrong one."""
         if assertion in self.asserted or ASSERTIONS[len(self.asserted)] != assertion:
             raise Refused(f"assertion {assertion} out of inventory order")
+        self.observed, self.expected = observed, expected
+        if self.negative == assertion:
+            if observed != expected:
+                raise Refused(f"{assertion}: the control's observation fails the ordinary "
+                              "expectation, so its red would not be the deliberate one")
+            self.expected = wrong
         self.asserted.append(assertion)
-        self.observed = observed
-        self.expected = wrong if self.negative == assertion else expected
         if self.observed != self.expected:
             raise Mismatch(f"{assertion}: observed value differs from expectation")
         self.emit(assertion, "PASS", assertion)
@@ -247,15 +255,16 @@ class Editor:
         Tab identities are unique by fixture construction (title and first row), so the
         first repeat closes the ring. Off-strip tabs are visited, not inferred."""
         first = self.tab(self.frame())
-        walked = [first]
+        walked, seen = [first], {first}
         for _ in range(bound):
             self.driver.chord("Control_L", "Next")
             current = self.tab(self.frame())
             if current == first:
                 return walked
-            if current in walked:
+            if current in seen:
                 raise Refused(f"{self.role}: tab ring repeats {current!r} before its start")
             walked.append(current)
+            seen.add(current)
         raise Refused(f"{self.role}: tab ring did not close within {bound} steps")
 
     def steps(self, walked, start, index):
@@ -277,16 +286,12 @@ class Editor:
         return data
 
     def copy(self):
-        """Select All, Copy and read CLIPBOARD from the editor after its frame settles."""
-        sentinel = self.driver.own("CLIPBOARD", b"copy observation pending")
-        self.driver.chord("Control_L", "a")
-        self.driver.chord("Control_L", "c")
-        self.frame()  # the reply follows the disposed Copy
-        owner = self.driver.owner("CLIPBOARD")
-        if owner != self.window:
-            raise Refused(f"{self.role}: CLIPBOARD owner {owner:#x} after Copy "
-                          f"(window {self.window:#x}, sentinel {sentinel:#x})")
-        return self.driver.read("CLIPBOARD", self.window, WAIT_MS)
+        """One Select All and Copy, then CLIPBOARD read from this editor's window.
+
+        A snapshot reply does not order the editor's SetSelectionOwner against the driver's
+        query at the X server, so this waits on the ownership transition (recovery's bounded
+        wait: a third owner or watchdog expiry is ERROR)."""
+        return copied_text(self.driver, self.window)
 
     def type_text(self, text):
         for char in text:
@@ -462,8 +467,20 @@ def producers(case, sandbox, driver, stack, capacity, fill):
     filler_journal = filler.hot_exit()
     filler_bytes = filler_source.read_bytes()
     (case.artifacts / "filler-source.journal").write_bytes(filler_bytes)
-    older_mtime = older_source.stat().st_mtime_ns
-    filler_mtime = filler_source.stat().st_mtime_ns
+    # Setup, not editor behavior: discovery restores the newest source first by st_mtim in ns,
+    # ties broken by path (P, v1 src/editor/recovery.c newer_source, src/os/os_posix.c ts_ns).
+    # F's last write follows O's exit causally, but a tied stamp or a clock step can hide that,
+    # so with both producers exited the case stamps the order: whole seconds one apart, which
+    # any Linux filesystem with at most 1 s granularity stores exactly. A stamp read back
+    # differently is ERROR.
+    stamped = max(older_source.stat().st_mtime_ns, filler_source.stat().st_mtime_ns)
+    older_mtime = stamped - stamped % 1_000_000_000
+    filler_mtime = older_mtime + 1_000_000_000
+    os.utime(older_source, ns=(older_mtime, older_mtime))
+    os.utime(filler_source, ns=(filler_mtime, filler_mtime))
+    if (older_source.stat().st_mtime_ns, filler_source.stat().st_mtime_ns) != \
+            (older_mtime, filler_mtime):
+        raise Refused("producer journal stamps did not read back as set")
 
     # The older ring as a cycle starting at c0; the untitled tab's title is v1's own.
     names = [UNTITLED if title not in dict(OLDER) else title for title, _ in older_ring]
@@ -479,7 +496,6 @@ def producers(case, sandbox, driver, stack, capacity, fill):
         "filler_admitted": admitted,
         "filler_last": list(filler_last),
         "filler_journal": filler_journal == filler_source,
-        "filler_newer": filler_mtime > older_mtime,
         "below_startup_scan": max(len(older_bytes), len(filler_bytes)) < STARTUP_SCAN_BYTES,
     }
     expected = {
@@ -490,7 +506,7 @@ def producers(case, sandbox, driver, stack, capacity, fill):
                        UNTITLED: untitled_marker},
         "older_journal": True, "filler_admitted": fill,
         "filler_last": [filler_name(fill - 1), content(filler_name(fill - 1)).decode()],
-        "filler_journal": True, "filler_newer": True, "below_startup_scan": True,
+        "filler_journal": True, "below_startup_scan": True,
     }
     case.facts["producers"] = {
         "older_source": older_source.name, "older_bytes": len(older_bytes),
@@ -500,7 +516,7 @@ def producers(case, sandbox, driver, stack, capacity, fill):
         "older_ring_raw": older_ring,
     }
     case.check("producers-admitted", observed, expected)
-    return disk, expected_dirty, older_source, older_bytes, filler_source
+    return disk, expected_dirty, older_source, older_bytes, filler_source, older_ring
 
 
 def classify(walked):
@@ -523,8 +539,24 @@ def classify(walked):
     return fillers, older_clean, dirty, other
 
 
+def status_row(frame, dropped):
+    """The notice as the pin's status row shows it, with geometry established independently.
+
+    v1 sizes the grid as window / cell (P, src/editor/editor.c, below its max_cols clamp) and
+    gives the status the grid's last row (P, src/editor/paint.c editor_status_overlay), which
+    the inspector reports as (0, rows - 1, columns, 1). The text is read from that row and the
+    notice clipped to that width, so an empty, short or misplaced rectangle cannot match."""
+    columns = frame.window_width // frame.cell_width
+    rect = frame.bottom_row
+    observed = {"columns": frame.columns, "bottom_row": [rect.x, rect.y, rect.width, rect.height],
+                "text": frame.cell_text(frame.rows - 1).rstrip(" ")}
+    expected = {"columns": columns, "bottom_row": [0, frame.rows - 1, columns, 1],
+                "text": NOTICE.format(u=UNSAVED, d=dropped)[:columns].rstrip(" ")}
+    return observed, expected
+
+
 def restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
-            older_source, older_bytes, filler_source):
+            older_source, older_bytes, filler_source, older_ring):
     """Phase 3: the pressured relaunch, then a SIGKILL and a second relaunch."""
     room_clean = capacity - fill - UNSAVED  # live room left once F and every unsaved tab fit
     case.step("restore: argument-free relaunch under pressure")
@@ -532,25 +564,31 @@ def restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
     first.bind(driver)
     sandbox.record_server()
     frame = first.frame()
-    notice = frame.bottom_row_text().rstrip(" ")
-    columns = frame.bottom_row.width
     data_after = sorted(p.name for p in sandbox.data_dir.iterdir())
     walked = first.ring(capacity + 1)
     (case.artifacts / "restored-ring.json").write_text(json.dumps(walked) + "\n")
     fillers, older_clean, dirty, other = classify(walked)
+    dropped = len(OLDER_CLEAN) - len(older_clean)
+    notice, notice_expected = status_row(frame, dropped)
     case.facts["restored"] = {"live": len(walked), "fillers": len(fillers),
                               "older_clean": older_clean, "dirty_positions": dirty,
-                              "unclassified": other, "notice": notice, "columns": columns,
-                              "data_dir": data_after}
+                              "unclassified": other, "notice": notice, "data_dir": data_after}
+    admitted_fillers = [filler_name(i) for i in range(fill)]
+    if case.negative == "no-pressure":
+        # The control is credited only from the exact unpressured restore under ample C: both
+        # fillers and all five older tabs with their identities and dirty rows. Anything else
+        # (a dropped dirty tab, a wrong filler) is not the deliberate red.
+        whole = sorted([(name, content(name).decode()) for name in admitted_fillers] + older_ring)
+        if capacity <= len(whole) or sorted(walked) != whole:
+            raise Refused(f"no-pressure control: restored {sorted(walked)!r}, not the "
+                          f"unpressured {whole!r} under C = {capacity}")
     case.check("partial-restore-triggered",
-               {"live": len(walked), "fillers": len(fillers),
+               {"live": len(walked), "fillers": sorted(fillers),
                 "older_restored_whole": len(older_clean) == len(OLDER_CLEAN) and len(dirty) == 2,
                 "unclassified": other},
-               {"live": capacity, "fillers": fill, "older_restored_whole": False,
+               {"live": capacity, "fillers": admitted_fillers, "older_restored_whole": False,
                 "unclassified": []})
-    dropped = len(OLDER_CLEAN) - len(older_clean)
-    case.check("notice-visible", notice,
-               NOTICE.format(u=UNSAVED, d=dropped)[:columns].rstrip(" "))
+    case.check("notice-visible", notice, notice_expected)
     copies = {key: first.copy_at(walked, dirty[key]) if key in dirty else None
               for key in (DIRTY_FILE, UNTITLED)}
     case.check("dirty-restored", copies, expected_dirty)
@@ -636,16 +674,14 @@ def scenario(case, target, display, auth):
         driver = stack.enter_context(XDriver(BUILD / "xdriver", display, env=sandbox.env,
                                              timeout=WATCHDOG * 2))
         try:
-            disk, expected_dirty, older_source, older_bytes, filler_source = producers(
-                case, sandbox, driver, stack, capacity, fill)
-            last = restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
-                           older_source, older_bytes, filler_source)
+            last = restore(case, sandbox, driver, stack, capacity, fill,
+                           *producers(case, sandbox, driver, stack, capacity, fill))
             counts = {"relaunched": last.law2()}
             case.facts["law2"] = counts
             # Count rule (wave0-contract-design.md): v1 measured 0 over the relaunched editor's
             # tab-walk and copy windows (run contract-capacity-v8wtgv9p: 1007 scopes), so the
             # count is asserted on v1 as on v2.
-            case.check("law2-count", counts["relaunched"]["allocations"], 0, wrong=1)
+            case.check("law2-count", counts["relaunched"]["allocations"], 0)
         finally:
             if sandbox.data_dir.exists():
                 shutil.copytree(sandbox.data_dir, case.artifacts / "data")

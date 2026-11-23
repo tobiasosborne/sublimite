@@ -118,3 +118,42 @@ R4 assumes a **discoverable live-tab capacity refusal through a public open**. A
 
 - v1's handoff cost rises linearly with the live tab count (above), so filling 1000 tabs is quadratic. That is not a trial-use defect at Tobias's tab counts; it is noted for the v2 open path.
 - The copy observation reads `GetSelectionOwner` after the snapshot reply. The editor flushed its `SetSelectionOwner` before submitting, but cross-client ordering at the X server is not a protocol guarantee. A mismatch is ERROR (fail closed), never a pass.
+
+## W0.7-B4 · 2026-11-23: R4 defects from the Wave 0 review (v2-he7.30)
+
+Findings 5, 6, 7, 14, 26 (capacity part) and 33 of `docs/reviews/wave0-code-astra.md`. Only `tests/contract/cases/capacity.py` changed. Assertion IDs are unchanged, so `expectations.json` is untouched.
+
+**Superseded above.** The `producers-admitted` predicate no longer includes "F newer", and the last bullet of *Observed, not fixed* (the one-shot `GetSelectionOwner`) is fixed here. The rest of the section stands.
+
+- **5 · notice geometry.** `notice-visible` used to take its expected prefix length from the reported bottom rectangle. An empty rectangle, which is legal on the wire, therefore certified an empty notice, and a one-cell rectangle certified "r". The case now establishes the status row independently: columns = window width ÷ cell width (P, v1 `src/editor/editor.c`, below its `max_cols` clamp), and the row is the grid's last row (P, `src/editor/paint.c` `editor_status_overlay`: "one owner for the last row"). It requires the reported rectangle to equal `(0, rows − 1, columns, 1)` and the grid width to equal `columns`. It reads the text from that row and clips the notice to that width. On the pin (M, run `contract-capacity-ppr038av`) this is `(0, 43, 96, 1)`, 96 columns.
+- **6 · admitted filler set.** `partial-restore-triggered` compares the sorted filler titles with `filler_name(i)` for `i < fill`, not with their count. The `second-recovery` comparison with the first restore is kept as an independent persistence check.
+- **7 · Copy ordering.** `Editor.copy` is now recovery's `copied_text`. It sends one Select All and one Copy, then waits for the CLIPBOARD owner to move from the sentinel (or 0) to the editor's window, within the 15 s watchdog. It then reads from that window. A third owner is ERROR (`Refused`), and so is expiry (`TimeoutError`). The snapshot drain before the owner query is gone: the ownership transition is the completion event.
+- **14 · reds reach their cause only.**
+  - Discovery orders sources by `st_mtim` in ns with a path tie-break (P, `recovery.c` `newer_source`, `os_posix.c` `ts_ns`). Once both producers have exited, the case stamps O = ⌊max(both)⌋ to the whole second and F = O + 1 s. It reads both back as setup, and a mismatch is ERROR. Whole seconds survive any filesystem granularity up to 1 s, and a 1 s step orders them in ns. "F newer" is no longer scored as editor behavior.
+  - The no-pressure control first requires the exact unpressured ring under ample C. That ring is both fillers plus all five older tabs, with their (title, first row) identities and dirty rows; C > 7 here. Anything else is ERROR at `partial-restore-triggered`, and only then does the pressure expectation get contradicted.
+  - Generally (`Case.check`), a `--negative` assertion must first meet the ordinary expectation before its wrong expectation is credited. Otherwise it is ERROR at that ID. This covers the swapped-survivor red: c0 admitted and active, c1 and c2 refused for capacity.
+- **26.** `law2-count` lost its unreachable `wrong=1`. `NEGATIVES` cannot select it.
+- **33.** `Editor.ring` keeps the ordered list for indexing and tests membership in a set.
+
+**Red → green.** The scratch harness fakes the editor, driver, sandbox and handoffs around the case's own `producers`, `restore`, `Case.check`, `Editor.copy` and `Editor.ring`. Against the pre-change file, 4 of 15 required outcomes held. After the change, 15 of 15 held:
+
+| proof | before | after |
+|---|---|---|
+| 5 zero-width / one-cell / misplaced notice rectangle | all 10 PASS | FAIL `notice-visible` |
+| 6 f0010 → f1999 on both restores, counts unchanged | all 10 PASS | FAIL `partial-restore-triggered` |
+| 14 no-pressure, equal / reversed producer mtimes | FAIL `producers-admitted` | FAIL `partial-restore-triggered`, live 7, two PASS before it |
+| 14 no-pressure, a dirty tab dropped / a wrong filler | FAIL `partial-restore-triggered` (credited) | ERROR `partial-restore-triggered` |
+| 14 swapped-survivor on an editor keeping c1 | FAIL (credited) | ERROR `clean-survivor-tab-order` |
+| 7 owner held at the sentinel for two queries, then transferred | ERROR after one query | PASS, one Copy, read bound to the window |
+| 7 expiry | ERROR (`Refused`, one query) | ERROR (`TimeoutError` at the watchdog) |
+
+Unchanged in both versions: a third owner is ERROR, the healthy swapped and no-pressure reds FAIL, and the ring traces for a full 1000-tab ring and a duplicate before the start match. 26 and 33 do not change behavior. Their proof is that the CLI cannot select `law2-count` and that the traces are identical.
+
+**Oracle runs** (pin as above; displays :195–:197; [AC] Charging; load from other workers on the box):
+
+| run | power, load | outcome |
+|---|---|---|
+| `contract-capacity-t65c2vxw` green, `contract-capacity-h6901idi` swapped (concurrent with the next) | Charging, 6.5–17 | ERROR `producers-admitted`: fill handoffs 017 and 012 answered `running instance did not respond before the timeout`. Three 1000-tab fills ran at once under a load of 12–17, and v1's 2000 ms forwarding bound (see *Batch size*) expired. Harness load, not the change; serial reruns below |
+| `contract-capacity-g2jzwhze` red, no pressure | Charging, 6.5 | FAIL `partial-restore-triggered`: live 7 ≠ 1000, fillers `f0000 f0001`, older session whole. `capacity-measured` and `producers-admitted` PASS. The exact-ring precondition held. Stamps O = 1795461730 s, F = O + 1 s |
+| `contract-capacity-ppr038av` green | Charging, 17.8 | PASS ×10 in 399 s; C = 1000; notice row `(0, 43, 96, 1)`; law-2 0 over 1006 scopes |
+| `contract-capacity-m5taeqde` red, swapped survivor | Charging, 16.4 | FAIL `clean-survivor-tab-order` in 148 s, after the ordinary observation held: c0 kept and active, c0 admitted, c1 and c2 refused. The wrong expectation is c2 kept. The five earlier assertions PASS |
