@@ -23,6 +23,9 @@ v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
 Epic v2-0fv; L0 beads v2-0fv.1 os LANDED (1.1, 8974fee, 1,224 lines), .2 fault ids (signed spec), .3 base (Law-2 guard; dispatched, Sol), .4 trace (dispatched, Sol),
 .5 work, .6 ipc. L2/L5 wait for the Wave 0 gate.
 
+L1 piece and undo beads filed from the signed pool spec (docs/decisions/wave1-piece-pool.md; A13/A14); dispatch after
+os, base and fault ids land.
+
 ### Next session, in order
 1. Land whatever the in-flight lanes left (each worker's worktree is committed on its branch; see the list above or
    the final session-end note below if one was written).
