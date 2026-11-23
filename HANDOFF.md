@@ -12,12 +12,11 @@ isolation lint (10cec71). `make check` green.
 
 ### Wave 0 exit, second half: contract suite (epic v2-he7, design docs/decisions/wave0-contract-design.md + "Advisor review" trims T1–T5)
 Landed: W0.6a sandbox (7dfb7bb) · W0.6b X driver (28976cf) · W0.6c wire client `snapwire.py` (5a8f29f) ·
-W0.6g pre-ACK recovery controls (996f3da; bead stays open for post-ACK).
+W0.6g pre-ACK recovery controls (996f3da; bead stays open for post-ACK) · W0.6f R3 + R5 Tier A, 8 PASS (0.30; bead open for 5 screen assertions).
 In flight at the time of this commit (worktrees under ~/.t3/worktrees/sublimite-v2/, one branch each):
 - v2-he7.11 W0.6d v1 adapter patch (Sol xhigh) — patch applied in /home/tobias/Projects/sublimite-v1-inspect (disposable detached 6fec2e8).
 - v2-he7.15 W0.6h large delete+undo X3 on the stock v1 build (Opus) — first running-v1 reproduction; stop if v1 does not show it.
-- v2-he7.13 W0.6f R3 + R5 Tier A part (Sol).
-- Wave 1 prep: Astra deriving the piece pool size → docs/decisions/wave1-piece-pool.md (advisor reviews).
+- Wave 1 prep: piece pool derivation landed (e0f176f, docs/decisions/wave1-piece-pool.md), advisor review pending.
 Open, not started: v2-he7.12 W0.6e navigation R1 + R6 (needs the adapter) · W0.6g post-ACK (needs the adapter) ·
 v2-he7.16 W0.6i runner + gate (wire all contract self-tests into make check; registry slash-row fixture) ·
 v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
