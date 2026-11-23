@@ -178,8 +178,11 @@ def validate(manifest):
             found += expectation_problems(f"assertion {full} on {target}", expect)
         count = spec["count"]
         if not isinstance(count, dict) or not set(count) <= set(spec["expect"]) \
-                or not set(count.values()) <= set(COUNTS):
+                or not all(isinstance(value, str) and value in COUNTS for value in count.values()):
             found.append(f"assertion {full}: count maps its expected targets to one of {COUNTS}")
+        elif any(spec["expect"][target] != "PASS" for target in count):
+            # A signed FAIL carries no count: a count predicate beside an XFAIL would pass one.
+            found.append(f"assertion {full}: a target with a count predicate expects PASS")
     return found
 
 

@@ -322,7 +322,7 @@
       "v1-pin": "recorded",
       "v2": "zero"
      },
-     "note": "Passive Law-2 count over R1's input-to-submit windows. v1-pin: the guard is active over at least one measured window and the count is recorded (4 at 0.48: libxcb read_packet under xcb_flush in cpu_paint_margins, docs/decisions/v2-he7.23.md). v2: count == 0 (Law 2, amendment A12)."
+     "note": "Passive Law-2 count over R1's input-to-submit windows. v1-pin (10 runs: 4 in 10; earlier 4 at 0.48, a real v1 typing-path allocation: libxcb read_packet under xcb_flush in cpu_paint_margins, docs/decisions/v2-he7.23.md): recorded. v2: count == 0 (Law 2, amendment A12). Runs are on a server of the case's or launch's own, 2026-11-23 (docs/decisions/v2-he7.33.md); a run counts when its editor printed one active report over at least one window."
     }
    }
   },
@@ -344,7 +344,7 @@
       "v1-pin": "recorded",
       "v2": "zero"
      },
-     "note": "Passive Law-2 count over R6's input-to-submit windows. v1-pin: the guard is active over at least one measured window and the count is recorded (docs/decisions/v2-he7.33.md: 4 on a fresh server, 0 after R1 on a shared one; every case now has its own server). v2: count == 0 (Law 2, amendment A12)."
+     "note": "Passive Law-2 count over R6's input-to-submit windows. v1-pin (9 runs: 4 in 9, three of them the advisor's three-run check; the earlier 0 followed R1 on a shared server): recorded. v2: count == 0 (Law 2, amendment A12). Runs are on a server of the case's or launch's own, 2026-11-23 (docs/decisions/v2-he7.33.md); a run counts when its editor printed one active report over at least one window."
     }
    }
   },
@@ -367,7 +367,12 @@
     },
     "other-files-unchanged": {},
     "law2-count": {
-     "evidence": "B"
+     "evidence": "B",
+     "count": {
+      "v1-pin": "recorded",
+      "v2": "zero"
+     },
+     "note": "Passive Law-2 count over R3's input-to-submit windows. v1-pin (21 runs: 11 in 3 of 13 runs of this bead's files.py and 1 of 8 runs of the pre-bead files.py, 0 in the other 17; v1 timing, not server history: R3 was always first on its server): recorded. v2: count == 0 (Law 2, amendment A12). Runs are on a server of the case's or launch's own, 2026-11-23 (docs/decisions/v2-he7.33.md); a run counts when its editor printed one active report over at least one window."
     }
    }
   },
@@ -395,7 +400,12 @@
     "reopen-exit": {},
     "bytes-unchanged": {},
     "law2-count": {
-     "evidence": "B"
+     "evidence": "B",
+     "count": {
+      "v1-pin": "zero",
+      "v2": "zero"
+     },
+     "note": "Passive Law-2 count, summed over R5's open and reopen editors. v1-pin (20 runs: 0 and 0 in 12 runs of this bead's files.py and 8 of the pre-bead files.py): zero, asserted on v1 as the count rule's proof that the adapter's window is correct. v2: count == 0 (Law 2, amendment A12). Runs are on a server of the case's or launch's own, 2026-11-23 (docs/decisions/v2-he7.33.md); a run counts when its editor printed one active report over at least one window."
     }
    }
   },
@@ -479,7 +489,7 @@
       "v1-pin": "recorded",
       "v2": "zero"
      },
-     "note": "Passive Law-2 count over the relaunched editor's tab-walk and copy windows. v1-pin: the guard is active over at least one measured window and the count is recorded (4 on a server of its own, docs/decisions/v2-he7.33.md; the earlier 0 was a shared server's history). v2: count == 0 (Law 2, amendment A12)."
+     "note": "Passive Law-2 count over the relaunched editor's tab-walk and copy windows. v1-pin (2 runs: 4 in 2; the earlier 0 of run contract-capacity-v8wtgv9p followed the producers and the restored editor on a shared server): recorded. v2: count == 0 (Law 2, amendment A12). Runs are on a server of the case's or launch's own, 2026-11-23 (docs/decisions/v2-he7.33.md); a run counts when its editor printed one active report over at least one window."
     }
    },
    "note": "docs/decisions/v2-he7.17.md. Assumes a discoverable live-tab capacity refusal through a public open, which v2 must also provide."

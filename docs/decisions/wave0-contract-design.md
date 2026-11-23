@@ -211,6 +211,6 @@ it is asserted there too, so the adapter's window is proven correct on at least 
 0.48; attribution: docs/decisions/v2-he7.23.md — all four are a real v1 typing-path allocation, libxcb read_packet under xcb_flush in cpu_paint_margins during backend submit; R1 stays recorded on v1.)
 
 *Amended 2026-11-23 (advisor ruling, v2-he7.33 §2):* the count has its own ID per case and its
-predicate per target lives in the manifest (`"count"`): R1, R6 and R4 are recorded on v1-pin and
-asserted 0 on v2. Every case and every scored launch now gets an X server of its own; on one, v1
+predicate per target lives in the manifest (`"count"`): R1, R6, R4 and R3 are recorded on v1-pin,
+R5 is asserted 0 on v1-pin, and all are asserted 0 on v2 (R3: v1 counted 11 in 4 of 21 runs). Every case and every scored launch now gets an X server of its own; on one, v1
 counts 4 for R6 (three runs) and for R4 (two runs), where a shared server had shown 0.

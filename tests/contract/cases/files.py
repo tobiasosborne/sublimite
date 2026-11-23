@@ -149,7 +149,7 @@ class Case:
         self.logs = []
         self.asserted = []
         self.results = []
-        self.inspector = self.child = self.driver = None
+        self.inspector = self.child = self.driver = self.law2 = None
         self.ticket = self.serial = None
         self.step("setup", "private sandbox and authenticated X driver")
 
@@ -173,6 +173,7 @@ class Case:
             "status": status, "predicate": reason or self.assertion,
             "step": self.part or self.assertion,
             "observed": self.observed, "expected": self.expected, "ordinary": self.ordinary,
+            "law2": self.law2 if self.assertion == "law2-count" else None,
             "ticket": self.ticket, "submit_serial": self.serial,
             "seed": self.seed, "negative": self.negative,
             "child_status": [{"pid": child.pid, "exit": child.poll()} for child in self.children],
@@ -312,7 +313,16 @@ class Case:
         self.step("law2-count", "an active guard's report with measured scopes", part=part)
         count = law2_count(self.logs[-1].read_bytes())
         self.note(f"law2 {count}")
-        return count.allocations
+        return count
+
+    def law2_count(self, counts):
+        """law2-count over the case's windows: each report was healthy (allocation_count); the
+        count's predicate per target is the manifest's ("count"), applied by the runner to
+        `law2`. The red control expects one allocation more than was counted."""
+        self.law2 = {"allocations": sum(c.allocations for c in counts),
+                     "scopes": sum(c.scopes for c in counts)}
+        self.check("law2-count", self.law2, self.law2, dict(self.law2, allocations=self.law2[
+            "allocations"] + 1))
 
 
 def search_frame(case, expected, wrong):
@@ -444,9 +454,7 @@ def r3(case, sandbox):
     case.observed = status
     if status != 0:
         raise Mismatch(f"editor exited {status} after Ctrl+Q")
-    count = case.allocation_count("report")
-    # v1 measured 0 for this window (docs/decisions/v2-he7.13.md), so the count rule asserts 0.
-    case.check("law2-count", [count], [0], [1])
+    case.law2_count([case.allocation_count("report")])
 
 
 def tab_view(frame, rows):
@@ -523,8 +531,7 @@ def r5(case, sandbox):
             on_disk.append(path.read_bytes())
             counts.append(case.allocation_count(f"{phase}-report"))
     case.check("bytes-unchanged", on_disk, [expected, expected], [expected, b"!" + expected[1:]])
-    # v1 measured 0 for both windows (docs/decisions/v2-he7.13.md); the count rule asserts 0.
-    case.check("law2-count", counts, [0, 0], [0, 1])
+    case.law2_count(counts)
 
 
 def run_case(case, scenario, target):

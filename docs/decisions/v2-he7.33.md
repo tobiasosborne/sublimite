@@ -62,8 +62,8 @@ entry carries `count: {predicate, observed}`.
   only assert what the case's author remembered to branch on.
 - **Ids.** `R1.law2-count`, `R6.law2-count` (new) and `R4.law2-count` (converted): recorded on
   v1-pin, zero on v2. R4 is converted because on its own server v1 counts 4 in two of two runs:
-  the count rule (recorded unless v1 shows 0) applied as written. R3, R5 and R31 stay asserted 0
-  in the case: 0 on fresh servers in every R5 and R31 run (but see R3 below).
+  the count rule (recorded unless v1 shows 0) applied as written. R3 and R5 follow in the
+  follow-up round below; R31 stays asserted 0 in the case (0 in every run).
 - **R6 three runs** (step 2b): 4, 4, 4 (R1: 4, 4, 4) [Discharging, load 4.7–5.2], each case on a
   server of its own. The count is the same in every run. Through the runner on a
   navigation-only diagnostic manifest: `count: recorded` PASS with `{allocations 4}`; the same
@@ -176,9 +176,32 @@ first under a red and record it (`ordinary`); a failing ordinary is ERROR, never
 
 ## Outside this bead (reported, not fixed)
 
-- **R3.law2-count on v1-pin is not reliably 0.** On fresh servers v1 counted 11 in 2 of 9 R3 runs
-  of this bead, and in 1 of 8 runs of the pre-bead `files.py` (R3 was already first on its
-  server). The case asserts 0 on v1, so the gate can FAIL there. By the count rule it would be
-  recorded on v1 like R1, R6 and R4; that is the advisor's call.
+- *Resolved in the follow-up round below:* R3.law2-count on v1-pin was not reliably 0.
 - `recovery.py` still refuses a restarted editor whose PID equals the killed one (finding 26).
 - `/tmp/.X11-unix/X121` left by this bead's first red run (section 1).
+
+## Follow-up round (advisor rulings, 2026-11-23 22:20)
+
+- **R3 and R5 counts through the manifest predicate.** `files.py` no longer asserts a count. Its
+  `law2-count` requires one healthy report per window (`law2_count`), records
+  `law2 = {allocations, scopes}` summed over the case's windows, and the runner applies the
+  manifest's predicate: R3 recorded on v1-pin (advisor: assert 0 on v1 only where v1 shows 0),
+  R5 zero on both targets (the count rule's v1 proof stays, now through the same path). R5 sums
+  its open and reopen windows: the sum is 0 exactly when both are. Every count ID now runs
+  through one mechanism (R1, R3, R4, R5, R6); R31 still asserts 0 in the case (two counted
+  windows in one record; not part of this round).
+- **The count reds** keep their IDs. Under `--negative R3.law2-count` or `R5.law2-count` the case
+  first requires the healthy report (an unhealthy one is ERROR), then expects one allocation
+  more than was counted: the FAIL shows the ID can fail on the case's real count. The
+  predicate's own red is the runner's (`test_count_predicate_per_target`; live, the
+  navigation-only manifest under `zero`). Retaken on v1-pin [Charging, load 2.6]: both qualify.
+- **Manifest evidence (advisor condition b).** Each count note names its v1 runs and values:
+  R1 4 in 10 of 10, R6 4 in 9 of 9, R4 4 in 2 of 2, R3 11 in 3 of 13 (this bead) and 1 of 8
+  (pre-bead), 0 otherwise; R5 0 and 0 in 20 of 20 (12 and 8). A run counts when its editor
+  printed one active report over at least one window; tallied from every log under `build/`.
+  `test_run.py` requires a run count in each note.
+- **Runner review (wave0-runner-astra.md).** `--validate` rejects a count predicate on a target
+  whose expectation is not PASS: a signed FAIL carries no count, so count + reviewed XFAIL let a
+  signature without a count pass (red: gate exit 0; green: ERROR, zero invocations). A count
+  value is type-checked before membership, so an array or object is an invalid-manifest ERROR
+  with a receipt instead of a TypeError (red: no gate record).

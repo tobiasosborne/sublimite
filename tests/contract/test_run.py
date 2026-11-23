@@ -433,11 +433,32 @@ class RunnerTests(unittest.TestCase):
                 if count != "sometimes":
                     self.assertEqual(gate["assertions"]["A.a"]["count"],
                                      {"predicate": count, "observed": law2})
-        with self.subTest("checked-in manifest: R1, R6 and R4 assert zero on v2 only"):
+        with self.subTest("checked-in manifest: every count ID, zero on v2"):
             manifest = json.loads((HERE / "expectations.json").read_text())
-            for case in ("R1", "R6", "R4"):
-                self.assertEqual(manifest["cases"][case]["assertions"]["law2-count"]["count"],
-                                 {"v1-pin": "recorded", "v2": "zero"})
+            for case, v1 in (("R1", "recorded"), ("R6", "recorded"), ("R4", "recorded"),
+                             ("R3", "recorded"), ("R5", "zero")):
+                row = manifest["cases"][case]["assertions"]["law2-count"]
+                self.assertEqual(row["count"], {"v1-pin": v1, "v2": "zero"})
+                # Advisor condition b: the note names the runs behind the v1 predicate.
+                self.assertRegex(row["note"], r"v1-pin \(\d+ runs?")
+
+    def test_count_predicate_needs_a_pass_expectation_and_a_named_predicate(self):
+        # Runner review: count + reviewed XFAIL on one target let a signed FAIL without a count
+        # pass; a non-string count value raised TypeError before any receipt.
+        xfail = {"status": "XFAIL", "signature": SIGNATURE, "witness": WITNESS}
+        for name, override, problem in (
+                ("count beside an XFAIL", {"expect": {"fixture": xfail},
+                                            "count": {"fixture": "recorded"}}, "expects PASS"),
+                ("array count value", {"count": {"fixture": ["zero"]}}, "one of"),
+                ("object count value", {"count": {"fixture": {"zero": 1}}}, "one of")):
+            with self.subTest(name):
+                self.out = self.dir / f"out-{name}"
+                code, gate, out = self.run_gate(self.manifest(
+                    [{"records": [record("a", "FAIL", signature=SIGNATURE)], "exit": 3}],
+                    assertions=("a",), overrides={"A.a": override}))
+                self.assertEqual(code, records.EXIT["ERROR"], out)
+                self.assertIn(problem, " ".join(gate["problems"]), out)
+                self.assertEqual(self.invocations(), 0)
 
     def test_replaced_executable_is_an_error_before_launch(self):
         # Finding 2 proof: select A, replace it by B with a matching new stamp before a launch.
