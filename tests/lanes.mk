@@ -4,6 +4,7 @@
 # Lanes: layers san law2 tsan fuzz. The Makefile derives each lane's list from
 # these lines; tools/check_layout.py rejects anything else in this file.
 fuzz/base_fuzz.c := fuzz
+fuzz/config_toml_fuzz.c := fuzz
 fuzz/dnd_fuzz.c := fuzz
 fuzz/find_fuzz.c := fuzz
 fuzz/indent_fuzz.c := fuzz
@@ -17,6 +18,7 @@ fuzz/undo_fuzz.c := fuzz
 fuzz/utf8_fuzz.c := fuzz
 fuzz/work_fuzz.c := fuzz
 tests/base_test.c := san tsan
+tests/config_toml_test.c := san
 tests/dnd_test.c := san
 tests/find_bench_test.c := san
 tests/find_bestof_test.c := san

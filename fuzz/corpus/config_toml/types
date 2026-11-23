@@ -1,0 +1,11 @@
+# comment
+[test]
+min = -9223372036854775808
+max = +9_223_372_036_854_775_807
+float = 1.2_5e+2
+bool = false
+array = [
+ # comment
+"a\n\u2603", 'b\c',
+]
+empty = []

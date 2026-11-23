@@ -157,6 +157,10 @@ malloc                 vendor_ts # ts_current_malloc default allocator
 realloc                vendor_ts # ts_current_realloc default allocator
 snprintf               vendor_ts # ts_subtree_string node names
 stderr                 vendor_ts # default dot-graph stream and allocation-failure message
+# config: the harvested TOML parser's float conversion. libm, no kernel
+# entry, but it may set the calling thread's errno, so it is granted to
+# this module only rather than '*'.
+powl config # decimal exponent scaling of a parsed TOML float (LF-2)
 # base: the release allocation interposer and one-time CPU detection.
 __libc_calloc base # glibc allocation beneath the Law-2 interposer
 __libc_malloc base # glibc allocation beneath the Law-2 interposer
