@@ -7,3 +7,9 @@ SAN_SUITES := $(LAYER_SUITES) tests/isolation_test.c tests/os_test.c tests/base_
 LAW2_SUITES := tests/law2_base_test.c
 TSAN_SUITES := tests/os_test.c tests/base_test.c
 FUZZ_SUITES := fuzz/base_fuzz.c
+
+# trace (v2-0fv.4)
+SAN_SUITES += tests/trace_test.c
+LAW2_SUITES += tests/law2_trace_test.c
+TSAN_SUITES += tests/trace_test.c
+FUZZ_SUITES += fuzz/trace_fuzz.c

@@ -156,6 +156,9 @@ $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 $(B)/rel/bench/base_bench: $(B)/rel/bench/base_bench.o $(call lib_of,rel,L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
 
+$(B)/trace_bench: bench/trace_bench.c $(call lib_of,rel,L0)
+	$(CC_RELEASE) $(WARN) $(REL_F) $(INC) $^ $(LDLIBS) -o $@
+
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.
 check:
