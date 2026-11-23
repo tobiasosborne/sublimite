@@ -16,6 +16,10 @@ ALLOWLIST = Path(__file__).resolve().with_name('system-symbols.txt')
 ANY_MODULE = '*'
 UNDEFINED = frozenset('Uwv')
 L5_FORBIDDEN = {'x11', 'wayland', 'gl', 'raster'}
+# The vendored tree-sitter runtime and grammars form one pseudo-module: no
+# src/ directory, linked into hl's archive, ordered below hl and above
+# nothing (docs/decisions/v2-he7.24.md). It is implicit, like main.
+VENDOR_TS = 'vendor_ts'
 TS_RUNTIME = Path('vendor/tree-sitter/lib/src/lib.o')
 TS_RUNTIME_EXPORTS = {'_ts_dup', 'range_intersects', 'range_within'}
 # These definitions must use the libc ABI names to interpose at link time.
@@ -32,9 +36,10 @@ def read_module_map(entries):
         if not re.fullmatch(r'L[0-9]+', layer) or not module or module in layers:
             raise ValueError(f'invalid or duplicate module map entry {entry!r}')
         layers[module] = int(layer[1:])
-    if 'app' not in layers or 'main' in layers:
-        raise ValueError('module map must include app and leave main implicit')
+    if 'app' not in layers or 'hl' not in layers or {'main', VENDOR_TS} & layers.keys():
+        raise ValueError(f'module map must include app and hl and leave main and {VENDOR_TS} implicit')
     layers['main'] = layers['app']
+    layers[VENDOR_TS] = layers['hl']
     return layers
 
 
@@ -48,6 +53,7 @@ def intra_order(layers):
                     if a not in layers or b not in layers or layers[a] != layers[b]:
                         raise ValueError(f'invalid intra-layer rule {rule!r}')
                     order.add((a, b))
+    order.add((VENDOR_TS, 'hl'))
     while True:
         closure = order | {(a, d) for a, b in order for c, d in order if b == c}
         if closure == order:
@@ -66,7 +72,7 @@ def symbol_module(symbol, layers):
     if symbol == 'main':
         return 'main'
     if vendor_symbol(symbol):
-        return 'hl'
+        return VENDOR_TS
     prefix, _, _ = symbol.rpartition('_')
     while prefix:
         if prefix in layers and len(symbol) > len(prefix) + 1:
@@ -159,11 +165,11 @@ def archive_members(nm, archive, members):
 
 def object_module(path):
     if path.suffix == '.o' and '..' not in path.parts:
-        if len(path.parts) >= 3 and path.parts[0] == 'src':
+        if len(path.parts) >= 3 and path.parts[0] == 'src' and path.parts[1] != VENDOR_TS:
             return path.parts[1]
         if path == TS_RUNTIME or (len(path.parts) >= 4 and path.parts[0] == 'vendor'
                                   and path.parts[1].startswith('tree-sitter-')):
-            return 'hl'
+            return VENDOR_TS
     raise ValueError(f'unrecognized object path {path}')
 
 
@@ -174,7 +180,7 @@ def owns_symbol(member, module, owner, symbol):
         return symbol.startswith('ts_') or symbol in TS_RUNTIME_EXPORTS
     if member.parts[0] == 'vendor':
         return symbol.startswith('tree_sitter_')
-    return owner == module and not vendor_symbol(symbol)
+    return owner == module
 
 
 def audit_object(rows, where, member, module, layers, order, allowlist):

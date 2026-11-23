@@ -1,5 +1,7 @@
 # Use the normal release object rule and flags from Makefile.
-SYMBOL_FIXTURE_OBJS := $(patsubst %.c,$(B)/rel/%.o,$(wildcard tests/symbols/*/src/*/*.c))
+# Vendored fixture sources sit at their release paths under the case directory.
+SYMBOL_FIXTURE_OBJS := $(patsubst %.c,$(B)/rel/%.o,$(wildcard tests/symbols/*/src/*/*.c \
+    tests/symbols/*/vendor/tree-sitter/lib/src/*.c tests/symbols/*/vendor/tree-sitter-*/src/*.c))
 
 .PHONY: check-symbol-fixtures
 check-symbol-fixtures: $(SYMBOL_FIXTURE_OBJS)

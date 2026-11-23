@@ -11,7 +11,9 @@ import sys
 
 FIXTURES = Path('tests/symbols')
 CHECKER = Path('tools/check_symbols.py')
-# Each layer's module tuple also gives the member order passed to ar. An
+# Each layer's module tuple also gives the member order passed to ar; an
+# entry with a '/' is a directory of vendored sources (the vendor_ts
+# pseudo-module, docs/decisions/v2-he7.24.md), any other is src/MODULE. An
 # accepted case names the imports its objects must still make, so a compiler
 # that folds the call away cannot turn the case into a vacuous pass. A case
 # with system_symbols audits against that file in its source directory.
@@ -29,8 +31,14 @@ CASES = (
     Case('clean', {0: ('os', 'base', 'trace'), 1: ('piece',)}, (), ('strlen',)),
     Case('restricted', {1: ('piece',), 5: ('app',)},
          ('[restricted] piece imports read, granted only to os',
-          '[restricted] app imports malloc, granted only to hl')),
-    Case('granted', {0: ('os',), 4: ('hl',)}, (), ('read', 'fdopen')),
+          '[restricted] app imports malloc, granted only to vendor_ts')),
+    Case('granted', {0: ('os',), 4: ('vendor/tree-sitter/lib/src',)}, (), ('read', 'fdopen')),
+    Case('hl_heap', {4: ('hl',)}, ('[restricted] hl imports malloc, granted only to vendor_ts',)),
+    Case('vendor', {4: ('hl', 'vendor/tree-sitter/lib/src', 'vendor/tree-sitter-probe/src')}, (),
+         ('malloc', 'free', 'calloc', 'ts_probe_parser_new', 'tree_sitter_probe')),
+    Case('vendor_owner', {4: ('hl', 'vendor/tree-sitter/lib/src', 'vendor/tree-sitter-probe/src')},
+         ('lib/src/lib.o): error: [restricted] vendor_ts imports read, granted only to os',
+          'scanner.o): error: [intra-layer] vendor_ts (L4) references hl_probe_callback from hl (L4)')),
     Case('pure', {1: ('piece',), 5: ('app',)}, (), ('memcpy', 'strcmp')),
     Case('config_unknown_module', {0: ('os',)}, ('[input]', ":2: read is granted to unknown module 'nosuchmod'"),
          source='config', system_symbols='unknown_module.txt'),
@@ -65,7 +73,7 @@ def main():
         for layer, modules in case.layers.items():
             members = [path.relative_to(source).with_suffix('.o')
                        for module in modules
-                       for path in sorted((source / 'src' / module).glob('*.c'))]
+                       for path in sorted((source / ('' if '/' in module else 'src') / module).glob('*.c'))]
             if not members:
                 raise ValueError(f'{case.name}: no fixture objects for L{layer}')
             archive = build / f'layer{layer}.a'

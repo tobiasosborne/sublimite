@@ -8,7 +8,8 @@
 #                 that enters the kernel or touches process-global state:
 #                 syscall wrappers, file, memory and heap calls, signals,
 #                 processes, threads, clocks, environment, errno, stdio.
-# MODULE must be in the layer map (mk/layers.mk). Keep each block sorted;
+# MODULE must be in the layer map (mk/layers.mk) or be one of the implicit
+# pseudo-modules main and vendor_ts (docs/decisions/v2-he7.24.md). Keep each block sorted;
 # a module's grants form one block so parallel additions do not collide.
 # Rationale and borderline cases: docs/decisions/v2-he7.22.md.
 
@@ -133,24 +134,27 @@ unlinkat               os # directory-relative name removal
 unsetenv               os # remove a process environment variable
 write                  os # sequential write or eventfd signal
 
-# hl: the vendored tree-sitter runtime (lib.o) and grammar scanners. Upstream
-# code, granted as found; the debug-graph and allocation-failure paths are a
-# reported exception to the os boundary (docs/decisions/v2-he7.22.md).
-__fprintf_chk          hl # fortified fprintf: dot-graph output, allocation-failure message
-__snprintf_chk         hl # fortified snprintf: ts_subtree_string node names
-__vsnprintf_chk        hl # fortified vsnprintf: ts_lexer debug log formatting
-abort                  hl # ts_malloc_default failure; tree-sitter-yaml scanner invariant
-calloc                 hl # ts_current_calloc default allocator
-dup                    hl # ts_tree_print_dot_graph duplicates the caller's descriptor
-fclose                 hl # close the dot-graph stream
-fdopen                 hl # dot-graph stream over a caller descriptor
-fputc                  hl # dot-graph character output
-free                   hl # ts_current_free default allocator
-fwrite                 hl # dot-graph string output (fputs lowered by the compiler)
-malloc                 hl # ts_current_malloc default allocator
-realloc                hl # ts_current_realloc default allocator
-snprintf               hl # ts_subtree_string node names
-stderr                 hl # default dot-graph stream and allocation-failure message
+# vendor_ts: the vendored tree-sitter runtime (lib.o) and grammar scanners, a
+# pseudo-module of their own so src/hl inherits none of these. Upstream code,
+# granted as found; the debug-graph and allocation-failure paths are a reported
+# exception to the os boundary (docs/decisions/v2-he7.22.md). The heap, stdio,
+# abort and dup lines go when Wave 3 hl supplies a base allocator
+# (docs/decisions/v2-he7.24.md).
+__fprintf_chk          vendor_ts # fortified fprintf: dot-graph output, allocation-failure message
+__snprintf_chk         vendor_ts # fortified snprintf: ts_subtree_string node names
+__vsnprintf_chk        vendor_ts # fortified vsnprintf: ts_lexer debug log formatting
+abort                  vendor_ts # ts_malloc_default failure; tree-sitter-yaml scanner invariant
+calloc                 vendor_ts # ts_current_calloc default allocator
+dup                    vendor_ts # ts_tree_print_dot_graph duplicates the caller's descriptor
+fclose                 vendor_ts # close the dot-graph stream
+fdopen                 vendor_ts # dot-graph stream over a caller descriptor
+fputc                  vendor_ts # dot-graph character output
+free                   vendor_ts # ts_current_free default allocator
+fwrite                 vendor_ts # dot-graph string output (fputs lowered by the compiler)
+malloc                 vendor_ts # ts_current_malloc default allocator
+realloc                vendor_ts # ts_current_realloc default allocator
+snprintf               vendor_ts # ts_subtree_string node names
+stderr                 vendor_ts # default dot-graph stream and allocation-failure message
 # base: the release allocation interposer and one-time CPU detection.
 __libc_calloc base # glibc allocation beneath the Law-2 interposer
 __libc_malloc base # glibc allocation beneath the Law-2 interposer
