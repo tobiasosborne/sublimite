@@ -155,6 +155,13 @@ check:
 	@$(MAKE) --no-print-directory check-law2
 	@echo "check: ok"
 
+# X3 large delete + undo on the stock v1 oracle; not part of `check` (docs/decisions/v2-he7.15.md).
+# Usage: make check-contract-large-undo ORACLE=/abs/v1/build/sublimite CONTRACT_DISPLAY=:140
+.PHONY: check-contract-large-undo
+check-contract-large-undo: $(B)/xdriver $(B)/xdriver-test-client
+	python3 -B tests/contract/test_large_undo.py --display "$(CONTRACT_DISPLAY)"
+	python3 -B tests/contract/cases/large_undo.py --target "$(ORACLE)" --display "$(CONTRACT_DISPLAY)"
+
 .PHONY: check-contract-sandbox
 check-contract-sandbox:
 	python3 -B tests/contract/test_sandbox.py

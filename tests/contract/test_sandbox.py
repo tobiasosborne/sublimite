@@ -69,10 +69,10 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
             conn, _ = peer.accept()
             with conn:
                 message = conn.recv(64)
-                if message in (b"quit", b"quit-stale"):
-                    if message == b"quit":
+                if message in (b"quit", b"quit-stale", b"fail", b"fail-stale"):
+                    if message in (b"quit", b"fail"):
                         Path(path).unlink()
-                    raise SystemExit
+                    raise SystemExit(1 if message.startswith(b"fail") else 0)
                 if message:
                     conn.sendall(session.read_bytes())
 '''
@@ -437,6 +437,24 @@ class SandboxTests(unittest.TestCase):
             child = box.restart(self.stub(box, "primary"), stdout=subprocess.PIPE)
             self.record(child)
             box.record_server()
+
+    def test_restart_after_error_exit_that_removed_its_socket(self):
+        # v1 exits 1 on a fatal editor error after ipc_server_fini (main.c:342-344).
+        with self.case() as box:
+            primary = self.start_server(box)
+            with box.connect() as peer:
+                peer.sendall(b"fail")
+            self.assertEqual(primary.wait(timeout=WATCHDOG), 1)
+            self.assertFalse(box.socket_path.exists())
+            child = box.restart(self.stub(box, "primary"), stdout=subprocess.PIPE)
+            self.record(child)
+            box.record_server()
+        with self.case() as box:
+            primary = self.start_server(box)
+            with box.connect() as peer:
+                peer.sendall(b"fail-stale")
+            self.assertEqual(primary.wait(timeout=WATCHDOG), 1)
+            self.assert_no_launch(box.restart)
 
     def test_restart_refuses_replaced_executable_with_same_digest(self):
         with self.case() as box:

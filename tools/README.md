@@ -18,3 +18,5 @@
 | `check_layout.py` | Validates suite registration, checks the tools registry and forbidden directories, and checks real test/fuzzer dependencies for C implementation includes. | `make check-layout` and `make check-includes` | `check-lints`, suite lanes |
 
 `make check-lints` runs `tests/lint/run.py` for compiler-dependency fixtures and `tests/lanes/run.py` for suite, registry and lint inventory fixtures.
+| `tests/contract/cases/large_undo.py` and `large_undo_fixture.py` | X3: delete an over-cap file, undo, save; compares bytes on the stock v1 oracle (expected failure A8), with deterministic twin/over fixtures. | `make check-contract-large-undo ORACLE=/absolute/oracle/build/sublimite CONTRACT_DISPLAY=:140` | `check-contract-large-undo` |
+| `tests/contract/test_large_undo.py` | Self-test for X3: result classification and a stub editor whose failing control must report ERROR. | `python3 -B tests/contract/test_large_undo.py --display :140` | `check-contract-large-undo` |

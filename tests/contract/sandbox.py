@@ -469,7 +469,11 @@ class Sandbox:
             return self._spawn(argv, env, stdin=stdin, stdout=stdout, stderr=stderr, pass_fds=())
 
     def restart(self, argv=(), *, stdin=subprocess.DEVNULL, stdout=None, stderr=None, pass_fds=()):
-        """Allow the editor to reclaim only its own recorded, dead socket."""
+        """Allow the editor to reclaim only its own recorded, dead socket.
+
+        A reaped SIGKILL must leave the recorded socket refusing connections. Any exit with a
+        status (0, or an error status such as v1's 1 after a fatal editor error) must have
+        removed its socket. Other signals are refused."""
         with self._checked():
             endpoint = self._recorded()
             status = self._primary.poll()
@@ -482,13 +486,14 @@ class Sandbox:
                         raise Refused("recorded IPC socket is still listening")
                 except ConnectionRefusedError:
                     pass
-            elif status != 0 or self._verify_endpoint(endpoint, allow_missing_socket=True):
-                raise Refused("restart requires SIGKILL or a clean exit that removed its socket")
+            elif status < 0 or self._verify_endpoint(endpoint, allow_missing_socket=True):
+                raise Refused("restart requires SIGKILL or an exit that removed its socket")
 
         with self._checked() as env:
-            has_socket = self._verify_endpoint(endpoint, allow_missing_socket=status == 0)
-            if has_socket and status == 0:
-                raise Refused("IPC socket reappeared after clean exit")
+            exited = status >= 0
+            has_socket = self._verify_endpoint(endpoint, allow_missing_socket=exited)
+            if has_socket and exited:
+                raise Refused("IPC socket reappeared after exit")
             self._primary = self._spawn(argv, env, stdin=stdin, stdout=stdout,
                                         stderr=stderr, pass_fds=pass_fds)
             self._endpoint = None
