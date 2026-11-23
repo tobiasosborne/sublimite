@@ -110,3 +110,26 @@ checkpoint abort may return entries to unknown; the next sweep restores them fro
 - `lineidx` (v2-0fv.18) is rescoped to the off-path chunk counter and the estimate used while a prefix is unknown; whether
   it stays a module or becomes a function beside its caller is settled with the 7a worker before .18 dispatches.
   v2-0fv.9 follows whatever .18 becomes.
+
+## Second review rulings (advisor, 2026-11-23; docs/reviews/wave1-piece-lines-astra-2.md)
+
+- Closed: the delete + describe + undo read bound is 131,072 B (Astra Q3.1 derives it attainable; 65,536 needs a changed
+  information contract); the undo literal threshold stays 16, with 24 B per span accounted when admitting in-memory
+  inverses (Astra Q4: 24 minimises RAM only on 16s ≤ L < 24s and breaks A13's copy cap there).
+- A. Carried exactness narrowed: an edit, undo or redo preserves exactness for every piece whose record was counted when
+  described; an end piece of mixed knowledge is described unknown, reinserted unknown, and is eligible for resolve at once
+  (the alternatives add state for a case only a NULL-count insertion creates). Test: Astra's Q2.2 trace is exact again
+  after resolve.
+- B. A record is valid only for the exact unclipped interval it was described for, in the same tree's validated ORIGINAL
+  generation, and for ADD by byte lineage; a table-known whole chunk overrides an UNKNOWN record. Debug check of this
+  precondition: in the sanitizer lanes only (A15's second macro), piece_replace_spans recounts each carried end piece and
+  compares; the shipped build reads nothing.
+- C. Any successful live edit, abort, or adoption that adds knowledge invalidates the sweep cursor; done is relative to
+  the current root and table; identical re-adoption does not rewind; the cursor advances only with a successful
+  publication; one call visits at most its budget in nodes.
+- D. Batches revalidated at adoption; scanning queries bracket mapped loads with opening and closing polls; fail closed
+  on a poll error; snapshot answers are stable only while the backing is trusted.
+- E. Replace reads zero inserted-source bytes and at most 65,536 B of destination cuts; next_span reads nothing only with
+  nl == NULL; a compound replace splices at the existing seam before coalescing.
+- Freeze procedure: 7a writes A–E into the header's Lines section; the advisor reads that text; no third Astra pass
+  unless A changes shape.
