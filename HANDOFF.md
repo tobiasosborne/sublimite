@@ -10,30 +10,26 @@ W0.1 vendor (c0e9e2c) · W0.3a include DAG from compiler dependency files (86509
 · W0.3c fail-closed lanes, suite manifest `tests/lanes.mk`, tools registry (3f26948) · W0.4 app identity guard +
 isolation lint (10cec71). `make check` green.
 
-### Wave 0 exit, second half: contract suite (epic v2-he7, design docs/decisions/wave0-contract-design.md + "Advisor review" trims T1–T5)
-Landed: W0.6a sandbox (7dfb7bb) · W0.6b X driver (28976cf) · W0.6c wire client `snapwire.py` (5a8f29f) ·
-W0.6g recovery controls pre- and post-ACK (996f3da, 4d20f22) · W0.6f R3 + R5 Tier A, 8 PASS (0.30; bead open for 5 screen assertions) · W0.6d v1 inspector patch +383/−6 (d653383; tree /home/tobias/Projects/sublimite-v1-inspect) · W0.6h X3 case, XFAIL pinned per A8 (0.45).
-In flight at the time of this commit (worktrees under ~/.t3/worktrees/sublimite-v2/, one branch each):
-- Wave 1 prep: piece pool derivation revised through advisor challenges 1–6 (2ac1c97, one 400 B node class, process reserve); sign-off pending.
-Dispatched: v2-he7.12 W0.6e navigation R1 + R6 (Sol). Open, not started: W0.6g post-ACK and W0.6f's 5 screen assertions (adapter now landed) ·
-v2-he7.16 W0.6i runner + gate (wire all contract self-tests into make check; registry slash-row fixture) ·
-v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
+### Wave 0 exit, second half: contract suite landed; W0.7 review says HOLD (state at 20:3x UTC 2026-11-23)
+All W0.6 beads landed (sandbox, X driver, wire client, v1 inspector patch, R1/R6, R3/R5, recovery pre/post-ACK,
+X3, runner + gate record, R4 with survivor identity). Astra's whole-wave review docs/reviews/wave0-code-astra.md
+found 12 false-PASS risks; triage (advisor): phase 1 beads B1 runner v2-he7.27, B2 X3 .28, B3 navigation .29,
+B4 capacity .30, B5 files+adapter .31, B7 scaffold .32 (all Opus, running); phase 2 B6 cross-cutting .33 (after
+phase 1); phase 3 Astra reads run.py/records.py; THEN the gate run ([AC], quiet box, all lanes paused). Finding 10
+(fatal UBSan) done by the coordinator (0.77). Backlog .34.
 
-### Wave 1 started (amendment A10)
-Epic v2-0fv; L0 beads v2-0fv.1 os LANDED (1.1), .3 base LANDED (1.2, Law-2 lane live), .4 trace LANDED (1.3), .2 fault ids (Opus, in flight), .5 work (Sol, in flight), .6 ipc (Muse, in flight),
-.5 work, .6 ipc. L2/L5 wait for the Wave 0 gate.
-
-L1 piece and undo beads filed from the signed pool spec (docs/decisions/wave1-piece-pool.md; A13/A14); dispatch after
-os, base and fault ids land.
+### Wave 1 (A10: L0/L1 now; L2/L5 after the Wave 0 gate)
+Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream + one wait set (1.8, 1.11),
+fault ids (1.10) + A15 follow-up (1.12), ASSERT migration (1.14). Landed L1: scan (1.6), utf8 (1.7), indent (1.9,
+1.13). In flight: piece 7a (v2-0fv.7: frozen piece.h + reference model + suite; FREEZE GATE: advisor reads piece.h
+before the suite is finished). Filed, waiting on 7a: 7b implementation (.17), undo (.8), lineidx (.18), find (.19).
+Held: env hooks (.20). L2 edit placeholder (.15) carries acceptance lines. Specs: docs/decisions/wave1-piece-pool.md
+(signed), wave1-os-fault-lease.md (+A18). Amendments A1–A18 in docs/decisions/wave0-plan-amendments.md.
 
 ### Next session, in order
-1. Land whatever the in-flight lanes left (each worker's worktree is committed on its branch; see the list above or
-   the final session-end note below if one was written).
-2. W0.6e and W0.6g post-ACK on the landed adapter, then W0.6i, then W0.6j.
-3. Whole-wave deletion-lens code review by Astra (bead W0.7, docs/reviews/wave0-code-astra.md) and its triage.
-4. **The Wave 0 gate run is the first full-suite run of the next session**: no other lane running, stamped with
-   power state and load at start (AC preferred; [bat] acceptable on a quiet box). Then report to the advisor (checkpoint d).
-5. Then open Wave 1 beads under epic v2-0fv (its description carries the exit criteria and acceptance items).
+1. Land whatever lanes left (each worktree is committed on its branch: "wip ..." commits).
+2. W0.7 phase 1 → phase 2 (B6) → phase 3 (Astra read) → Wave 0 gate run (`make contract-gate`, [AC], quiet box).
+3. piece 7a freeze → 7b, undo, lineidx, find in parallel lanes.
 
 ### Facts the next session needs
 - Quality bar (Tobias, 2026-11-23): genius-level engineering; push back on sloppy work. Owner-read every landing,
