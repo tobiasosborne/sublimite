@@ -2,31 +2,107 @@
 _GLOBAL_OFFSET_TABLE_ # ELF linker-generated GOT base
 __assert_fail # glibc assert implementation
 __ctype_b_loc # glibc narrow character-class table
+__errno_location # glibc calling-thread errno
 __fprintf_chk # fortified fprintf
+__realpath_chk # fortified realpath
 __snprintf_chk # fortified snprintf
 __stack_chk_fail # compiler stack protector failure handler
 __vsnprintf_chk # fortified vsnprintf
 abort # process termination
 calloc # zero-initializing allocation
+clock_getres # POSIX clock resolution
+clock_gettime # POSIX clock read
+close # release a file descriptor
+closedir # release a directory stream
 dup # file descriptor duplication
+environ # glibc process environment
+eventfd # Linux event counter descriptor
+fchmod # set file permission bits by descriptor
 fclose # stream close
+fcntl # query descriptor flags or duplicate with close-on-exec
+fdatasync # flush file data and required metadata
 fdopen # open a stream over an existing descriptor
+fdopendir # open an iterator over a directory descriptor
+flock # advisory file or directory lock
 fputc # write a character to a stream
 free # allocation release
+fstat # metadata by descriptor
+fstatat # directory-relative metadata
+fsync # flush file or directory data and metadata
+ftruncate # resize a file
 fwrite # stream write
+getcwd # current working directory
+getenv # lookup in the process environment
+gethostname # local host name
+getpagesize # Linux base page size
+getpid # calling process ID
+getrandom # Linux kernel random bytes
+getrlimit # current process resource limits
+ioctl # Linux FICLONE reflink request
 iswalnum # wide-character alphanumeric classification
 iswalpha # wide-character alphabetic classification
 iswdigit # wide-character digit classification
 iswspace # wide-character whitespace classification
+kill # send a signal to a child process
+lstat # path metadata without following the final symlink
+madvise # Linux mapping advice
 malloc # allocation
+memchr # locate a byte in a bounded span
 memcmp # compare bytes
 memcpy # copy bytes
 memmove # copy potentially overlapping bytes
 memset # fill bytes
+mkdir # create a directory
+mkdirat # directory-relative directory creation
+mmap # create an address space mapping
+munmap # release an address space mapping
+nanosleep # relative monotonic sleep
+openat # path or directory-relative descriptor open
+poll # wait for descriptor readiness
+posix_spawn # launch a process with explicit file actions
+posix_spawn_file_actions_addclosefrom_np # glibc child descriptor inheritance control
+posix_spawn_file_actions_destroy # release spawn file actions
+posix_spawn_file_actions_init # initialize spawn file actions
+pread # positioned file read
+pthread_cond_broadcast # wake all condition waiters
+pthread_cond_destroy # release a condition variable
+pthread_cond_init # initialize a condition variable
+pthread_cond_signal # wake a condition waiter
+pthread_cond_wait # condition wait with mutex release and reacquire
+pthread_create # start a POSIX thread
+pthread_join # reap a POSIX thread
+pthread_mutex_destroy # release a mutex
+pthread_mutex_init # initialize a mutex
+pthread_mutex_lock # acquire a mutex
+pthread_mutex_unlock # release a held mutex
+pthread_mutexattr_destroy # release mutex attributes
+pthread_mutexattr_init # initialize mutex attributes
+pthread_mutexattr_settype # select recursive mutex semantics
+pthread_once # thread-safe one-time initialization
+pthread_self # calling thread identity
+pwrite # positioned file write
+read # sequential read or eventfd drain
+readdir # advance a directory stream
+readlink # read a symlink target
 realloc # resize allocation
+renameat # directory-relative atomic rename
+renameat2 # Linux atomic rename with no replacement
+rewinddir # reset a directory stream cursor
+rmdir # remove an empty directory
+sched_yield # yield the calling thread
+setenv # set a process environment variable
+setrlimit # update a process resource limit
 snprintf # bounded formatted string output
+stat # path metadata following symlinks
 stderr # standard error stream
+strchr # locate a character in a C string
 strcmp # compare strings
 strlen # string length
 strncmp # bounded string comparison
+sysconf # query Linux physical page count
 towlower # wide-character lowercase conversion
+unlink # remove a non-directory name
+unlinkat # directory-relative name removal
+unsetenv # remove a process environment variable
+waitpid # wait for and reap a child process
+write # sequential write or eventfd signal
