@@ -40,10 +40,14 @@ Epic v2-0fv; L0 beads v2-0fv.1 os LANDED (1.1, 8974fee, 1,224 lines), .2 fault i
   Baseline: 120/120 sanitizer suites on a quiet box, one named v1 test race (pin decision §9).
 - Xvfb: explicit display only, `-noreset -nolisten tcp`; lanes were given disjoint ranges :120–:169.
 - PLAN_V2 is kept true by amendments A1–A5 (docs/decisions/wave0-plan-amendments.md).
+- Quota routing (advisor, 2026-11-23 noon): Codex weekly reset ~11:56; up to pace only (≈0.6 pt/h): Astra first, at most
+  one Sol lane when t3quota shows room > 0. New code beads go to Opus (≤ 2 workers, stop at Claude room 3). Muse one lane;
+  Gemini prose only. L0 beads count as critical path under the battery plan.
 - Routing: Codex's cyber filter refused test-case beads that describe a defect or a process kill (v2-he7.7, .15, .14;
   worklog). Those go to Opus or Muse from the start; Sol does lint, tool and patch beads. Muse and Gemini: up to pace only.
-- Worker briefs carry: no rm -rf, no mktemp with a clean-up trap, nothing outside the checkout, build under build/,
-  report instead of running anything that needs approval. T3 thread timestamps are UTC.
+- Worker briefs carry: no rm -rf, no mktemp with a clean-up trap, nothing outside the checkout is created or removed,
+  HOME for any tool that writes caches is under the checkout's build/, build under build/, report instead of running
+  anything that needs approval; never profile the oracle (perf record -N if ever). T3 thread timestamps are UTC.
 - Battery: Tobias could not plug in on 2026-11-23; stop line 20 % (advisor rule, worklog).
 - v1 findings for Tobias (advisor reports them): post-rename save conflict and >32 MiB delete+undo (known-bugs doc),
   editor_session_test ivv_save race, test_install_omarchy EDITOR export.
