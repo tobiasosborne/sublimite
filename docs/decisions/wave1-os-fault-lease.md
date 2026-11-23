@@ -92,7 +92,7 @@ On match, SC-CAS increment the epoch until successful or saturated. Order it bef
 * Each departing handler performs an acq_rel count decrement. Only the handler observing RETIRING **and** last reference in its returned old word calls async-signal-safe `sem_post`. It does this after finishing all accesses to the mapping and slot, then returns or chains. An early post is retained by the semaphore. Late arrivals cannot enter RETIRING. There is no notification on an ordinary last departure from LIVE.
 * Consume the owed post even when the count has already fallen to zero. The retiring thread acquire-observes closed/zero and release-publishes FREE before unlocking. Thus a second retire cannot consume the first's post. At most one post can be outstanding (P, one serialized retire and one last departure). The semaphore has process lifetime. No waiting, mutex operation, allocation or logging runs in the handler.
 
-**Chain.** In `fault_install` query the previous action into immutable service storage and release-publish its selector before installing the new action. Use one replacing `sigaction(SIGBUS, &new, &old)` to capture the action actually replaced. As in v1, if publishing the returned action, write a second immutable cell and release-store the selector. Two cells (P, one readable during installation and one for the returned action) suffice. Inherit the previous mask and `SA_ONSTACK`, `SA_NODEFER`, `SA_RESTART` flags; install `SA_SIGINFO`. A competing, independent installer violates this process contract. The handler does not read back installation state or consult a file object.
+**Chain.** *(Superseded by amendment A18, see "Chain and install (A18)" at the end of this file.)* In `fault_install` query the previous action into immutable service storage and release-publish its selector before installing the new action. Use one replacing `sigaction(SIGBUS, &new, &old)` to capture the action actually replaced. As in v1, if publishing the returned action, write a second immutable cell and release-store the selector. Two cells (P, one readable during installation and one for the returned action) suffice. Inherit the previous mask and `SA_ONSTACK`, `SA_NODEFER`, `SA_RESTART` flags; install `SA_SIGINFO`. A competing, independent installer violates this process contract. The handler does not read back installation state or consult a file object.
 
 On wrong code, unmatched address or failed recovery, drop all transient admissions before `fault_chain`. Acquire-load the selector, restore interrupted errno before forwarding and restore it on return. With a previous simple handler call it with the signal; with `SA_SIGINFO` forward the original siginfo and ucontext. For a one-shot action an acq_rel exchange ARMED → CONSUMED reserves its single invocation. Honor `SIG_IGN` for a forwarded signal; returning cannot repair a real synchronous fault. For default or consumed one-shot install default with `sigaction` and re-raise on the faulting thread via `raise`. If that fatal dispatch itself fails, use async-safe `_Exit(EXIT_FAILURE)`. Successful recovery also restores errno. Handler-visible state is limited to signal-frame locals, errno, the published immutable page size/prior actions, admitted range, verified lock-free atomics and the drain post.
 
@@ -118,7 +118,7 @@ Write the public-header tests failing first. Demonstrate behavioral red on a bar
 | Arguments and overlap | Reject null pointers, invalid ID, empty/unaligned/overflowing extents and trigger at logical end. Check the exact public errors and output preservation. Reject duplicate and partially overlapping rounded ranges with EXIST. Adjacent extents and distinct maps of one inode each register and taint independently. |
 | Capacity | Hold exactly `OS_FAULT_SLOTS` distinct registrations, then one extra disjoint registration gets NOSPC with absent output. Retire one and retry the extra; only the freed index can be reused. v1 `tests/os_test.c:case_fault` used repeated copies of one view for this fixture. |
 | Recovery | Adapt v1 `tests/os_test.c:case_map` / `case_fault`. Pattern-fill a mapped prefix and two possible suffix starts (P, one page per role). Trigger later then earlier. Each increments once, zeros the expected suffix and leaves the prefix and neighbor intact. Include a partial final page and remap to verify the actual file bytes. In a fresh native child truncate on a page boundary and perform a volatile read of the missing page. Require a zero result, positive epoch, intact prefix and normal exit. |
-| Chaining | In fresh exec children test a stray native fault with default disposition (death by SIGBUS), ignored asynchronous delivery, both previous handler signatures, original masks/context and one-shot then default. Accept both recovery codes, forward unrelated codes, preserve errno, and verify a successfully handled mapped fault does not consume the previous one-shot. |
+| Chaining (superseded by A18) | In fresh exec children test a stray native fault with default disposition (death by SIGBUS), ignored asynchronous delivery, both previous handler signatures, original masks/context and one-shot then default. Accept both recovery codes, forward unrelated codes, preserve errno, and verify a successfully handled mapped fault does not consume the previous one-shot. |
 | OS errors | Link isolated fixtures with `-Wl,--wrap=sysconf,--wrap=sigaction,--wrap=sem_init,--wrap=mmap,--wrap=syscall` as appropriate to actual referenced symbols. Inject bad page size, failed service semaphore setup, failed query and failed install in fresh processes. Require sticky NOTSUP, absent output and unchanged prior disposition. Fail only the handler's fixed remap during a synthetic trigger: prior handler runs, epoch is tainted, retire succeeds. Fail the native send: translated native error and unchanged epoch. Require each selected wrapper to fire. Handler-side wrappers use only AS-safe operations. |
 
 | TSan interleaving | Acceptance oracle |
@@ -154,3 +154,34 @@ test-build-only setter for the next generation. Unregistered fault handling (pen
 siginfo si_code > 0 (kernel-raised, e.g. BUS_ADRERR), restore the default disposition and return so the re-executed
 instruction terminates the process as it would without the service; if si_code ≤ 0 (kill/sigqueue), honour the
 previous disposition (ignore for SIG_IGN, chain for a handler).
+
+
+## Chain and install (A18, advisor 2026-11-23; supersedes the Chain paragraph, the Chaining test row and the
+## si_code rule in the A15 correction above)
+
+The chain has exactly one client: a callable SIGBUS handler installed before os installs — in this project the
+sanitizer runtime and libFuzzer in the test lanes (os_fuzz truncates files under mappings; an unrepaired fault must reach
+libFuzzer's handler or the crashing input is not saved). Header rule, one sentence: **a SIGBUS the service does not
+repair terminates the process by SIGBUS, unless a callable handler was installed before the service, which is then
+called** with the original sig, siginfo and ucontext, errno restored. Invariant: an unrepaired SIGBUS never returns to
+the faulting instruction with nothing changed. Cut, each for want of a client: SIG_IGN emulation (a prior SIG_IGN is
+treated as SIG_DFL; no si_code classification, no platform sign conventions, no MCEERR/SI_KERNEL cases — the stated
+difference from "never installed" is that a sent SIGBUS terminates a process whose launcher ignored SIGBUS; a real fault
+under SIG_IGN is already fatal on Linux); SA_RESETHAND emulation (one-shot state and its exchange; the header says it is
+not emulated); mask and flag inheritance (the service's action is fixed: SA_SIGINFO, empty mask; any further flag needs a
+named need beside it); the second cell, selector and install race (query into one cell, then one
+sigaction(SIGBUS, &new, NULL); the cell is written once before the handler can run; os is the only module allowed to call
+sigaction, and the runtimes install before the first registration; a later dlopen'd installer can displace the service
+whatever we write). The implementation states the happens-before edge from the cell write to the handler's read on
+another thread (smallest sufficient: one atomic). Evidence required (M): the action the query returns in the ASan lane
+and in the fuzz lane (callable or not, flags, mask); SA_RESETHAND or a non-empty mask there is a counter-example to stop on.
+
+Tests: default prior + stray native fault → death by SIGBUS; IGN prior, truncate then read → death by SIGBUS (alarm, exit
+or abort fail); prior callable handler, both signatures → called with the original arguments; failed fixed remap →
+prior handler when one exists, death by SIGBUS otherwise; a repaired fault does not call the prior handler.
+
+**Memory orders (A18):** seq_cst everywhere in the fault service, no `_explicit` forms. On x86-64 a seq_cst load is the
+same instruction as a weaker load and a seq_cst RMW the same locked instruction; only plain stores differ (xchg for mov),
+and none is in poll (P). A weaker order needs a proof and a measured need; the default needs neither. The poll fence
+stays: the mapped byte loads are not atomic, so the closing validation needs a barrier compiler and machine both respect.
+A weak-memory litmus for the poll fence is an obligation of the bead that adds a weakly ordered target.

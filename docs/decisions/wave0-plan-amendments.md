@@ -158,3 +158,12 @@ linearly with the live tab count — 128-path handoffs took 0.3, 0.6, 0.9, 1.2, 
 name the per-tab operation responsible; the Wave 3 session-restore/tabs bead first identifies it by symbol at the pin
 (starting from src/editor/buffers.c editor_open_request), then states the acceptance: opening or restoring N tabs
 performs O(N) work in total, tested by counting that per-tab operation, not by timing.
+
+## A18. Fault-service chain and install cut to their one client; seq_cst throughout (advisor, 2026-11-23)
+
+The advisor's earlier signature of the spec's chain section "as in v1" was v1 structure by the back door; Astra's
+must-fixes 1 and 4 on the L0-2 diff were its price. The chain keeps only what its one named client needs (a callable
+prior SIGBUS handler: the sanitizer runtime and libFuzzer); SIG_IGN emulation, SA_RESETHAND emulation, mask/flag
+inheritance, the second cell/selector and the install-race machinery are cut. Memory orders in the fault service are
+seq_cst throughout with no _explicit forms (x86-64 cost derivation in the spec). Spec rewritten:
+docs/decisions/wave1-os-fault-lease.md, section "Chain and install (A18)".
