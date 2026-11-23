@@ -206,6 +206,25 @@ LDFLAGS_piece_test := -Wl,--wrap=os_vm_reserve,--wrap=os_fault_poll
 $(B)/fuzz/piece_fuzz: private LDLIBS += -Wl,--wrap=os_vm_reserve,--wrap=os_fault_poll
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/piece_test: $(B)/$(c)/tests/piece_model.o))
 $(B)/fuzz/piece_fuzz: $(B)/fuzz/tests/piece_model.o
+# Find suites and fuzzer use the piece model until v2-0fv.7b lands.
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bestof_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_fault_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_options_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_p1r_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_simd_filter_verify_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_test: $(B)/$(c)/tests/piece_model.o))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_timeout_test: $(B)/$(c)/tests/piece_model.o))
+$(B)/rel/tests/law2_find_test: $(B)/rel/tests/piece_model.o
+$(B)/fuzz/find_fuzz: $(B)/fuzz/tests/piece_model.o
+FIND_TW_SUITES := find_bestof_test find_p1r_test find_simd_filter_verify_test
+$(foreach c,rel san tsan,$(foreach t,$(FIND_TW_SUITES),$(eval $(B)/$(c)/tests/$(t): $(B)/$(c)/src/find/literal_test_hooks.o)))
+LDFLAGS_find_bestof_test := -Wl,--wrap=work_should_stop,--wrap=piece_iter_init,--wrap=piece_iter_next
+LDFLAGS_find_fault_test := -Wl,--wrap=os_fault_poll,--wrap=piece_iter_next
+LDFLAGS_find_p1r_test := -Wl,--wrap=work_should_stop
+LDFLAGS_find_simd_filter_verify_test := -Wl,--wrap=base_cpu_has_avx2
+LDFLAGS_find_timeout_test := -Wl,--wrap=work_should_stop
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/bench/find_bench))
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
@@ -233,6 +252,12 @@ $(B)/rel/bench/utf8_bench: $(B)/rel/bench/utf8_bench.o $(call libs_of,rel,L1 L0)
 
 $(B)/rel/bench/indent_bench: $(B)/rel/bench/indent_bench.o $(call libs_of,rel,L1 L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
+
+define FIND_BENCH
+$(B)/$(1)/bench/find_bench: $(B)/$(1)/bench/find_bench.o $(call libs_of,$(1),L1 L0)
+	$$(CC_$(1)) $$(CF_$(1)) -pthread $$^ $$(LDLIBS) -o $$@
+endef
+$(foreach c,rel san tsan,$(eval $(call FIND_BENCH,$(c))))
 
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.
