@@ -5,13 +5,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 extern char **environ;
 
 int main(void)
 {
     char path[OS_PATH_MAX];
-    if (os_proc_self_path(path, sizeof path) != OS_OK) return 1;
+    ssize_t len = readlink("/proc/self/exe", path, sizeof path);
+    if (len <= 0 || (size_t)len >= sizeof path) return 1;
+    path[len] = '\0';
     char *leaf = strrchr(path, '/');
     if (!leaf) return 1;
     /* The benchmark is in the same configuration's sibling directory. */

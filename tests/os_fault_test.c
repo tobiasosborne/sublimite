@@ -1013,7 +1013,9 @@ int main(int argc, char **argv)
     }
     ASSERT(argc == 1);
     char exe[OS_PATH_MAX], cwd[OS_PATH_MAX];
-    OK(os_proc_self_path(exe, sizeof exe));
+    ssize_t exe_len = readlink("/proc/self/exe", exe, sizeof exe);
+    ASSERT(exe_len > 0 && (size_t)exe_len < sizeof exe);
+    exe[exe_len] = '\0';
     OK(os_cwd(cwd, sizeof cwd));
     for (size_t i = 0; i < CASES; i++) {
         char dir[OS_PATH_MAX], flag[64];

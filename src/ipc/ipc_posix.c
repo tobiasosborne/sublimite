@@ -56,7 +56,7 @@ static uint64_t milliseconds(void)
 }
 /* Peer credentials: a peer must run as our uid, on every endpoint. Tests
  * model a foreign peer by wrapping os_stream_peer_uid in their own link
- * (tests/ipc_peer_seam.h); the shipped code has no override. */
+ * (tests/ipc_seam.h); the shipped code has no override. */
 static bool own_peer(const os_stream *s)
 {
     uint32_t uid=0;
@@ -113,27 +113,19 @@ static ipc_result resolve(const char *runtime, const char *display, endpoint *ep
     if(runtime!=NULL) return resolve_dir(runtime,display,ep);
     char suffix[64]; ipc_result rc=display_suffix(display,suffix,sizeof suffix);
     if(rc!=IPC_OK) return rc;
-    char ns[ABSTRACT_CAP+1u]; os_err e=os_env_get("EDIT_IPC_NAMESPACE",ns,sizeof ns);
     text t={ep->name,ABSTRACT_CAP,0,false};
-    put(&t,EDIT_APP_ID "-"); put_u64(&t,os_user_id());
-    if(e==OS_OK) {
-        if(ns[0]=='\0') return IPC_INVALID;
-        put(&t,"-"); put(&t,ns); put(&t,suffix);
-    } else if(e==OS_E_RANGE) return IPC_LIMIT;
-    else if(e==OS_E_NOENT) put(&t,suffix);
-    else return IPC_INVALID;
+    put(&t,EDIT_APP_ID "-"); put_u64(&t,os_user_id()); put(&t,suffix);
     if(t.over) return IPC_LIMIT;
     ep->abstract=true; return IPC_OK;
 }
 /* Private filesystem endpoint used when another uid has squatted the abstract
- * name (review §13): EDIT_IPC_FALLBACK_DIR (test hook) or /run/user/<uid>. */
+ * name (review §13): /run/user/<uid>. No environment variable moves it or the
+ * abstract name; tests reach both through link-time seams (tests/ipc_seam.h,
+ * v2-0fv.20). */
 static ipc_result resolve_fallback(const char *display, endpoint *ep)
 {
     ep_reset(ep);
-    char buf[OS_PATH_MAX]; os_err e=os_env_get("EDIT_IPC_FALLBACK_DIR",buf,sizeof buf);
-    if(e==OS_OK) return resolve_dir(buf,display,ep);
-    if(e!=OS_E_NOENT) return IPC_INVALID;
-    text t={buf,sizeof buf,0,false}; put(&t,"/run/user/"); put_u64(&t,os_user_id());
+    char buf[OS_PATH_MAX]; text t={buf,sizeof buf,0,false}; put(&t,"/run/user/"); put_u64(&t,os_user_id());
     return resolve_dir(buf,display,ep);
 }
 /* One client connection: the stream and a private wait set for its

@@ -1,6 +1,6 @@
 #include "ipc/ipc.h"
 #include "ipc_isolation.h"
-#include "ipc_peer_seam.h"
+#include "ipc_seam.h"
 #include "assert_death.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -155,10 +155,13 @@ static void endpoint_validation(const char *dir)
     int fd=open(path,O_CREAT|O_WRONLY,0600); ASSERT(fd>=0); close(fd);
     ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_INVALID); struct stat st; ASSERT(stat(path,&st)==0 && S_ISREG(st.st_mode)); ASSERT(unlink(path)==0);
     ASSERT(chmod(dir,0755)==0); ASSERT(ipc_server_init(&s,dir)==IPC_INVALID); ASSERT(chmod(dir,0700)==0);
-    ASSERT(unsetenv("XDG_RUNTIME_DIR")==0); ASSERT(ipc_server_init(&s,NULL)==IPC_OK);
-    const char *ns=getenv("EDIT_IPC_NAMESPACE"); ASSERT(ns!=NULL && ns[0]!='\0');
-    char saved[108], alternate[108], name[108];
-    ASSERT(snprintf(saved,sizeof saved,"%s",ns)>0);
+    ASSERT(unsetenv("XDG_RUNTIME_DIR")==0);
+    /* v1's test hook is inert in v2: the abstract name is ipc's derivation
+     * plus only the seam's tail (v2-0fv.20). */
+    ASSERT(setenv("EDIT_IPC_NAMESPACE","stale-hook",1)==0);
+    ASSERT(ipc_server_init(&s,NULL)==IPC_OK);
+    char saved[sizeof ipc_seam_namespace], name[108];
+    ASSERT(snprintf(saved,sizeof saved,"%s",ipc_seam_namespace)>0);
     int n=snprintf(name,sizeof name,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),saved);
     ASSERT(n>0 && (size_t)n<sizeof name);
     struct sockaddr_un bound={0}; socklen_t len=sizeof bound;
@@ -166,17 +169,11 @@ static void endpoint_validation(const char *dir)
     ASSERT(bound.sun_path[0]=='\0' && len==offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
     ASSERT(memcmp(bound.sun_path+1,name,(size_t)n)==0);
     ipc_server other={0}; ASSERT(ipc_server_init(&other,NULL)==IPC_EXISTS);
-    ASSERT(snprintf(alternate,sizeof alternate,"%s-other",saved)>0);
-    ASSERT(setenv("EDIT_IPC_NAMESPACE",alternate,1)==0);
+    ASSERT(unsetenv("EDIT_IPC_NAMESPACE")==0);
+    n=snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s-o",saved);
+    ASSERT(n>0 && (size_t)n<sizeof ipc_seam_namespace);
     roundtrip(NULL,false,true); /* Independent abstract server AND client. */
-    char oversized[108]; memset(oversized,'x',sizeof oversized-1); oversized[sizeof oversized-1]='\0';
-    ipc_request r=request(false,false);
-    ASSERT(setenv("EDIT_IPC_NAMESPACE",oversized,1)==0);
-    ASSERT(ipc_server_init(&other,NULL)==IPC_LIMIT && ipc_client_send(NULL,&r,CLIENT_TIMEOUT_MS)==IPC_LIMIT);
-    ASSERT(ipc_server_init(&other,dir)==IPC_OK); ipc_server_fini(&other); /* Hook is abstract-only. */
-    ASSERT(setenv("EDIT_IPC_NAMESPACE","",1)==0);
-    ASSERT(ipc_server_init(&other,NULL)==IPC_INVALID && ipc_client_send(NULL,&r,CLIENT_TIMEOUT_MS)==IPC_INVALID);
-    ASSERT(setenv("EDIT_IPC_NAMESPACE",saved,1)==0);
+    ASSERT(snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s",saved)>0);
     ASSERT(ipc_server_init(&other,NULL)==IPC_EXISTS); ipc_server_fini(&s);
     ASSERT(setenv("XDG_RUNTIME_DIR",dir,1)==0);
 }
@@ -496,8 +493,12 @@ static void t_lock_timeout(const char *dir)
 static void t_foreign_cred(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"cred",rt); ASSERT(unsetenv("XDG_RUNTIME_DIR")==0);
-    char ns[128]; ASSERT(snprintf(ns,sizeof ns,"%s-cred",getenv("EDIT_IPC_NAMESPACE"))>0);
-    ASSERT(setenv("EDIT_IPC_NAMESPACE",ns,1)==0); ASSERT(setenv("EDIT_IPC_FALLBACK_DIR",rt,1)==0);
+    char saved[sizeof ipc_seam_namespace]; ASSERT(snprintf(saved,sizeof saved,"%s",ipc_seam_namespace)>0);
+    int n=snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s-cred",saved);
+    ASSERT(n>0 && (size_t)n<sizeof ipc_seam_namespace);
+    /* The seam stands rt in for /run/user/<uid>; v1's hook must not move it. */
+    n=snprintf(ipc_seam_fallback,sizeof ipc_seam_fallback,"%s",rt); ASSERT(n>0 && (size_t)n<sizeof ipc_seam_fallback);
+    char stale[IPC_PATH_CAP]; subdir(dir,"cred-stale",stale); ASSERT(setenv("EDIT_IPC_FALLBACK_DIR",stale,1)==0);
     ipc_request r=request(false,false); capture c={0};
     /* client refuses a server whose credentials are foreign */
     ipc_server s={0}; ASSERT(ipc_server_init(&s,NULL)==IPC_OK);
@@ -513,21 +514,21 @@ static void t_foreign_cred(const char *dir)
     ipc_server_fini(&s);
     /* another uid squats the abstract name: we fall back to the private path */
     struct sockaddr_un a={0}; a.sun_family=AF_UNIX;
-    int n=snprintf(a.sun_path+1,sizeof a.sun_path-1,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),ns); ASSERT(n>0);
+    n=snprintf(a.sun_path+1,sizeof a.sun_path-1,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),ipc_seam_namespace); ASSERT(n>0);
     int squat=socket(AF_UNIX,SOCK_STREAM,0); ASSERT(squat>=0);
     ASSERT(bind(squat,(struct sockaddr *)&a,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n))==0 && listen(squat,4)==0);
     rc=ipc_server_init(&s,NULL);
     if(rc!=IPC_OK) fprintf(stderr,"init with squatted abstract name: rc=%d\n",(int)rc);
     ASSERT(rc==IPC_OK);
     char sp[IPC_PATH_CAP]; sock_path(rt,sp); struct stat st; ASSERT(lstat(sp,&st)==0 && S_ISSOCK(st.st_mode));
+    sock_path(stale,sp); ASSERT(lstat(sp,&st)!=0 && errno==ENOENT);
     ipc_server other={0}; ASSERT(ipc_server_init(&other,NULL)==IPC_EXISTS);
     ch=spawn_client(NULL,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
     ipc_server_fini(&s); close(squat);
-    ipc_seam_foreign_abstract=false; ASSERT(unsetenv("EDIT_IPC_FALLBACK_DIR")==0);
-    ASSERT(setenv("EDIT_IPC_NAMESPACE",ns+0,1)==0);
-    char saved[128]; ASSERT(snprintf(saved,sizeof saved,"%s",ns)>0); saved[strlen(ns)-5]='\0';
-    ASSERT(setenv("EDIT_IPC_NAMESPACE",saved,1)==0); ASSERT(setenv("XDG_RUNTIME_DIR",dir,1)==0);
-    rm_rf(rt);
+    ipc_seam_foreign_abstract=false; ipc_seam_fallback[0]='\0'; ASSERT(unsetenv("EDIT_IPC_FALLBACK_DIR")==0);
+    ASSERT(snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s",saved)>0);
+    ASSERT(setenv("XDG_RUNTIME_DIR",dir,1)==0);
+    rm_rf(rt); rm_rf(stale);
 }
 
 /* 14: receive storage is a small shared pool, released after the callback. */
@@ -777,7 +778,7 @@ static void t_namespace(const char *dir)
     close(dfd); ASSERT(unlink(decoy)==0);
     /* Abstract: a decoy at the v1-style namespaced name receives nothing. */
     ASSERT(unsetenv("XDG_RUNTIME_DIR")==0);
-    const char *ns=getenv("EDIT_IPC_NAMESPACE"); ASSERT(ns!=NULL && ns[0]!=0);
+    const char *ns=ipc_seam_namespace; ASSERT(ns[0]!=0);
     struct sockaddr_un va={0}; va.sun_family=AF_UNIX;
     int vn=snprintf(va.sun_path+1,sizeof va.sun_path-1,"sublimite-%lu-%s",(unsigned long)getuid(),ns);
     ASSERT(vn>0 && (size_t)vn<sizeof va.sun_path-1);
@@ -813,9 +814,12 @@ static void t_precondition_death(void)
 static int run_suite(const char *only, int ns_fd)
 {
     alarm(120); const char *dir=test_ipc_isolate(); ASSERT(dir!=NULL);
-    /* mkdtemp makes this namespace unique across processes and worktrees.
-     * Forked clients must inherit it rather than choose their own endpoint. */
-    const char *ns=getenv("EDIT_IPC_NAMESPACE"); ASSERT(ns!=NULL && ns[0]!=0);
+    /* mkdtemp makes the directory's basename unique across processes and
+     * worktrees; it becomes the seam's abstract namespace (tests/ipc_seam.h).
+     * Forked clients inherit it rather than choose their own endpoint. */
+    const char *ns=strrchr(dir,'/'); ASSERT(ns!=NULL && ns[1]!=0); ns++;
+    int nl=snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s",ns);
+    ASSERT(nl>0 && (size_t)nl<sizeof ipc_seam_namespace); ns=ipc_seam_namespace;
     if(ns_fd>=0) { size_t l=strlen(ns); ASSERT(write(ns_fd,ns,l+1u)==(ssize_t)(l+1u)); close(ns_fd); } /* --parallel: report the namespace */
 #define T(name,call) do { if(only==NULL || strcmp(only,name)==0) { call; } } while(0)
     T("death",t_precondition_death()); T("parser",parser(dir)); T("wire",wire_tests()); T("roundtrip",roundtrip(dir,false,false)); T("roundtrip",roundtrip(dir,true,false)); T("roundtrip",roundtrip(dir,false,true));
@@ -839,7 +843,7 @@ static int run_suite(const char *only, int ns_fd)
 
 #define PAR_MAX 16u
 /* --parallel [N [ROUNDS]]: N independent suites at once, each with its own
- * EDIT_IPC_NAMESPACE (reported over a pipe and checked pairwise distinct). A
+ * seam namespace (reported over a pipe and checked pairwise distinct). A
  * shared endpoint, a leaked default name or a cross-talking client fails here
  * (edit-457.17 isolation regression). Defaults 4 x 1: part of nothing in
  * `make check`, which stays at one serial suite. */

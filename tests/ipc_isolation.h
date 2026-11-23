@@ -1,6 +1,8 @@
 /* Private IPC endpoints inherited by forked/exec'd clients. No global state.
  * The runtime directory is a per-test mkdtemp under build/ (never the real
- * XDG dirs, never a v1 socket); the abstract namespace is its basename. */
+ * XDG dirs, never a v1 socket), published through XDG_RUNTIME_DIR, which the
+ * product reads. Abstract endpoints are isolated by the link seam in
+ * tests/ipc_seam.h, with this directory's basename as the namespace. */
 #ifndef TEST_IPC_ISOLATION_H
 #define TEST_IPC_ISOLATION_H
 #include <dirent.h>
@@ -58,11 +60,8 @@ static const char *test_ipc_isolate(void)
     if (n < 0 || (size_t)n >= sizeof isolation->runtime) { free(isolation); return NULL; }
     isolation->owner = getpid();
     if (!mkdtemp(isolation->runtime)) { free(isolation); return NULL; }
-    const char *base = strrchr(isolation->runtime, '/');
-    base = base ? base + 1 : isolation->runtime;
     if (chmod(isolation->runtime, 0700) ||
         setenv("XDG_RUNTIME_DIR", isolation->runtime, 1) ||
-        setenv("EDIT_IPC_NAMESPACE", base, 1) ||
         on_exit(test_ipc_isolation_cleanup, isolation)) {
         test_ipc_isolation_cleanup(1, isolation); return NULL;
     }

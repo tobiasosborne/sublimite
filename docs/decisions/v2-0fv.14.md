@@ -95,7 +95,7 @@ Remaining (each `IPC_INVALID` left in the tree):
 | `ipc_args_set_activation` `IPC_IO` | arena exhaustion from repeated font options |
 | `ipc_wire_decode` `IPC_PROTOCOL` | any malformed frame from a peer |
 | `ipc_wire_encode` `IPC_LIMIT` | a request larger than `IPC_MAX_WIRE` or than the caller's capacity (the caller cannot size it in advance) |
-| server/client init `IPC_INVALID` | a runtime directory that is relative, missing, foreign-owned, group/other-accessible or not a directory; a lock leaf or socket of the wrong kind or owner; an unreadable `XDG_RUNTIME_DIR`; an empty `EDIT_IPC_NAMESPACE` or `DISPLAY` |
+| server/client init `IPC_INVALID` | a runtime directory that is relative, missing, foreign-owned, group/other-accessible or not a directory; a lock leaf or socket of the wrong kind or owner; an unreadable `XDG_RUNTIME_DIR`; an empty `DISPLAY` (the `EDIT_IPC_NAMESPACE` hook was removed by v2-0fv.20) |
 | init/send `IPC_LIMIT`, `IPC_EXISTS`, `IPC_IO`, `IPC_TIMEOUT`, `IPC_REJECTED`, `IPC_BUSY`, `IPC_PROTOCOL` | environment lengths, a live incumbent, kernel failures, a slow, foreign or older peer |
 | `ipc_server_report_closed` `IPC_INVALID` | a token whose wait client already disconnected or was answered |
 | `ipc_server_adopt_wait` `IPC_LIMIT`, `IPC_IO` | a full peer table; 2^64 issued tokens (P); a refused adoption |

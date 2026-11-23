@@ -14,7 +14,8 @@ Source pin `6fec2e8` (read-only oracle at
   (`sublimite-v2`), never spelled: formats are
   `EDIT_APP_ID "-%lu%s.sock"` (leaf), `EDIT_APP_ID "-%lu%s"` and
   `EDIT_APP_ID "-%lu-%s%s"` (abstract, with the `EDIT_IPC_NAMESPACE`
-  hook). The leaf keeps v1's shape — 4-char extension — so
+  hook; *superseded by v2-0fv.20:* the hook is gone, tests append their
+  namespace through a link seam). The leaf keeps v1's shape — 4-char extension — so
   `start_endpoint`'s lock derivation (`memcpy(lockleaf+ln-4,"lock",4)`)
   stays valid and yields `<app-id>-<uid><suffix>.lock`.
   Length derivation (Law 4): leaf buffer is `endpoint.leaf[64]`, so a
@@ -47,8 +48,8 @@ Source pin `6fec2e8` (read-only oracle at
   used through os: `os_cwd`, `os_path_canonical`, `os_stat_path`,
   `os_path_is_absolute`, `os_file_read` (stdin), `os_now_ns`
   (deadlines), `os_sleep_ns` (lock/retry waits), `os_env_get`
-  (`XDG_RUNTIME_DIR`, `EDIT_IPC_NAMESPACE`, `EDIT_IPC_FALLBACK_DIR`;
-  `EDIT_IPC_TEST_PEER_UID` was removed by v2-0fv.13, see below). os
+  (`XDG_RUNTIME_DIR`; `EDIT_IPC_TEST_PEER_UID` was removed by
+  v2-0fv.13, `EDIT_IPC_NAMESPACE` and `EDIT_IPC_FALLBACK_DIR` by v2-0fv.20). os
   offered no socket, epoll, timerfd,
   peer-credential or uid API, so those imports are granted to `ipc`
   in `tools/system-symbols.txt`, one line with a reason each — the
@@ -75,7 +76,9 @@ Source pin `6fec2e8` (read-only oracle at
   `IPC_LIMIT` (v1: the same, via the `snprintf` guard).
   *Superseded by v2-0fv.13:* the `EDIT_IPC_TEST_PEER_UID` hook is gone
   from shipped code. Tests reach the peer-identity decision through a
-  link-time wrap of `os_stream_peer_uid` (`tests/ipc_peer_seam.h`).
+  link-time wrap of `os_stream_peer_uid` (`tests/ipc_peer_seam.h`, now
+  `tests/ipc_seam.h`). *Superseded by v2-0fv.20:* the namespace and
+  fallback hooks went the same way; the overlong-namespace outcome is gone.
 - **Test fixture lives under `build/`.** `tests/ipc_isolation.h`
   keeps v1's structure but mkdtemps `build/ipc-test-XXXXXX` under the
   absolute cwd (never `/tmp`, never real XDG) and derives the

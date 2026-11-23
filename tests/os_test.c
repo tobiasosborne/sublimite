@@ -49,6 +49,12 @@ static void join(char *out, size_t cap, const char *a, const char *b)
     CHECK(n >= 0 && (size_t)n < cap);
 }
 
+/* os has no environment setter (v2-0fv.20); fixtures set variables directly. */
+static void env_set(const char *name, const char *value)
+{
+    CHECK((value ? setenv(name, value, 1) : unsetenv(name)) == 0);
+}
+
 static bool ends_with(const char *s, const char *tail)
 {
     size_t a = strlen(s), b = strlen(tail);
@@ -1083,12 +1089,12 @@ static void case_utf8(void)
     CHECK(ends_with(canon, dir_tail));
     EXPECT(os_path_canonical(file_path, canon, 4), OS_E_RANGE);
     /* Environment values are UTF-8 too. */
-    OK(os_env_set("OS_TEST_UTF8", file_name));
+    env_set("OS_TEST_UTF8", file_name);
     EXPECT(os_env_get("OS_TEST_UTF8", buf, 4), OS_E_RANGE);
     char env[OS_PATH_MAX];
     OK(os_env_get("OS_TEST_UTF8", env, sizeof env));
     CHECK(strcmp(env, file_name) == 0);
-    OK(os_env_set("OS_TEST_UTF8", NULL));
+    env_set("OS_TEST_UTF8", NULL);
     EXPECT(os_env_get("OS_TEST_UTF8", env, sizeof env), OS_E_NOENT);
     OK(os_unlink(file_path));
     os_dir_close(&d);
@@ -1202,14 +1208,6 @@ static int role_fdlimit(const char *arg)
 
 static void case_proc(void)
 {
-    char exe[OS_PATH_MAX];
-    OK(os_proc_self_path(exe, sizeof exe));
-    CHECK(os_path_is_absolute(exe));
-    os_stat st;
-    OK(os_stat_path(exe, 0, &st));
-    CHECK(st.kind == OS_KIND_FILE);
-    CHECK(os_proc_id() == (uint64_t)getpid());
-
     /* A lock held by a process is released when that process dies. */
     char path[OS_PATH_MAX];
     join(path, sizeof path, work_root, "proc.lock");
@@ -1262,33 +1260,33 @@ static void case_known_dirs(void)
     OK(os_mkdir(data));
     OK(os_mkdir(runtime));
     OK(os_mkdir(home));
-    OK(os_env_set("XDG_CONFIG_HOME", config));
-    OK(os_env_set("XDG_DATA_HOME", data));
-    OK(os_env_set("XDG_RUNTIME_DIR", runtime));
-    OK(os_env_set("HOME", home));
+    env_set("XDG_CONFIG_HOME", config);
+    env_set("XDG_DATA_HOME", data);
+    env_set("XDG_RUNTIME_DIR", runtime);
+    env_set("HOME", home);
 
     check_app_dir(OS_APP_CONFIG, config, EDIT_APP_ID);
     check_app_dir(OS_APP_DATA, data, EDIT_APP_ID);
 
     char trailing[OS_PATH_MAX], out[OS_PATH_MAX];
     join(trailing, sizeof trailing, config, "/");
-    OK(os_env_set("XDG_CONFIG_HOME", trailing));
+    env_set("XDG_CONFIG_HOME", trailing);
     check_app_dir(OS_APP_CONFIG, config, EDIT_APP_ID);
 
-    OK(os_env_set("XDG_CONFIG_HOME", "relative"));
-    OK(os_env_set("XDG_DATA_HOME", ""));
+    env_set("XDG_CONFIG_HOME", "relative");
+    env_set("XDG_DATA_HOME", "");
     check_app_dir(OS_APP_CONFIG, home, ".config/" EDIT_APP_ID);
     check_app_dir(OS_APP_DATA, home, ".local/share/" EDIT_APP_ID);
-    OK(os_env_set("HOME", "relative"));
+    env_set("HOME", "relative");
     EXPECT(os_app_dir(OS_APP_CONFIG, out, sizeof out), OS_E_NOENT);
-    OK(os_env_set("HOME", NULL));
+    env_set("HOME", NULL);
     EXPECT(os_app_dir(OS_APP_DATA, out, sizeof out), OS_E_NOENT);
     EXPECT(os_app_dir((os_app_dir_kind)0, out, sizeof out), OS_E_INVAL);
 
-    OK(os_env_set("TMPDIR", trailing));
+    env_set("TMPDIR", trailing);
     OK(os_temp_dir(out, sizeof out));
     CHECK(strcmp(out, config) == 0);
-    OK(os_env_set("TMPDIR", "relative"));
+    env_set("TMPDIR", "relative");
     OK(os_temp_dir(out, sizeof out));
     CHECK(strcmp(out, "/tmp") == 0);
 

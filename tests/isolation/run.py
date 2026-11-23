@@ -54,8 +54,21 @@ SOURCES = {
     'local undefinition': ('#undef /* identity is build-defined */ EDIT_APP_ID', 1, REDEFINED),
     'local definition': ('%:define EDIT_APP_ID "other-editor"', 1, REDEFINED),
 }
+ENV = 'shipped code reads only product variables; isolate tests through a link-time seam'
+# v2-0fv.20: a test hook read through the environment, and a computed name
+# outside os. The near neighbour reads a product variable by literal.
+ENV_SOURCES = {
+    'test hook through os': ('void f(char *b) { (void)os_env_get("EDIT_IPC_NAMESPACE", b, 8); }', 1,
+                             "environment read of 'EDIT_IPC_NAMESPACE'"),
+    'test hook through libc': ('#include <stdlib.h>\nconst char *g(void) { return getenv("EDIT_IPC_FALLBACK_DIR"); }',
+                               2, "environment read of 'EDIT_IPC_FALLBACK_DIR'"),
+    'computed name': ('static const char *n = "HOME";\nvoid f(char *b) { (void)os_env_get(n, b, 8); }', 2,
+                      'environment name passed to os_env_get is not a string literal'),
+}
 NEAR = (('limite', 'limate'), (r'\x69te', r'\x61te'), (r'\151te', r'\141te'), ('\\\nite', '\\\nate'),
-        ('"ite"', '"ate"'), ("'i','t','e'", "'a','t','e'"), ('EDIT_APP_ID', 'EDIT_APP_NAME'))
+        ('"ite"', '"ate"'), ("'i','t','e'", "'a','t','e'"), ('EDIT_APP_ID', 'EDIT_APP_NAME'),
+        ('"EDIT_IPC_NAMESPACE"', '"XDG_RUNTIME_DIR"'), ('"EDIT_IPC_FALLBACK_DIR"', '"TMPDIR"'),
+        ('os_env_get(n,', 'os_env_get("HOME",'))
 
 
 def near_neighbour(snippet):
@@ -98,6 +111,13 @@ def main():
             source.write_text(snippet + '\n', encoding='utf-8')
             verdicts.append(expect(name, lint, 1, [
                 f'src/probe.c:{line}: error: {reason}; build app-identity paths from EDIT_APP_ID',
+                'check_isolation: FAIL: 1 violation(s)']))
+            source.write_text(near_neighbour(snippet) + '\n', encoding='utf-8')
+            verdicts.append(expect(f'{name} (near neighbour)', lint, 0, [CLEAN_RUN]))
+        for name, (snippet, line, reason) in ENV_SOURCES.items():
+            source.write_text(snippet + '\n', encoding='utf-8')
+            verdicts.append(expect(name, lint, 1, [
+                f'src/probe.c:{line}: error: {reason}; {ENV}',
                 'check_isolation: FAIL: 1 violation(s)']))
             source.write_text(near_neighbour(snippet) + '\n', encoding='utf-8')
             verdicts.append(expect(f'{name} (near neighbour)', lint, 0, [CLEAN_RUN]))

@@ -296,9 +296,10 @@ typedef enum os_app_dir_kind { OS_APP_CONFIG = 1, OS_APP_DATA = 2 } os_app_dir_k
 os_err os_app_dir(os_app_dir_kind kind, char *out, size_t cap);
 /* Absolute TMPDIR, otherwise /tmp. Strip trailing slashes except at /. */
 os_err os_temp_dir(char *out, size_t cap);
-/* Environment access must be serialized against mutation. NULL value unsets. */
+/* Environment reads must be serialized against mutation. Shipped code reads
+ * only product variables (tools/check_isolation.py); there is no setter, as
+ * no shipped caller sets one (v2-0fv.20). */
 os_err os_env_get(const char *name, char *out, size_t cap);
-os_err os_env_set(const char *name, const char *value);
 
 size_t os_page_size(void);
 /* Alignment required for a file mapping's offset. */
@@ -385,10 +386,9 @@ void os_vm_release(void *addr, size_t len);
 /* Fill the entire buffer with getrandom, restarting interrupted transfers. */
 os_err os_random(void *buf, size_t n);
 
-/* Child processes (spawn, kill, wait) were removed in v2-0fv.13: no module
- * called them. The bead that needs one adds it together with its client. */
-uint64_t os_proc_id(void);
-os_err os_proc_self_path(char *out, size_t cap);
+/* Child processes (spawn, kill, wait) were removed in v2-0fv.13, the process
+ * id and executable path in v2-0fv.20: no module called them. The bead that
+ * needs one adds it together with its client. */
 
 /* The real user ID, for endpoint names and ownership checks. */
 uint32_t os_user_id(void);

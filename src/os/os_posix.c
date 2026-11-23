@@ -732,12 +732,6 @@ os_err os_env_get(const char *name, char *out, size_t cap)
     if (!v) return fail_with(OS_E_NOENT);
     return copy_out(out, cap, v, strlen(v));
 }
-os_err os_env_set(const char *name, const char *value)
-{
-    if (!name) return fail_with(OS_E_INVAL);
-    int rc = value ? setenv(name, value, 1) : unsetenv(name);
-    return rc ? fail() : OS_OK;
-}
 
 /* ---- memory ------------------------------------------------------------- */
 size_t os_page_size(void) { return (size_t)getpagesize(); }
@@ -1150,8 +1144,7 @@ os_err os_random(void *buf, size_t n)
     return OS_OK;
 }
 
-/* ---- process identity --------------------------------------------------- */
-uint64_t os_proc_id(void) { return (uint64_t)getpid(); }
+/* ---- descriptor limit ---------------------------------------------------- */
 os_err os_fd_limit_raise(uint64_t *soft)
 {
     struct rlimit now;
@@ -1163,14 +1156,6 @@ os_err os_fd_limit_raise(uint64_t *soft)
     if (setrlimit(RLIMIT_NOFILE, &now)) return fail();
     if (soft) *soft = (uint64_t)now.rlim_cur;
     return OS_OK;
-}
-os_err os_proc_self_path(char *out, size_t cap)
-{
-    char tmp[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", tmp, sizeof tmp);
-    if (n < 0) return fail();
-    if ((size_t)n >= sizeof tmp) return fail_with(OS_E_NAMETOOLONG);
-    return copy_out(out, cap, tmp, (size_t)n);
 }
 
 /* ---- local streams (v2-0fv.13) ----------------------------------------- */

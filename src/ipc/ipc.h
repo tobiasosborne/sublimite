@@ -114,12 +114,10 @@ typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
  * Endpoint names are built from the build identity EDIT_APP_ID: the
  * filesystem leaf is <app-id>-<uid><display-suffix>.sock inside the verified
  * runtime directory (lock leaf: same stem, .lock), the abstract name is
- * <app-id>-<uid><display-suffix>. Test hook: when EDIT_IPC_NAMESPACE is set,
- * the abstract name on both server and client gains a -<namespace> segment.
- * Use a unique namespace per test process, inherited by its forked clients.
- * Empty namespaces return IPC_INVALID; names too long return IPC_LIMIT.
- * Filesystem endpoints ignore this hook. Set it before IPC calls, and keep
- * it stable for the endpoint lifetime; do not change it from another thread.
+ * <app-id>-<uid><display-suffix>. If another uid holds the abstract name,
+ * the fallback is the same leaf in /run/user/<uid>. No environment variable
+ * other than XDG_RUNTIME_DIR changes an endpoint; tests isolate theirs
+ * through link-time seams (tests/ipc_seam.h, v2-0fv.20).
  * (v1's Windows named-pipe endpoint is not carried over; see v1 ipc_win.c
  * at 6fec2e8.)
  * All server calls belong to the loop thread; fini only after successful init. */

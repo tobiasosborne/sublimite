@@ -69,7 +69,6 @@ getcwd                 os # current working directory
 getenv                 os # lookup in the process environment
 gethostname            os # local host name
 getpagesize            os # Linux base page size
-getpid                 os # calling process ID
 getrandom              os # Linux kernel random bytes
 getrlimit              os # current process resource limits
 getsockopt             os # SO_PEERCRED peer user ID of a local stream
@@ -105,7 +104,6 @@ pwrite                 os # positioned file write
 raise                  os # fault chain: re-raise SIGBUS under the default action
 read                   os # sequential read or eventfd drain
 readdir                os # advance a directory stream
-readlink               os # read a symlink target
 recv                   os # local stream read and peek
 renameat               os # directory-relative atomic rename
 renameat2              os # Linux atomic rename with no replacement
@@ -113,7 +111,6 @@ rewinddir              os # reset a directory stream cursor
 rmdir                  os # remove an empty directory
 sched_yield            os # yield the calling thread
 send                   os # local stream write with MSG_NOSIGNAL
-setenv                 os # set a process environment variable
 setrlimit              os # update a process resource limit
 socket                 os # local stream endpoint descriptors
 socketpair             os # connected local stream pair
@@ -128,7 +125,6 @@ sigaction              os # query, install and reset the SIGBUS action (fault se
 sigemptyset            os # empty mask for the fault chain's default action
 unlink                 os # remove a non-directory name
 unlinkat               os # directory-relative name removal
-unsetenv               os # remove a process environment variable
 write                  os # sequential write or eventfd signal
 
 # vendor_ts: the vendored tree-sitter runtime (lib.o) and grammar scanners, a

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Validate the v2 build identity and reject hardcoded identities in src/."""
+"""Validate the v2 build identity, reject hardcoded identities in src/ and
+environment reads of anything but a product variable (v2-0fv.20)."""
 
 import argparse
 from bisect import bisect_right
@@ -23,6 +24,13 @@ SIMPLE_ESCAPES = {
     'a': '\a', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t', 'v': '\v',
 }
 STRING_FORMAT = re.compile(r'(?:[^%]|%s|%%)*')
+# Environment variables the shipped product reads. A name is here because the
+# product needs it, never because a test does: tests isolate through link-time
+# seams (tests/ipc_seam.h) or through these variables (docs/decisions/v2-0fv.20.md).
+PRODUCT_ENV = frozenset(('HOME', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR'))
+ENV_READERS = frozenset(('getenv', 'secure_getenv', 'os_env_get'))
+IDENTITY_FIX = 'build app-identity paths from EDIT_APP_ID'
+ENV_FIX = 'shipped code reads only product variables; isolate tests through a link-time seam'
 
 
 class Token(NamedTuple):
@@ -144,6 +152,20 @@ def violations(tokens):
                     yield offset, 'EDIT_APP_ID is defined by the build'
 
 
+def env_violations(tokens, forwarder):
+    """Each read names a product variable by literal. Only os, which forwards
+    its callers' literals, may pass a computed name."""
+    for i, token in enumerate(tokens[:-2]):
+        if token.kind != 'code' or token.value not in ENV_READERS or tokens[i + 1][:2] != ('code', '('):
+            continue
+        arg = tokens[i + 2]
+        if arg.kind == 'string':
+            if arg.value not in PRODUCT_ENV:
+                yield arg.offset, f'environment read of {arg.value!r}'
+        elif not forwarder:
+            yield arg.offset, f'environment name passed to {token.value} is not a string literal'
+
+
 def scan_sources(root):
     bad = files = 0
     for dirpath, dirnames, filenames in os.walk(root / 'src', onerror=raise_walk_error):
@@ -154,9 +176,12 @@ def scan_sources(root):
             path = Path(dirpath) / fn
             files += 1
             text, line_of = desplice(clex.read_text(path))
-            for offset, reason in violations(source_tokens(text)):
-                print(f'{path.relative_to(root)}:{line_of(offset)}: error: {reason}; '
-                      'build app-identity paths from EDIT_APP_ID')
+            tokens = source_tokens(text)
+            forwarder = path.parent == root / 'src' / 'os'
+            found = [(offset, reason, IDENTITY_FIX) for offset, reason in violations(tokens)]
+            found += [(offset, reason, ENV_FIX) for offset, reason in env_violations(tokens, forwarder)]
+            for offset, reason, fix in sorted(found):
+                print(f'{path.relative_to(root)}:{line_of(offset)}: error: {reason}; {fix}')
                 bad += 1
     return bad, files
 

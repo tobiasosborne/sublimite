@@ -11,7 +11,7 @@
  *   callback nor get an ACK (credential regression traps).
  * Part 5 (v2): NUL-split argv through ipc_parse_args + stdin + activation. */
 #include "ipc/ipc.h"
-#include "../tests/ipc_peer_seam.h"
+#include "../tests/ipc_seam.h"
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -84,7 +84,7 @@ static ipc_server g_srv; static int g_srv_state; /* 0 untried, 1 up, -1 unavaila
 static int e2e_connect(void)
 {
     struct sockaddr_un a; memset(&a,0,sizeof a); a.sun_family=AF_UNIX;
-    int n=snprintf(a.sun_path+1,sizeof a.sun_path-1,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),getenv("EDIT_IPC_NAMESPACE"));
+    int n=snprintf(a.sun_path+1,sizeof a.sun_path-1,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),ipc_seam_namespace);
     int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0); ASSERT(fd>=0);
     ASSERT(connect(fd,(struct sockaddr *)&a,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n))==0);
     return fd;
@@ -97,8 +97,8 @@ static void pump(sink *s, int ms)
 static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, bool foreign)
 {
     if(g_srv_state==0) {
-        char ns[64]; snprintf(ns,sizeof ns,"fuzz-%ld",(long)getpid());
-        ASSERT(setenv("EDIT_IPC_NAMESPACE",ns,1)==0); unsetenv("XDG_RUNTIME_DIR");
+        snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"fuzz-%ld",(long)getpid());
+        unsetenv("XDG_RUNTIME_DIR");
         g_srv_state=ipc_server_init(&g_srv,NULL)==IPC_OK?1:-1;
     }
     if(g_srv_state<0) return;

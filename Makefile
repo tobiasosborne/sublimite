@@ -193,10 +193,11 @@ LDFLAGS_os_fault_test := -Wl,--wrap=mmap,--wrap=sem_wait,--wrap=sem_post
 # os_posix.c with OS_TEST_HOOKS (the generation setter, A15).
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/os_fault_test: $(B)/$(c)/src/os/os_posix_test_hooks.o))
 $(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
-# ipc's peer-identity decision is reached through a test-only link seam
-# (tests/ipc_peer_seam.h); the shipped binary has no override (v2-0fv.13).
-IPC_PEER_SEAM := -Wl,--wrap=os_stream_peer_uid
-$(foreach c,rel san tsan,$(B)/$(c)/tests/ipc_test) $(B)/fuzz/ipc_fuzz: private LDLIBS += $(IPC_PEER_SEAM)
+# ipc's peer-identity decision (v2-0fv.13) and its endpoint isolation
+# (v2-0fv.20) are reached through test-only link seams (tests/ipc_seam.h);
+# the shipped binary has no override and reads no test variable.
+IPC_SEAM := -Wl,--wrap=os_stream_peer_uid,--wrap=os_listen_local,--wrap=os_connect_local,--wrap=os_dir_open
+$(foreach c,rel san tsan,$(B)/$(c)/tests/ipc_test) $(B)/fuzz/ipc_fuzz: private LDLIBS += $(IPC_SEAM)
 # piece (v2-0fv.7): base refusal is injected at its one reservation path, and
 # a fault (nonzero epoch) or a failing poll at os_fault_poll (Lines tests). The
 # flat model (tests/piece_model.c defines every piece.h symbol) stands in for
