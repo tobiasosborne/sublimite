@@ -1,4 +1,13 @@
-"""Run the stock-v1, no-snapshot portions of file contracts R3 and R5."""
+"""Run file contracts R3 and R5 once against the pinned, inspected v1 oracle.
+
+Every wait is on an event: a snapshot reply on the inspector socket (SNAP, or
+NEXT after a named submit serial), an inotify event armed before the keys that
+cause it, or the editor's pidfd. The only timers are hang detectors; an expired
+one is ERROR, never FAIL.
+
+Exit status: 0 PASS, 3 FAIL, 4 ERROR, as in cases/recovery.py. Python reserves
+1 for an uncaught exception and argparse 2 for a usage error.
+"""
 
 import argparse
 from contextlib import ExitStack, contextmanager
@@ -19,33 +28,49 @@ import sys
 import tempfile
 import time
 
+from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
 from files_fixtures import BINARY_SEED, SEARCH_FILES, binary_bytes, search_results, search_tree
 from sandbox import Refused, RunTarget, Sandbox
-from xdriver import XDriver, XDriverError
+import snapwire as wire
+from test_oracle_inspector import GUARD, Inspector
+from xdriver import XDriver
 
 
 ROOT = Path(__file__).resolve().parents[3]
 BUILD = ROOT / "build"
-ORACLE_BUILD = Path("/home/tobias/Projects/sublimite-v1-oracle/build")
-PIN = "6fec2e8"
-ORACLE_SHA256 = "64c27b03f20f51abbfc512fc0b5441883e2d2b8f1ca916b9061c6eb18ca71115"
 # Reuse the X driver conformance fixture's operation and wrapper watchdogs.
 WATCHDOG = 15
 WAIT_MS = WATCHDOG * 1000
-GEOMETRY = "1280x1024x24"  # Xvfb(1)'s default screen geometry.
-WAITING = "waiting: requires snapshot adapter (v2-he7.11)"
-TIER_A_ASSERTIONS = {
-    "R3": ("save-b-bytes", "save-a-bytes", "other-files-unchanged"),
-    "R5": ("open-alive", "open-exit", "reopen-alive", "reopen-exit", "bytes-unchanged"),
+SCREEN = (1280, 1024)  # Xvfb(1)'s default screen geometry.
+GEOMETRY = f"{SCREEN[0]}x{SCREEN[1]}x24"
+# test_oracle_inspector.CAPACITY's bound (one settled frame, one overscan row,
+# a cell per window pixel carrying at most U+FFFD, a tab per column) evaluated
+# at this screen. Each frame's window must fit the screen, or the run is ERROR.
+CAPACITY = (2 * wire.WORD.size + wire.FRAME_SIZES.size + 3 * wire.RECT.size
+            + wire.SCROLL.size + wire.FRAME_TAIL.size + wire.WORD.size
+            + SCREEN[0] * (SCREEN[1] + 1) * (wire.CELL_HEADER.size + len("�".encode()))
+            + SCREEN[0] * (wire.RECT.size + wire.WORD.size))
+EXIT = {"PASS": 0, "FAIL": 3, "ERROR": 4}
+ASSERTIONS = {
+    "R3": ("results-between-a-and-b", "save-b-bytes", "save-a-bytes",
+           "results-text-still-visible", "other-files-unchanged", "law2-count"),
+    "R5": ("open-alive", "header-painted", "adjacent-text-and-sibling-save", "open-exit",
+           "reopen-alive", "settled-binary-tab-revisit", "reopen-exit", "bytes-unchanged",
+           "law2-count"),
 }
-WAITING_ASSERTIONS = {
-    "R3": ("results-between-a-and-b", "results-text-still-visible"),
-    "R5": ("header-painted", "settled-binary-tab-revisit", "adjacent-text-and-sibling-save"),
-}
-NEGATIVES = tuple(f"{case}.{assertion}" for case, assertions in TIER_A_ASSERTIONS.items()
-                  for assertion in assertions) + ("R3.save-signal",)
-IN_MOVED_TO = 0x00000080
+EVIDENCE = {"results-between-a-and-b": "B", "results-text-still-visible": "B",
+            "header-painted": "B", "settled-binary-tab-revisit": "B",
+            "adjacent-text-and-sibling-save": "A+B", "law2-count": "B",
+            "search-readiness": "B", "edit-b": "B", "edit-a": "B", "edit-sibling": "B"}
+NEGATIVES = tuple(f"{case}.{assertion}" for case, assertions in ASSERTIONS.items()
+                  for assertion in assertions) + ("R3.save-signal", "R3.snapshot-reply")
+RESULTS_TITLE = "Find Results"
+TAB_TRAILER = 2  # v1's last two tab cells hold the modified dot and spacing.
+UNRESOLVED = "▯"  # Stands for an unresolved cell; never part of an expected ASCII text.
+SEARCH_END = re.compile(r"\d+ match(es)? (across \d+ files|in 1 file)$|Search (failed|truncated|cancelled)")
+SIBLING = b"sibling text\n"
 IN_ACCESS = 0x00000001
+IN_MOVED_TO = 0x00000080
 IN_Q_OVERFLOW = 0x00004000
 IN_IGNORED = 0x00008000
 INOTIFY_EVENT = struct.Struct("=iIII")
@@ -116,11 +141,9 @@ def private_display(display, artifacts):
         finally:
             if server.poll() is None:
                 server.terminate()
-                try:
-                    server.wait(timeout=WATCHDOG)
-                except subprocess.TimeoutExpired:
+                if not exited(server, WATCHDOG):
                     server.kill()
-                    server.wait(timeout=WATCHDOG)
+            server.wait()
 
 
 @contextmanager
@@ -170,18 +193,100 @@ def wait_for_file_event(fd, path, mask, child):
     raise TimeoutError(f"no {mask:#x} file event for {path.name} before deadline")
 
 
+def exited(process, timeout):
+    """Wait on the process's pidfd; True once it can be reaped without blocking."""
+    if process.poll() is not None:
+        return True
+    pidfd = os.pidfd_open(process.pid)
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(pidfd, selectors.EVENT_READ)
+            return bool(ready.select(timeout))
+    finally:
+        os.close(pidfd)
+
+
+class Snapshots(Inspector):
+    """The oracle transport; each reply wait also wakes on the editor's exit."""
+
+    def __init__(self, stack):
+        super().__init__(stack, CAPACITY)
+        self.pidfd = None
+        self.deadline = None
+
+    def packet(self):
+        with selectors.DefaultSelector() as ready:
+            ready.register(self.reader, selectors.EVENT_READ)
+            ready.register(self.pidfd, selectors.EVENT_READ)
+            pending = {key.fd for key, _ in ready.select(max(0, self.deadline - time.monotonic()))}
+        if self.reader.fileno() not in pending:
+            if self.pidfd in pending:
+                raise Refused("editor exited while awaiting a snapshot")
+            raise TimeoutError("missing snapshot reply before watchdog")
+        packet, ancillary, flags, _ = self.reader.recvmsg(wire.PACKET.size)
+        if flags or ancillary:
+            raise wire.ProtocolError("truncated reply or unexpected ancillary data")
+        return packet
+
+
+def row_text(frame, row, start, stop):
+    """Displayed text of a cell range; unresolved cells read as UNRESOLVED (T3).
+
+    Expected texts are ASCII, so a required match crossing an unresolved cell fails."""
+    offset = row * frame.columns
+    return "".join(UNRESOLVED if cell.kind == wire.CellKind.UNRESOLVED else
+                   " " if cell.kind == wire.CellKind.BLANK else cell.text
+                   for cell in frame.cells[offset + start:offset + stop])
+
+
+def document_rows(frame):
+    d = frame.document
+    return [row_text(frame, y, d.x, d.x + d.width).rstrip(" ") for y in range(d.y, d.y + d.height)]
+
+
+def tab_strip(frame):
+    """Visible tab titles in strip order and the active tab's index."""
+    titles = [row_text(frame, tab.rect.y, tab.rect.x, tab.rect.x + tab.rect.width - TAB_TRAILER).strip()
+              for tab in frame.tabs]
+    active = [i for i, tab in enumerate(frame.tabs) if tab.active]
+    return titles, active[0] if len(active) == 1 else None
+
+
+def active_title(frame):
+    titles, active = tab_strip(frame)
+    return None if active is None else titles[active]
+
+
+def hard_wrapped(text, width, height):
+    """v1's Find Results rows for this fixture: a line wider than the document breaks
+    every `width` cells. The fixture's only wide lines are absolute paths; a space in
+    one would put the line outside this model, which is then a harness ERROR."""
+    rows = []
+    for line in text.split("\n"):
+        if len(line) > width and " " in line:
+            raise Refused(f"Find Results line outside the hard-wrap model: {line!r}")
+        rows += [line[i:i + width] for i in range(0, len(line), width)] or [""]
+    if len(rows) > height:
+        raise Refused(f"Find Results needs {len(rows)} rows; the document shows {height}")
+    return [row.rstrip(" ") for row in rows] + [""] * (height - len(rows))
+
+
 class Case:
     def __init__(self, case_id, artifacts, negative):
         self.id = case_id
         self.artifacts = artifacts / case_id
         self.artifacts.mkdir(mode=0o700)
         self.records = artifacts / "results.jsonl"
+        self.transcript = self.artifacts / "snapshots.jsonl"
         self.run_id = artifacts.name
         self.seed = BINARY_SEED if case_id == "R5" else None
         self.negative = negative
         self.children = []
+        self.logs = []
         self.asserted = []
-        self.failed = False
+        self.results = []
+        self.inspector = self.child = self.driver = None
+        self.ticket = self.serial = None
         self.step("setup", "private sandbox and authenticated X driver")
 
     def note(self, message):
@@ -194,14 +299,14 @@ class Case:
         self.observed = None
         self.note(assertion)
 
-    def emit(self, status, *, assertion=None, evidence="A", reason=None):
-        assertion = assertion or self.assertion
+    def emit(self, status, *, reason=None):
         record = {
-            "run_id": self.run_id, "case_id": self.id, "assertion_id": assertion,
-            "evidence": evidence, "first_required_wave": 3 if self.id == "R3" else 2,
-            "status": status, "predicate": reason or assertion,
-            "observed": self.observed if evidence == "A" else None,
-            "expected": self.expected if evidence == "A" else "snapshot adapter available",
+            "run_id": self.run_id, "case_id": self.id, "assertion_id": self.assertion,
+            "evidence": EVIDENCE.get(self.assertion, "A"),
+            "first_required_wave": 3 if self.id == "R3" else 2,
+            "status": status, "predicate": reason or self.assertion,
+            "observed": self.observed, "expected": self.expected,
+            "ticket": self.ticket, "submit_serial": self.serial,
             "seed": self.seed, "negative": self.negative,
             "child_status": [{"pid": child.pid, "exit": child.poll()} for child in self.children],
             "artifacts": str(self.artifacts),
@@ -211,79 +316,153 @@ class Case:
             print(line, file=file)
         print(line, flush=True)
         if status != "PASS":
-            print(f"{self.id}.{assertion}: {status} {record['predicate']}", file=sys.stderr)
-        self.failed |= status != "PASS" and evidence == "A"
+            print(f"{self.id}.{self.assertion}: {status} {record['predicate']}", file=sys.stderr)
+        self.results.append(status)
 
-    def check(self, assertion, observed, expected, wrong):
+    @property
+    def status(self):
+        for status in ("ERROR", "FAIL"):
+            if status in self.results:
+                return status
+        return "PASS" if self.results else "ERROR"
+
+    def check(self, assertion, observe, expected, wrong):
+        """Compare once. `observe` is a value or a function of the active expectation."""
         self.step(assertion, wrong if self.negative == f"{self.id}.{assertion}" else expected)
-        self.observed = observed
-        if assertion in self.asserted or assertion not in TIER_A_ASSERTIONS[self.id]:
-            self.step("assertion-inventory", "each known Tier A assertion executes once")
+        if assertion in self.asserted or assertion not in ASSERTIONS[self.id]:
+            self.step("assertion-inventory", "each known assertion executes once")
             raise Refused(f"duplicate or unknown assertion {assertion}")
         self.asserted.append(assertion)
-        if observed != self.expected:
+        self.observed = observe(self.expected) if callable(observe) else observe
+        if self.observed != self.expected:
             raise Mismatch(f"{assertion}: observed value differs from expectation")
         self.emit("PASS")
 
     def failure(self, exc):
-        if not self.failed:
+        # The first failure in a case is final; its later steps do not run.
+        if "FAIL" not in self.results and "ERROR" not in self.results:
             self.emit("FAIL" if isinstance(exc, Mismatch) else "ERROR",
                       reason=f"{type(exc).__name__}: {exc}")
 
-    def bind(self, sandbox, driver, child):
-        window = driver.find(child.pid, WAIT_MS)
-        driver.focus()
+    def launch(self, stack, start, paths, driver):
+        """Start one inspected editor, owned by `stack` for its lifetime."""
+        self.inspector = Snapshots(stack)
+        self.driver = driver
+        log_path = self.artifacts / f"editor-{len(self.children) + 1}.log"
+        with log_path.open("wb") as log:
+            self.child = start([*self.inspector.args, *map(str, paths)], stdout=log, stderr=log,
+                               pass_fds=self.inspector.fds)
+        self.children.append(self.child)
+        self.logs.append(log_path)
+        self.inspector.writer.close()
+        self.inspector.pidfd = os.pidfd_open(self.child.pid)
+        stack.callback(os.close, self.inspector.pidfd)
+        return self.child
+
+    def bind(self, sandbox):
+        window = self.driver.find(self.child.pid, WAIT_MS)
+        self.driver.focus()
         sandbox.record_server()
-        self.note(f"focused PID {child.pid} window {window:#x}")
+        self.note(f"focused PID {self.child.pid} window {window:#x}")
         return window
 
-    def start(self, start, path):
-        with (self.artifacts / f"editor-{len(self.children) + 1}.log").open("wb") as log:
-            child = start([str(path)], stdout=log, stderr=log)
-        self.children.append(child)
-        return child
+    def frame(self, action, *, after=None, deadline=None):
+        """One settled frame: SNAP, or NEXT after the submit serial `after`."""
+        inspector = self.inspector
+        inspector.deadline = deadline or time.monotonic() + WATCHDOG
+        operation = wire.Operation.SNAP if after is None else wire.Operation.NEXT
+        previous = 0 if after is None else after
+        self.ticket, self.serial = inspector.ticket + 1, None
+        if self.negative == f"{self.id}.snapshot-reply":
+            # Withhold the marker. The live editor keeps its endpoint open, so the
+            # receive path must reach its watchdog, independently of EOF.
+            self.note(f"negative control withheld ticket {self.ticket}")
+            inspector.receive(wire.Request(operation, self.ticket, previous))
+            raise wire.ProtocolError("received a reply to the withheld marker")
+        snapshot = inspector.receive(inspector.send(self.driver, operation, previous))
+        if len(snapshot.frames) != 1:
+            raise wire.ProtocolError("the pinned oracle must provide exactly one settled frame")
+        frame = snapshot.settled
+        if frame.window_width > SCREEN[0] or frame.window_height > SCREEN[1]:
+            raise Refused(f"window {frame.window_width}x{frame.window_height} exceeds the mapping bound")
+        self.serial = frame.submit_serial
+        titles, active = tab_strip(frame)
+        with self.transcript.open("a", encoding="utf-8") as log:
+            print(json.dumps({"action": action, "request": operation.name, "ticket": self.ticket,
+                              "after_serial": previous, "submit_serial": self.serial,
+                              "tabs": titles, "active": active, "document": vars(frame.document),
+                              "rows": document_rows(frame),
+                              "unresolved": sum(cell.kind == wire.CellKind.UNRESOLVED
+                                                for cell in frame.cells)}), file=log)
+        return frame
+
+    def quit(self):
+        """Ctrl+Q; the editor must exit 0 (reaped on its pidfd)."""
+        if self.child.poll() is not None:
+            raise Refused(f"editor exited before deliberate quit: {self.child.returncode}")
+        self.driver.chord("Control_L", "q")
+        if not exited(self.child, WATCHDOG):
+            raise TimeoutError("editor did not exit before watchdog after Ctrl+Q")
+        status = self.child.wait()
+        if status != 0:
+            raise Refused(f"editor exited abnormally after Ctrl+Q: {status}")
+        return status
+
+    def allocation_count(self):
+        """The passive Law-2 report printed by the last editor's clean exit."""
+        report = GUARD.search(self.logs[-1].read_bytes())
+        if report is None:
+            raise Refused(f"{self.logs[-1].name} has no allocation count")
+        active, allocations, scopes = map(int, report.groups())
+        self.note(report.group().decode("ascii"))
+        # Fail closed on an inert guard or a window that measured nothing (v2-he7.11).
+        if active != 1 or scopes == 0:
+            raise Refused(f"allocation guard inert or no window measured: {report.group()!r}")
+        return {"allocations": allocations, "scopes": scopes}
 
 
-def search_copy(case, driver, child, window, expected):
-    case.step("search-readiness", "completed Find Results containing the B match")
-    # Own a sentinel first so the observed data comes from an editor copy command.
-    sentinel = driver.own("CLIPBOARD", b"files-contract clipboard sentinel")
+def search_frame(case, expected):
+    """NEXT until a frame draws the search's end line, then compare that frame once."""
+    case.step("search-readiness", "the completed Find Results frame draws the fixture results")
     deadline = time.monotonic() + WATCHDOG
-    while time.monotonic() < deadline:
-        driver.chord("Control_L", "a")
-        driver.chord("Control_L", "c")
-        owner = driver.owner("CLIPBOARD")
-        if owner == sentinel:
-            if child.poll() is not None:
-                raise Refused("editor exited before Find Results was readable")
-            continue  # Empty results have nothing to copy.
-        if owner != window:
-            raise Refused(f"unexpected clipboard owner {owner:#x}")
-        copied = driver.read("CLIPBOARD", window, WAIT_MS)
-        if copied != case.observed:
-            case.note(f"Find Results clipboard: {copied!r}")
-        case.observed = copied
-        if copied == expected:
-            return
-        if not expected.startswith(copied):
-            raise Mismatch("Find Results clipboard diverged from the fixture result")
-        sentinel = driver.own("CLIPBOARD", b"files-contract clipboard sentinel")
-    raise TimeoutError("Find Results completion was not observed")
+    frame = case.frame("search submitted", deadline=deadline)
+    while not (active_title(frame) == RESULTS_TITLE
+               and any(SEARCH_END.match(row) for row in document_rows(frame))):
+        frame = case.frame("search progress", after=frame.submit_serial, deadline=deadline)
+    d = frame.document
+    case.expected = hard_wrapped(expected, d.width, d.height)
+    case.observed = document_rows(frame)
+    if case.observed != case.expected:
+        raise Mismatch("completed Find Results differ from the fixture results")
+    return frame
 
 
-def save(case, driver, child, path, original):
+def save(case, path, original):
     case.step(f"save-{path.stem}-signal", f"IN_MOVED_TO for {path.name}")
     with directory_watch(path.parent, IN_MOVED_TO) as watch:
         case.observed = path.read_bytes()
         if case.observed != original:
             raise Mismatch(f"{path.name} changed before its save")
         if case.negative != "R3.save-signal":
-            driver.chord("Control_L", "s")
+            case.driver.chord("Control_L", "s")
         else:
             case.note("negative control withheld Ctrl+S")
-        wait_for_file_event(watch, path, IN_MOVED_TO, child)
+        wait_for_file_event(watch, path, IN_MOVED_TO, case.child)
     case.note(f"IN_MOVED_TO {path.name}")
     return path.read_bytes()
+
+
+def typed(case, action, title, row):
+    """A settled frame after an edit: the input prefix is disposed and the row drawn.
+
+    The adapter answers only once no input is queued and the buffer is not opening,
+    so Ctrl+S sent after this reply cannot overtake the edit (A9)."""
+    frame = case.frame(action)
+    case.expected = (title, 1)
+    case.observed = (active_title(frame), document_rows(frame).count(row))
+    if case.observed != case.expected:
+        raise Mismatch(f"{action}: the edited row is not drawn once in {title}")
+    return frame
 
 
 def unrelated_files(root, edited):
@@ -297,75 +476,151 @@ def unrelated_files(root, edited):
     return files
 
 
-def quit_editor(driver, child):
-    if child.poll() is not None:
-        raise Refused(f"editor exited before deliberate quit: {child.returncode}")
-    driver.chord("Control_L", "q")
-    status = child.wait(timeout=WATCHDOG)
-    if status != 0:
-        raise Refused(f"editor exited abnormally after Ctrl+Q: {status}")
-    return status
-
-
 def r3(case, sandbox, driver):
     root = sandbox.fixtures
     search_tree(root)
     a, b = "a.txt", "nested/b.c"
     others = unrelated_files(root, {a, b})
-    child = case.start(sandbox.start, root / a)
-    window = case.bind(sandbox, driver, child)
-    case.step("search-start", "Ctrl+Shift+F, cat, Tab, private fixture root, Return")
-    driver.chord("Control_L", "Shift_L", "f")
-    for key in "cat":
-        driver.key(key)
-    driver.key("Tab")
-    for byte in os.fsencode(root):
-        driver.key(byte)
-    driver.key("Return")
-    search_copy(case, driver, child, window, search_results(root))
-    case.step("open-b-match", "Return on the scatter result")
-    driver.chord("Control_L", "g")
-    driver.key("8")  # One-based form of the reference's zero-based scatter row 7.
-    driver.key("Return")
-    driver.key("Return")
-    driver.key("b")
+    results = search_results(root).decode("ascii")
     expected_b = b"cat\nsbcatter\ncat!\n"
     expected_a = b"a" + SEARCH_FILES[a]
-    saved_b = save(case, driver, child, root / b, SEARCH_FILES[b])
-    case.check("save-b-bytes", saved_b, expected_b, expected_a)
-    after_b = unrelated_files(root, {a, b})
+    strip = ["a.txt", RESULTS_TITLE, "b.c"]
+    with ExitStack() as stack:
+        case.launch(stack, sandbox.start, [root / a], driver)
+        case.bind(sandbox)
+        case.step("search-start", "Ctrl+Shift+F, cat, Tab, private fixture root, Return")
+        driver.chord("Control_L", "Shift_L", "f")
+        for key in "cat":
+            driver.key(key)
+        driver.key("Tab")
+        for byte in os.fsencode(root):
+            driver.key(byte)
+        driver.key("Return")
+        search_frame(case, results)
 
-    case.step("edit-a", "Alt+1, Ctrl+Home, type a")
-    driver.chord("Alt_L", "1")
-    driver.chord("Control_L", "Home")
-    driver.key("a")
-    saved_a = save(case, driver, child, root / a, SEARCH_FILES[a])
-    case.check("save-a-bytes", (saved_a, (root / b).read_bytes()),
-               (expected_a, expected_b), (expected_b, expected_b))
-    case.step("quit", "Ctrl+Q exits 0")
-    quit_editor(driver, child)
+        case.step("open-b-match", "Go to Line 8, Return on the scatter result")
+        driver.chord("Control_L", "g")
+        driver.key("8")  # One-based form of the reference's zero-based scatter row 7.
+        driver.key("Return")
+        driver.key("Return")
+        frame = case.frame("open b from the match")
+        case.check("results-between-a-and-b", tab_strip(frame), (strip, 2),
+                   (["a.txt", "b.c", RESULTS_TITLE], 1))
+
+        case.step("edit-b", "b drawn and its first journal entry before Ctrl+S (A9)")
+        journals = sorted(sandbox.data_dir.glob("session-*"))
+        if len(journals) != 1:
+            raise Refused(f"expected one session journal, found {[p.name for p in journals]}")
+        with directory_watch(sandbox.data_dir, IN_MOVED_TO) as journal:
+            driver.key("b")
+            typed(case, "type b", "b.c", "sbcatter")
+            # v1 commits the session's first edit by renaming its journal (large_undo.py).
+            wait_for_file_event(journal, journals[0], IN_MOVED_TO, case.child)
+        case.note(f"IN_MOVED_TO {journals[0].name}")
+        saved_b = save(case, root / b, SEARCH_FILES[b])
+        case.check("save-b-bytes", saved_b, expected_b, expected_a)
+        after_b = unrelated_files(root, {a, b})
+
+        case.step("edit-a", "Alt+1, Ctrl+Home, type a; a drawn before Ctrl+S")
+        driver.chord("Alt_L", "1")
+        driver.chord("Control_L", "Home")
+        driver.key("a")
+        typed(case, "type a", "a.txt", "aAlpha cat")
+        saved_a = save(case, root / a, SEARCH_FILES[a])
+        case.check("save-a-bytes", (saved_a, (root / b).read_bytes()),
+                   (expected_a, expected_b), (expected_b, expected_b))
+
+        case.step("show-results", "Alt+2 selects the surviving results tab")
+        driver.chord("Alt_L", "2")
+        frame = case.frame("results after both saves")
+        d = frame.document
+        model = hard_wrapped(results, d.width, d.height)
+        wrong = hard_wrapped(results.replace("9 matches", "8 matches"), d.width, d.height)
+        case.check("results-text-still-visible", (*tab_strip(frame), document_rows(frame)),
+                   (strip, 1, model), (strip, 1, wrong))
+        case.step("quit", "Ctrl+Q exits 0")
+        case.quit()
     case.check("other-files-unchanged", (after_b, unrelated_files(root, {a, b})),
                (others, others), ({}, {}))
+    count = case.allocation_count()
+    # v1 measured 0 for this window (docs/decisions/v2-he7.13.md), so the count rule asserts 0.
+    case.check("law2-count", [count["allocations"]], [0], [1])
+
+
+def tab_view(frame, rows):
+    """The active tab title and its first `rows` document rows."""
+    return active_title(frame), document_rows(frame)[:rows]
+
+
+def crossing(frame, title):
+    """Red control for T3: the drawn rows through the first row holding an unresolved
+    cell, with that cell expected as v1's '?' replacement glyph. Every other cell
+    equals the frame, so the FAIL shows a required match across an unresolved cell fails."""
+    rows = document_rows(frame)
+    first = next((i for i, row in enumerate(rows) if UNRESOLVED in row), None)
+    if first is None:
+        raise Refused("the binary frame has no unresolved cell to cross")
+    return title, [row.replace(UNRESOLVED, "?") for row in rows[:first + 1]]
 
 
 def r5(case, sandbox, driver):
     path = sandbox.fixtures / "fixture.pdf"
+    sibling = sandbox.fixtures / "sibling.txt"
     expected = binary_bytes()
     path.write_bytes(expected)
-    on_disk = []
-    for phase, start in (("open", sandbox.start), ("reopen", sandbox.restart)):
-        case.step(f"{phase}-alive", "file opened, mapped owned window, live editor")
-        with directory_watch(path.parent, IN_ACCESS) as watch:
-            child = case.start(start, path)
-            wait_for_file_event(watch, path, IN_ACCESS, child)
-        case.note(f"IN_ACCESS {path.name}, PID {child.pid}")
-        case.bind(sandbox, driver, child)
-        case.check(f"{phase}-alive", child.poll(), None, 0)
-        case.step(f"{phase}-exit", "Ctrl+Q exits 0")
-        status = quit_editor(driver, child)
-        case.check(f"{phase}-exit", status, 0, 1)
-        on_disk.append(path.read_bytes())
+    sibling.write_bytes(SIBLING)
+    header = (path.name, [expected[:expected.index(b"\n")].decode("ascii")])
+    on_disk, counts, revisits = [], [], []
+    for phase, start, paths in (("open", sandbox.start, [path, sibling]),
+                                ("reopen", sandbox.restart, [path])):
+        with ExitStack() as stack:
+            case.step(f"{phase}-alive", "file opened, mapped owned window, live editor")
+            with directory_watch(path.parent, IN_ACCESS) as watch:
+                child = case.launch(stack, start, paths, driver)
+                wait_for_file_event(watch, path, IN_ACCESS, child)
+            case.note(f"IN_ACCESS {path.name}, PID {child.pid}")
+            case.bind(sandbox)
+            case.check(f"{phase}-alive", child.poll(), None, 0)
+            if phase == "open":
+                case.step("activate-binary", "Alt+1 activates the binary tab")
+                driver.chord("Alt_L", "1")
+                frame = case.frame("activate binary tab")
+                case.check("header-painted", tab_view(frame, 1), header,
+                           (path.name, ["%PDF-1.4"]))
+
+                case.step("edit-sibling", "Alt+2, type s; s drawn before Ctrl+S")
+                driver.chord("Alt_L", "2")
+                driver.key("s")
+                frame = typed(case, "type into sibling", sibling.name, "s" + SIBLING.decode().rstrip())
+                drawn = tab_view(frame, 1)
+                saved = save(case, sibling, SIBLING)
+                case.check("adjacent-text-and-sibling-save", (*drawn, saved),
+                           (sibling.name, ["s" + SIBLING.decode().rstrip()], b"s" + SIBLING),
+                           (sibling.name, ["s" + SIBLING.decode().rstrip()], SIBLING))
+
+                case.step("revisit-binary", "Alt+1 returns to the binary tab")
+                driver.chord("Alt_L", "1")
+                revisits.append(case.frame("revisit binary tab"))
+            else:
+                # Alt+1 gives the reopened editor an input-to-submit window to count.
+                case.step("reopened-binary", "Alt+1 in the reopened editor shows the binary tab")
+                driver.chord("Alt_L", "1")
+                revisits.append(case.frame("reopened binary tab"))
+                wrong = None
+                if case.negative == "R5.settled-binary-tab-revisit":
+                    wrong = [crossing(revisits[0], path.name), header]
+                case.check("settled-binary-tab-revisit",
+                           lambda want: [tab_view(frame, len(rows))
+                                         for frame, (_, rows) in zip(revisits, want)],
+                           [header, header], wrong)
+            case.step(f"{phase}-exit", "Ctrl+Q exits 0")
+            status = case.quit()
+            case.check(f"{phase}-exit", status, 0, 1)
+            on_disk.append(path.read_bytes())
+            counts.append(case.allocation_count()["allocations"])
     case.check("bytes-unchanged", on_disk, [expected, expected], [expected, b"!" + expected[1:]])
+    # v1 measured 0 for both windows (docs/decisions/v2-he7.13.md); the count rule asserts 0.
+    case.check("law2-count", counts, [0, 0], [0, 1])
 
 
 def run_case(case, scenario, target, display, auth):
@@ -377,34 +632,34 @@ def run_case(case, scenario, target, display, auth):
                              timeout=WATCHDOG * 2) as driver:
                     try:
                         scenario(case, sandbox, driver)
-                        case.step("assertion-inventory", TIER_A_ASSERTIONS[case.id])
+                        case.step("assertion-inventory", ASSERTIONS[case.id])
                         case.observed = case.asserted
-                        if tuple(case.asserted) != TIER_A_ASSERTIONS[case.id]:
-                            raise Refused("Tier A assertion inventory incomplete")
+                        if tuple(case.asserted) != ASSERTIONS[case.id]:
+                            raise Refused("assertion inventory incomplete")
                         case.step("teardown", "driver shutdown and fixture retention")
-                    except (OSError, RuntimeError, Mismatch, subprocess.TimeoutExpired) as exc:
+                    except (OSError, RuntimeError, ValueError, Mismatch,
+                            subprocess.SubprocessError) as exc:
                         case.failure(exc)
             finally:
                 shutil.copytree(sandbox.fixtures, case.artifacts / "fixtures", symlinks=True)
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         case.failure(exc)
-    for assertion in WAITING_ASSERTIONS[case.id]:
-        case.emit("ERROR", assertion=assertion, evidence="B", reason=WAITING)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--oracle", required=True, type=Path)
+    parser.add_argument("--build-dir", required=True, type=Path,
+                        help="absolute inspected v1 build/contract-oracle directory")
     parser.add_argument("--display", required=True)
     parser.add_argument("--negative", choices=NEGATIVES)
     args = parser.parse_args()
     if not re.fullmatch(r":16[0-9]", args.display):
         parser.error("--display must be :160 through :169")
-    if not args.oracle.is_absolute() or not args.oracle.is_relative_to(ORACLE_BUILD):
-        parser.error(f"--oracle must be absolute and under {ORACLE_BUILD}")
+    if not args.build_dir.is_absolute():
+        parser.error("--build-dir must be absolute")
 
+    BUILD.mkdir(exist_ok=True)
     artifacts = Path(tempfile.mkdtemp(prefix="contract-files-", dir=BUILD))
-    target = RunTarget("v1", args.oracle, ORACLE_BUILD, ORACLE_SHA256)
     scenarios = {"R3": r3, "R5": r5}
     if args.negative:
         selected = args.negative.split(".", 1)[0]
@@ -414,26 +669,32 @@ def main():
     except OSError:
         battery = None
     manifest = {
-        "run_id": artifacts.name, "role": target.role, "oracle": str(target.executable),
-        "build_dir": str(target.build_dir), "sha256": target.sha256, "commit": PIN,
-        "display": args.display, "geometry": GEOMETRY, "cases": list(scenarios),
-        "battery_status": battery, "load_average": os.getloadavg(),
-        "negative": args.negative,
+        "run_id": artifacts.name, "display": args.display, "geometry": GEOMETRY,
+        "capacity": CAPACITY, "cases": list(scenarios), "battery_status": battery,
+        "load_average": os.getloadavg(), "negative": args.negative,
+        "oracle_build": str(args.build_dir),
     }
-    (artifacts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"R3/R5 run artifacts in {artifacts}", file=sys.stderr)
     cases = [Case(case_id, artifacts, args.negative) for case_id in scenarios]
     try:
+        stamp = json.loads((args.build_dir / STAMP).read_text(encoding="utf-8"))
+        if stamp["pin"] != PIN or stamp["patch_sha256"] != sha256(PATCH):
+            raise Refused("oracle manifest differs from the pinned source or patch")
+        target = RunTarget("v1", args.build_dir / EDITOR, args.build_dir, stamp["executables"][EDITOR])
+        manifest.update(role=target.role, oracle=str(target.executable), sha256=target.sha256,
+                        commit=PIN, patch_sha256=stamp["patch_sha256"])
         with private_display(args.display, artifacts) as auth:
             # Evaluate both independent cases once even after an earlier failure.
             for case in cases:
                 run_case(case, scenarios[case.id], target, args.display, auth)
-    except (OSError, Refused, subprocess.TimeoutExpired, XDriverError) as exc:
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         for case in cases:
-            case.step("display", "private Xvfb startup and shutdown")
+            case.step("display", "oracle identity, private Xvfb startup and shutdown")
             case.failure(exc)
-        return 1
-    return int(any(case.failed or WAITING_ASSERTIONS[case.id] for case in cases))
+    finally:
+        (artifacts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n",
+                                                 encoding="utf-8")
+    return max(EXIT[case.status] for case in cases)
 
 
 if __name__ == "__main__":

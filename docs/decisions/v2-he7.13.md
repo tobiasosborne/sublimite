@@ -1,126 +1,271 @@
-# W0.6f file contracts on the stock v1 oracle
+# W0.6f file contracts R3 and R5 on the inspected v1 oracle
 
-The runner binds the v1 role and commit `6fec2e8` to the absolute oracle build
-directory and executable SHA-256
-`64c27b03f20f51abbfc512fc0b5441883e2d2b8f1ca916b9061c6eb18ca71115`.
-It starts an authenticated Xvfb on the explicitly selected private display
-and runs each case once through `Sandbox` and `XDriver`. Each invocation
-retains its manifest, JSON Lines records, step logs, editor output and final
-fixture tree under `build/contract-files-*`. The Xvfb log and PID stay with
-the run. The runner reaps that PID on exit. The operation and driver pipe
-watchdogs are 15 s and 30 s, carried over from the measured X driver
-conformance fixture in [W0.6b](v2-he7.9.md).
+Both cases now run on the inspected v1 build, with disk assertions and
+screen assertions in the same run. The runner takes `--build-dir`, the
+`build/contract-oracle` directory of the disposable v1 tree. It checks the
+stamp's pin `6fec2e8c…` and patch SHA-256 `54bcf05f…fda1a`, and passes the
+stamped executable digest `ed75336c…2195` to the sandbox, which checks it on
+every launch. This is the same identity check as in
+[W0.6g](v2-he7.14.md). Every editor launch is inspected (`--inspect-fds`).
+The stock-oracle mode (`--oracle`) is gone. Its Tier A assertions run
+unchanged on the inspected build. The stock-pin disk and clipboard control is
+still the pre-ACK recovery case.
+
+```sh
+make check-contract-files ORACLE_TREE=/home/tobias/Projects/sublimite-v1-inspect CONTRACT_DISPLAY=:160
+```
+
+The run starts an authenticated Xvfb on the explicitly selected display
+(`:160`–`:169`, `-noreset -nolisten tcp`, private cookie). The screen is
+1280 × 1024 × 24, Xvfb(1)'s default. The runner stops Xvfb by its recorded
+PID and waits for it on a pidfd. Each invocation keeps its manifest, JSON
+Lines records, step logs, snapshot transcript, editor logs and final
+fixture tree under `build/contract-files-*`.
+
+**Mapping capacity.** The memfd uses the bound from
+`test_oracle_inspector.CAPACITY` (one settled frame, one overscan row, a cell
+per window pixel carrying at most U+FFFD, a tab per column). Here it is
+evaluated at the screen size, 1280 × 1025 cells, which gives 30,201,704 bytes
+(P). Every frame's window must fit the screen, or the run is `ERROR`. The
+observed window was 768 × 704 pixels, a 96 × 44 grid of 8 × 16 cells (M).
+
+**Exit statuses.** The runner uses the same codes as `recovery.py`: `PASS` 0,
+`FAIL` 3 and `ERROR` 4. When both cases run, `ERROR` outranks `FAIL`. Make
+reports a nonzero status as its own exit 2. The first failure in a case is
+final, and the case's later steps do not run. The other case still runs.
+After a green case, the runner checks the assertion inventory: each known ID
+must run exactly once, in order.
+
+## Waits
+
+Every wait is on an event. A timer is only a hang detector, and its expiry
+is `ERROR`, never `FAIL`. The operation and driver pipe watchdogs are 15 s
+and 30 s, as in [W0.6b](v2-he7.9.md).
+
+- **Snapshots.** A SNAP or NEXT reply wakes on the inspector socket and the
+  editor's pidfd together. An editor exit is `ERROR`, and so is a missing
+  reply at the watchdog.
+- **Disk.** The directory watch is armed before the keys that cause the
+  event: `IN_MOVED_TO` for a save, `IN_ACCESS` for a binary open,
+  `IN_MOVED_TO` of the session journal. The editor's pidfd is watched as
+  well.
+- **Exit.** Ctrl+Q is reaped on a pidfd, and so is the Xvfb teardown.
+  `Popen.wait(timeout)` is no longer used, because it polls.
 
 ## R3
 
-The search tree uses the matching files and binary sentinel from the v1
-`tree_fixture_init`. The editor starts with A open. Ctrl+Shift+F searches for
-`cat` in the private tree. Select All and Copy sample the results until the
-expected summary arrives from the owned editor window. Fresh clipboard
-ownership distinguishes the copy from earlier contents. A partial prefix
-can grow while the search is pending. The search itself executes once.
+The search tree uses the matching files and binary sentinel from v1's
+`tree_fixture_init`. The editor starts with A open. Ctrl+Shift+F searches
+for `cat` in the private tree.
 
-Go to Line selects the `scatter` result at logical line 8 (P, the pin's
-zero-based row 7). Absolute paths in this checkout can wrap across display
-rows. Enter on the result opens B at the match, where the runner types
-`b`. Alt+1 returns to A, and Ctrl+Home places the `a` marker at its start.
-The runner arms an inotify watch before each Ctrl+S and reads the original
-bytes before sending the key. An `IN_MOVED_TO` event for the destination
-acknowledges the stock save's atomic rename. The resulting edits are
-checked byte for byte. The other files' bytes, inodes, modes and modification
-times are compared after the B save and after deliberately quitting.
+**Search completion (review fix).** The old `search_copy` re-sent Select All
+and Copy in a tight loop. It returned `FAIL` whenever a sampled intermediate
+copy was not a prefix of the final text. Now the runner sends one SNAP, then
+NEXT after each returned serial, until a submitted frame has `Find Results`
+active and draws the search's end line (`N matches across M files`, or a
+failed, truncated or cancelled search). That frame is compared once against a
+model of the fixture results. No clipboard is involved. A watchdog expiry
+here is `ERROR`.
 
-The results tab's position between A and B and its surviving visible text
-both report `ERROR` with `waiting: requires snapshot adapter (v2-he7.11)`.
+**Find Results model.** v1 draws the results in a tab with soft wrapping. A
+fixture line wider than the document breaks every `width` cells. Only the
+absolute path lines are that wide, and they contain no spaces. The model
+(`hard_wrapped`) chunks each line of `search_results(root)` at the frame's
+document width. It pads to the document height and compares every row. If a
+wide line contained a space, or the results did not fit the height, the
+fixture would fall outside the model, and the runner reports `ERROR`.
+
+In all 19 R3 runs that reached the search (the green series, the two first
+attempts and the seven R3 controls that got past it), the first SNAP already
+showed the completed results (M, the retained `snapshots.jsonl`). The
+adapter's prefix fence waits while `find_replace_active` is set, so the NEXT
+branch is a guard that this fixture never reached.
+
+**Opening B from a match.** Go to Line 8 selects the `scatter` result (P, the
+pin's zero-based row 7), and Return opens B at the match. The SNAP after
+Return returns once the open is disposed, with no `pending_open` and no
+placeholder.
+
+- **results-between-a-and-b** (B). The tab strip reads
+  `a.txt | Find Results | b.c`, with B active. Each title is read from its
+  tab rect less v1's two trailing cells, which hold the modified dot.
+
+**A9 (Ctrl+S overtaking typed keys).** Before typing `b`, the runner arms a
+watch on the case's journal directory for the single `session-*` file. It
+types `b` and waits for that file's `IN_MOVED_TO`, the same signal
+`large_undo.py` uses. The SNAP reply is the second witness. The adapter
+answers only when no input is queued, `op_count` is 0 and the buffer is
+neither opening nor a placeholder. The frame must also draw `sbcatter`
+exactly once in `b.c`. So the edit is applied before Ctrl+S is sent, whatever
+the journal's rotation policy. A undergoes the same frame check
+(`aAlpha cat`) before its save.
+
+- **save-b-bytes** and **save-a-bytes** (A). The armed `IN_MOVED_TO` on the
+  destination acknowledges each save, and the bytes are compared exactly.
+- **results-text-still-visible** (B). After both saves, Alt+2 selects the
+  second tab. The frame must show the unchanged strip, with `Find Results`
+  active, and every document row must equal the results model.
+- **other-files-unchanged** (A). The other files' bytes, inodes, modes and
+  modification times match after the B save and after Ctrl+Q.
+- **law2-count** (B). See below.
 
 ## R5
 
-`binary_bytes` ports v1's `binary_open_fixture` recipe, including its
-256 KiB size, xorshift32 seed 2463534242, PDF-like header, NULs, invalid UTF-8,
-blank scalars and U+F227. A standalone build of the extracted C generator
-and the Python port produced byte-identical fixtures with SHA-256
-`fd6eaa29df67bd85a9329d15f48362c6479a3bcfbaa646e467c8a197b24b4387`.
-The saved comparator sources and fixtures are under `build/files-v1-binary*`
-and `build/files-python-binary.pdf`.
+`binary_bytes` ports v1's `binary_open_fixture`. The comparator evidence
+from the stock half is unchanged: SHA-256
+`fd6eaa29df67bd85a9329d15f48362c6479a3bcfbaa646e467c8a197b24b4387`,
+256 KiB, seed 2463534242. The first launch opens `fixture.pdf` and a
+sibling `sibling.txt` (`sibling text\n`). The sibling tab starts active.
+`IN_ACCESS` on the PDF precedes binding the window.
 
-The directory watch observes `IN_ACCESS` for the fixture on each launch.
-The runner binds the mapped window for the owned PID, checks the process
-state, and deliberately exits with Ctrl+Q. The reopened editor uses the same
-case root and a new process. Both exit statuses must be zero and both
-post-quit reads must equal the generated bytes.
+- **open-alive** (A). The fixture is read, an owned window is mapped and the
+  editor is live.
+- **header-painted** (B). After Alt+1, `fixture.pdf` is active and the first
+  document row is exactly `%PDF-1.5`. Under T3 only baked ASCII and known
+  replacement artwork resolve. The row reader maps an unresolved cell to
+  U+25AF, a character no expected (ASCII) text contains. Unresolved cells in
+  other rows are allowed, while a required match that crosses one fails.
+- **adjacent-text-and-sibling-save** (A+B). After Alt+2 and `s`, the frame
+  draws `ssibling text` in the active `sibling.txt`. The armed save then
+  writes exactly `ssibling text\n`.
+- **open-exit** (A). Ctrl+Q exits 0.
+- **reopen-alive** (A). The same case root starts a new process on the PDF.
+- **settled-binary-tab-revisit** (B). Two frames show `fixture.pdf` active
+  with `%PDF-1.5` as the first row: the Alt+1 revisit after the sibling save
+  in the first process, and Alt+1 in the reopened process.
+- **reopen-exit** (A) and **bytes-unchanged** (A). The second Ctrl+Q exits
+  0, and both post-quit reads equal the generated bytes.
+- **law2-count** (B). See below.
 
-The painted header, settled-font binary tab revisit, and adjacent ordinary
-text with sibling edit and save report `ERROR` with
-`waiting: requires snapshot adapter (v2-he7.11)`.
+**Font adoption (observation, not asserted).** The transcript records each
+frame's count of unresolved cells. Before adoption, v1 draws the PDF's
+non-ASCII cells as the resolved `?` placeholder. In every green run the
+activation and reopen frames held 0 or 1 unresolved cells, and the revisit
+frame held 38–42 (M), where resident shaped clusters are unresolved under T3.
+So the revisit frame is a settled frame after font adoption. Its header
+assertion passes with those unresolved cells around it. The count is not
+asserted, because adoption is asynchronous and the runner has no event for
+it.
 
-## Verification
+The reopened editor's Alt+1 is also its only input-to-submit window. The first
+green attempt (`contract-files-j36qm41k`) took the reopen frame without
+input. Its guard reported `scopes=0`, which the runner rejects as vacuous
+(`ERROR`).
 
-The red controls alter one expected value per invocation. The missing
-signal control withholds Ctrl+S with the ordinary watcher already armed.
-These are negative controls of the assertions.
+## Law-2 count
+
+Each inspected editor prints `oracle law2: active=… allocations=… scopes=…`
+at its clean Ctrl+Q exit. A count needs `active=1` and `scopes > 0`, otherwise
+the run is `ERROR` (fail closed). In all 10 green runs (M), R3 reported
+`allocations=0 scopes=4`, R5's first process `allocations=0 scopes=4`, and the
+reopened process `allocations=0 scopes=1`. Under the
+[count rule](wave0-contract-design.md#law-2-count-rule-for-inspected-cases-advisor-2026-11-23),
+v1 shows 0 for these windows, so 0 is **asserted** for each process and a
+nonzero count is `FAIL`.
+
+## Red receipts
+
+The Tier A controls and the new controls each change one expected value per
+invocation, through `--negative`. Two controls withhold an event instead.
+`R3.snapshot-reply` withholds the first marker, and `R3.save-signal` withholds
+Ctrl+S with the watch already armed. The five screen assertions had no green
+state before this change. All five reported `ERROR` `waiting: requires
+snapshot adapter (v2-he7.11)` on the stock oracle in `contract-files-da8doy86`.
 
 ```sh
-oracle=/home/tobias/Projects/sublimite-v1-oracle/build/sublimite
-for control in R3.save-b-bytes R3.save-a-bytes R3.other-files-unchanged R3.save-signal R5.open-alive R5.open-exit R5.reopen-alive R5.reopen-exit R5.bytes-unchanged; do
-    PYTHONPATH=tests/contract python3 -B -m cases.files --oracle "$oracle" --display :160 --negative "$control" > "build/files-final-red-$control.jsonl" 2> "build/files-final-red-$control.log"
-    printf '%s %s\n' "$control" "$?"
+B=/home/tobias/Projects/sublimite-v1-inspect/build/contract-oracle
+PYTHONPATH=tests/contract python3 -B -m cases.files --build-dir $B --display :161 --negative "$control" \
+    > "build/files-red-$control.jsonl" 2> "build/files-red-$control.log"
+```
+
+Power status was `Charging` [AC] throughout. The load column gives the measured
+1-, 5- and 15-minute load averages after each run (M, `/proc/loadavg`).
+
+| Control | Exit | Stopped at | Run under `build/` | Load |
+|---|---|---|---|---|
+| `R3.results-between-a-and-b` | 3 | `results-between-a-and-b` FAIL | `contract-files-z855xtmi` | 6.32 / 5.35 / 4.53 |
+| `R3.results-text-still-visible` | 3 | `results-text-still-visible` FAIL | `contract-files-2fx_zhhl` | 6.32 / 5.35 / 4.53 |
+| `R3.law2-count` | 3 | `law2-count` FAIL | `contract-files-8hl8z0mm` | 5.97 / 5.30 / 4.52 |
+| `R5.header-painted` | 3 | `header-painted` FAIL (`%PDF-1.4` expected) | `contract-files-oayxccgs` | 2.55 / 4.28 / 4.24 |
+| `R5.adjacent-text-and-sibling-save` | 3 | `adjacent-text-and-sibling-save` FAIL | `contract-files-z4v5tlz1` | 5.97 / 5.30 / 4.52 |
+| `R5.settled-binary-tab-revisit` | 3 | `settled-binary-tab-revisit` FAIL (crossing) | `contract-files-fh72ksxi` | 2.75 / 4.29 / 4.24 |
+| `R5.law2-count` | 3 | `law2-count` FAIL | `contract-files-dmy__v2o` | 5.83 / 5.29 / 4.52 |
+| `R3.snapshot-reply` | 4 | `search-readiness` ERROR, missing reply at watchdog | `contract-files-yva8miad` | 5.13 / 5.16 / 4.49 |
+| `R3.save-b-bytes` | 3 | `save-b-bytes` FAIL | `contract-files-qyeed9q0` | 5.13 / 5.16 / 4.49 |
+| `R3.save-a-bytes` | 3 | `save-a-bytes` FAIL | `contract-files-sayg_b9p` | 5.13 / 5.16 / 4.49 |
+| `R3.other-files-unchanged` | 3 | `other-files-unchanged` FAIL | `contract-files-vg7r8gfx` | 4.96 / 5.12 / 4.48 |
+| `R3.save-signal` | 4 | `save-b-signal` ERROR, no `IN_MOVED_TO` | `contract-files-7b5ws3p7` | 4.29 / 4.97 / 4.44 |
+| `R5.open-alive` | 3 | `open-alive` FAIL | `contract-files-khss4_zp` | 4.29 / 4.97 / 4.44 |
+| `R5.open-exit` | 3 | `open-exit` FAIL | `contract-files-q0knppjj` | 4.11 / 4.92 / 4.43 |
+| `R5.reopen-alive` | 3 | `reopen-alive` FAIL | `contract-files-mrpimqga` | 4.11 / 4.92 / 4.43 |
+| `R5.reopen-exit` | 3 | `reopen-exit` FAIL | `contract-files-wipu6ame` | 3.94 / 4.87 / 4.41 |
+| `R5.bytes-unchanged` | 3 | `bytes-unchanged` FAIL | `contract-files-tv8c4m3f` | 3.94 / 4.87 / 4.41 |
+
+**The crossing control (T3).** The negative for `settled-binary-tab-revisit`
+requires the revisit frame's document rows up to the first row holding an
+unresolved cell. That cell is expected as v1's `?` glyph, and every other
+cell equals the frame. The run failed on row 7, `  ?z  ▯G @  ? ?` against
+`  ?z  ?G @  ? ?`, and nowhere else. A required match that crosses an
+unresolved cell therefore fails, even when every resolved cell matches.
+
+Two earlier header controls are superseded. The first
+(`contract-files-qy148r1c`) required the header's second line as U+FFFD. It
+failed because v1 draws resolved `?` there, not because of an unresolved
+cell. So this control did not exercise T3, and its revisit-frame form
+replaced it. The first `R5.settled-binary-tab-revisit` control
+(`contract-files-5jrnltie`) expected `%PDF-1.4` on the reopen frame and failed
+on that.
+
+## Green receipts
+
+The series has one run per permitted display, `:160` through `:169`: 10 runs
+(P, 169 − 160 + 1), the per-display derivation of [W0.6d](v2-he7.11.md). The
+count was fixed before sampling. At the start of the series,
+`/sys/class/power_supply/BAT0/status` read `Charging` [AC] and `/proc/loadavg`
+read 2.79 / 4.25 / 4.23 (M). Every run read `Charging`, with the 1-minute
+load between 2.55 and 2.83.
+
+```sh
+for d in :160 :161 :162 :163 :164 :165 :166 :167 :168 :169; do
+    make --no-print-directory check-contract-files ORACLE_TREE=/home/tobias/Projects/sublimite-v1-inspect \
+        CONTRACT_DISPLAY=$d > build/files-green-${d#:}.jsonl 2> build/files-green-${d#:}.log || break
 done
 ```
 
-Each control exited 1. The expected-value controls stopped on their
-targeted `FAIL`. With no save signal, the first Tier A record was
-`R3.save-b-signal ERROR` and the watcher reported that the destination
-event did not arrive before its deadline.
+Each run exited 0 with 15 `PASS` records and no other record: 6 in R3 and 9 in
+R5. The serials are `ticket:after→submit`. R3's frames are search, open B,
+type b, type a and results. R5's are activate, sibling, revisit and reopen.
 
-`/sys/class/power_supply/BAT0/status` reported `Discharging` [bat] throughout.
-The load columns give the measured 1-, 5- and 15-minute load averages at
-invocation (M, `os.getloadavg()`).
+| Display | Run under `build/` | R3 frame serials | R5 frame serials | Unresolved in revisit |
+|---|---|---|---|---|
+| `:160` | `contract-files-auuyzxbk` | 6, 9, 11, 15, 18 | 2, 4, 8, 2 | 38 |
+| `:161` | `contract-files-0_p52vo8` | 6, 9, 11, 15, 19 | 2, 4, 10, 2 | 42 |
+| `:162` | `contract-files-5zb3sfdn` | 6, 9, 12, 16, 20 | 2, 4, 8, 2 | 39 |
+| `:163` | `contract-files-3epk1ef_` | 7, 10, 12, 16, 20 | 2, 4, 8, 2 | 39 |
+| `:164` | `contract-files-qz38emjy` | 5, 8, 10, 14, 18 | 2, 4, 8, 2 | 39 |
+| `:165` | `contract-files-a1fmsxgz` | 5, 8, 10, 14, 17 | 2, 4, 10, 2 | 40 |
+| `:166` | `contract-files-1wch3yec` | 6, 9, 11, 15, 19 | 2, 4, 8, 2 | 39 |
+| `:167` | `contract-files-7decbugu` | 5, 8, 10, 14, 18 | 2, 4, 8, 2 | 39 |
+| `:168` | `contract-files-x809u7qk` | 5, 8, 10, 14, 17 | 2, 4, 8, 2 | 39 |
+| `:169` | `contract-files-bv9q_wyf` | 9, 12, 15, 19, 23 | 2, 4, 8, 2 | 39 |
 
-| Control | Tier A outcome | Run directory under `build/` | Load |
-| --- | --- | --- | --- |
-| `R3.save-b-bytes` | FAIL | `contract-files-yagwdc73` | 12.22 / 9.58 / 8.73 |
-| `R3.save-a-bytes` | FAIL | `contract-files-x8khad5g` | 12.22 / 9.58 / 8.73 |
-| `R3.other-files-unchanged` | FAIL | `contract-files-2h4olfpq` | 12.29 / 9.64 / 8.75 |
-| `R3.save-signal` | ERROR | `contract-files-n75thkoo` | 12.29 / 9.64 / 8.75 |
-| `R5.open-alive` | FAIL | `contract-files-aigo30qe` | 12.00 / 9.72 / 8.79 |
-| `R5.open-exit` | FAIL | `contract-files-bw8bozsr` | 11.60 / 9.67 / 8.78 |
-| `R5.reopen-alive` | FAIL | `contract-files-s_zjcfd9` | 11.60 / 9.67 / 8.78 |
-| `R5.reopen-exit` | FAIL | `contract-files-wf3_dzhq` | 11.60 / 9.67 / 8.78 |
-| `R5.bytes-unchanged` | FAIL | `contract-files-osm10ibz` | 11.60 / 9.67 / 8.78 |
+The R3 edit frames hold one unresolved cell each: the modified dot in the
+tab trailer, outside every title read. Before the series,
+`contract-files-r4vdz28v` passed all 15 records once on `:160`, at load
+6.91 / 5.26 / 4.46 [AC]. After the series, one helper was renamed
+(`binary_view` to `tab_view`, with no change in behavior). The same command
+on `:160` then passed all 15 records (`contract-files-fctfbmgo`,
+5.43 / 4.69 / 4.38 [AC]). The red controls above ran before the rename.
 
-A scratch fixture failed on its first call and would pass on its second.
-The first run exited 1 with the counter at one and retained its failure in
-`contract-files-gqx4eowg`. A separate manual invocation advanced the counter
-to two and passed its synthetic Tier A checks in `contract-files-_n0mi54y`.
-Both ran at load 12.22 / 9.58 / 8.73 [bat].
+## Builds
 
-```sh
-for run in first manual; do
-    PYTHONPATH=tests/contract python3 -B build/files-first-failure.py --oracle "$oracle" --display :161 --negative R3.save-b-bytes > "build/files-first-failure-$run.jsonl" 2> "build/files-first-failure-$run.log"
-    printf '%s exit=%s attempts=%s\n' "$run" "$?" "$(cat build/files-first-failure-count)"
-done
-```
-
-The stock-oracle run uses the ordinary Make target. While the screen
-assertions are waiting, their errors keep the target nonzero.
+Both checkout builds exited 0. Before `make all`, the battery read
+`Charging` [AC] and the load was 2.59 / 3.99 / 4.14. Before `make check`, the
+load was 3.85 / 4.22 / 4.21 (M, `/proc/loadavg`). Neither target runs the
+contract cases. The `tab_view` rename came after `make check` started and
+touched only `files.py`.
 
 ```sh
-TMPDIR="$PWD/build" make check-contract-files ORACLE=/home/tobias/Projects/sublimite-v1-oracle/build/sublimite CONTRACT_DISPLAY=:160 > build/files-final-green.jsonl 2> build/files-final-green.log
-```
-
-Run `contract-files-da8doy86` produced eight Tier A passes (three in R3,
-five in R5) and five screen waiting errors (two in R3, three in R5).
-The Python runner exited 1 and Make exited 2. Both R5 processes and the
-R3 process exited 0 after Ctrl+Q. The retained A and B files contain their
-own markers, and the retained PDF fixture matches the C fixture byte for
-byte. Load was 9.19 / 9.30 / 8.69 [bat].
-
-Both checkout builds exited 0. The load before `make all` was
-12.94 / 9.49 / 8.68 [bat], and before `make check` it was
-3.35 / 7.70 / 8.10 [bat] (M, `/proc/loadavg`). The stock executable's
-SHA-256 matched the manifest again after the runs.
-
-```sh
-TMPDIR="$PWD/build" make all > build/files-make-all-final.log 2>&1
-TMPDIR="$PWD/build" make check > build/files-make-check.log 2>&1
+HOME="$PWD/build/home" TMPDIR="$PWD/build" make all > build/files-make-all.log 2>&1
+HOME="$PWD/build/home" TMPDIR="$PWD/build" make check > build/files-make-check.log 2>&1
 ```

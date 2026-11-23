@@ -194,7 +194,7 @@ check-contract-inspect:
 .PHONY: check-contract-files
 check-contract-files: $(B)/xdriver
 	@PYTHONPATH=tests/contract python3 -B -m cases.files \
-	    --oracle "$(ORACLE)" --display "$(CONTRACT_DISPLAY)"
+	    --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --display "$(CONTRACT_DISPLAY)"
 
 .PHONY: check-contract-navigation
 check-contract-navigation: $(B)/xdriver
