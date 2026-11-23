@@ -131,6 +131,10 @@ check:
 	@$(MAKE) --no-print-directory check-law2
 	@echo "check: ok"
 
+.PHONY: check-contract-sandbox
+check-contract-sandbox:
+	python3 -B tests/contract/test_sandbox.py
+
 # The include lints use the .d files emitted when compiling these objects.
 check-lints: $(LINT_OBJS)
 	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
