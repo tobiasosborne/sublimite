@@ -1,26 +1,45 @@
 # HANDOFF — sublimité v2
 
-## Session 0 (2026-11-22): scaffold
+Read order: this file → `CLAUDE.md` → `docs/PLAN_V2.md`. Beads: `bd` in this worktree resolves to the v2 database
+(prefix `v2`; docs/decisions/wave0-beads-and-oracle-pin.md §1). Push branch `v2` only, after every verified landing.
 
-### Scaffolded & Verified
-- `LICENSE` (AGPL-3.0, copied from v1 `main`), `.gitignore`, `README.md`, `CLAUDE.md` (v2 rules), `docs/PLAN_V2.md` (final council-approved plan).
-- Build system & 5-layer DAG: `Makefile`, `mk/layers.mk` (`L0`–`L5` archives + `--whole-archive` isolated layer link checks), `mk/grammars.mk` (unified 13-grammar table, gated on `vendor/`).
-- Structural linters (`tools/README.md`): `tools/check_dag.py`, `tools/check_no_c_includes.py`, `tools/check_isolation.py`, `tools/clex.py`.
-- Full module directory skeleton under `src/` with compiling L0–L5 smoke stubs (`os`, `piece`, `edit`, `render`, `viewport`, `app`, `main.c`) and `tests/layer_L0_test.c`..`layer_L4_test.c`.
-- Empty structure with `.gitkeep`: `tests/contract/`, `fuzz/`, `bench/`, `docs/decisions/`, `docs/reviews/`, `docs/worklog/`.
-- Verified green from clean tree: `make all` (`build/sublimite-v2`) and `make check` (`check-lints`, `check-layers`, `check-san` exit 0 in <1 s).
+## Session 1 (2026-11-22 night → 2026-11-23 morning, ThinkPad) — state as of the last commit
 
-### Not done
-No `vendor/` checked out yet, no harvested modules yet, no Wave 0 behavioral contract suite, no beads yet. `check-law2`, `check-tsan`, and `fuzz-smoke` currently emit `NOTE` until Wave 1 lands their first suites (switch to fail-closed as suites arrive). v1 `main` and `~/.local/bin/sublimite` are untouched.
+### Wave 0 exit, first half: DONE — scaffold blockers closed
+W0.1 vendor (c0e9e2c) · W0.3a include DAG from compiler dependency files (865095b) · W0.3b nm symbol DAG (45921fb)
+· W0.3c fail-closed lanes, suite manifest `tests/lanes.mk`, tools registry (3f26948) · W0.4 app identity guard +
+isolation lint (10cec71). `make check` green.
 
-## Next: Wave 0 (`docs/PLAN_V2.md` §6)
+### Wave 0 exit, second half: contract suite (epic v2-he7, design docs/decisions/wave0-contract-design.md + "Advisor review" trims T1–T5)
+Landed: W0.6a sandbox (7dfb7bb) · W0.6b X driver (28976cf) · W0.6c wire client `snapwire.py` (5a8f29f) ·
+W0.6g pre-ACK recovery controls (996f3da; bead stays open for post-ACK).
+In flight at the time of this commit (worktrees under ~/.t3/worktrees/sublimite-v2/, one branch each):
+- v2-he7.11 W0.6d v1 adapter patch (Sol xhigh) — patch applied in /home/tobias/Projects/sublimite-v1-inspect (disposable detached 6fec2e8).
+- v2-he7.15 W0.6h large delete+undo X3 on the stock v1 build (Opus) — first running-v1 reproduction; stop if v1 does not show it.
+- v2-he7.13 W0.6f R3 + R5 Tier A part (Sol).
+- Wave 1 prep: Astra deriving the piece pool size → docs/decisions/wave1-piece-pool.md (advisor reviews).
+Open, not started: v2-he7.12 W0.6e navigation R1 + R6 (needs the adapter) · W0.6g post-ACK (needs the adapter) ·
+v2-he7.16 W0.6i runner + gate (wire all contract self-tests into make check; registry slash-row fixture) ·
+v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
 
-1. **Vendor.** Check out `vendor/` from v1: `git checkout main -- vendor/` (13 tree-sitter grammars, UCD, `stb_truetype`). Do not copy anything else from `main` yet.
-2. **Namespace isolation.** Implement the `sublimite-v2` app identity for `OS_APP_DATA`, `OS_APP_CONFIG`, `config/runtime.c`, and `ipc_posix.c` (abstract + filesystem leaf) as modules land; `python3 tools/check_isolation.py` must be green and grep-audits all four.
-3. **Build skeleton.** Confirm `make all`, `make check-layers`, `make check-lints` run on the empty tree (DAG, `#include "*.c"` ban, isolation).
-4. **Contract suite.** Build the v1 behavioral contract suite under `tests/contract/`, running v1's tools (`keyinject`, `journal_replay`, `replay`, save-kill hook, Wayland clipboard fixture, headless cell inspector if needed) under disposable `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` and fixture files (see v1 `tests/ipc_isolation.h:56`) so it never forwards into the running daily editor.
-   - **Green on v1:** session 16–27 regressions (wrapped Return, Ctrl+S with Find Results open, over-capacity restore prioritising unsaved tabs, PDF blank-glyph, occupied-bulk large navigation).
-   - **Expected-failure specs** for known v1 bugs v2 must pass: 17-leaf `piece` root collapse, post-rename save conflict, `LINEIDX_EDIT_MAX_CHUNKS` >32 MiB delete+undo, Wayland clipboard copy.
-5. **Exit:** `make check` green, namespace isolation verified, contract suite recorded. Then write `docs/worklog/2026-11-22.md` (or the session date), update this file, and open Wave 1 beads.
+### Next session, in order
+1. Land whatever the in-flight lanes left (each worker's worktree is committed on its branch; see the list above or
+   the final session-end note below if one was written).
+2. W0.6e and W0.6g post-ACK on the landed adapter, then W0.6i, then W0.6j.
+3. **The Wave 0 gate run is the first full-suite run of the next session**: no other lane running, stamped with
+   power state and load at start (AC preferred; [bat] acceptable on a quiet box). Then report to the advisor (checkpoint d).
+4. Then open Wave 1 beads under epic v2-0fv (its description carries the exit criteria and acceptance items).
 
-Read `CLAUDE.md` Law 3 before dispatching: one bead per worker.
+### Facts the next session needs
+- Oracle: /home/tobias/Projects/sublimite-v1-oracle, detached 6fec2e8, built; `build/sysroot` holds
+  wayland-egl-backend.h (export CPATH=$PWD/build/sysroot/usr/include). Stock editor: build/sublimite.
+  Baseline: 120/120 sanitizer suites on a quiet box, one named v1 test race (pin decision §9).
+- Xvfb: explicit display only, `-noreset -nolisten tcp`; lanes were given disjoint ranges :120–:169.
+- PLAN_V2 is kept true by amendments A1–A5 (docs/decisions/wave0-plan-amendments.md).
+- Routing: Codex's cyber filter refused test-case beads that describe a defect or a process kill (v2-he7.7, .15, .14;
+  worklog). Those go to Opus or Muse from the start; Sol does lint, tool and patch beads. Muse and Gemini: up to pace only.
+- Worker briefs carry: no rm -rf, no mktemp with a clean-up trap, nothing outside the checkout, build under build/,
+  report instead of running anything that needs approval. T3 thread timestamps are UTC.
+- Battery: Tobias could not plug in on 2026-11-23; stop line 20 % (advisor rule, worklog).
+- v1 findings for Tobias (advisor reports them): post-rename save conflict and >32 MiB delete+undo (known-bugs doc),
+  editor_session_test ivv_save race, test_install_omarchy EDITOR export.
