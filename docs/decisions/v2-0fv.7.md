@@ -101,6 +101,20 @@ from the store's chunk totals, and a tail in chunk j. The record holds the head 
 **`piece_iter_next_span` gained an `end` argument.** A clipped span needs its tail count computed at the clip. A caller
 who clips a returned span afterwards would hold a stale tail count.
 
+### Frozen API addition for the undo landing review
+
+`piece_span_nl_join` is the single approved composition of two same-tree, source-adjacent descriptions. An
+input record comes from the iterator or a prior valid join. The output has provenance for the exact union
+of the two spans. This operation belongs to piece because the head/tail semantics depend on its chunk grid.
+A union edge shared by both descriptions sums their contributions and remains unknown if either is unknown.
+Whole interior chunks use only the core table. This is O(1) work on two edge records (P, each has a head and
+a tail). The existing sanitizer recount covers the result on reinsertion. The model implements the join, and
+7b supplies the archive implementation when it replaces the stub.
+
+Keeping a count from only one side loses newlines when both fragments are inside the same chunk. Undo cannot
+re-describe the union on the live view once the first fragment has been deleted. The join cases cover a shared
+head, shared tail, boundary seam, shared interior and unknown contributions from either side.
+
 ### Counter-example to R1+2c's pair bound (for the advisor)
 
 R1+2c states: "A one-span delete plus its undo together read ≤ 65,536 B (the undo reinserts at an entry boundary and cuts

@@ -226,6 +226,12 @@ LDFLAGS_find_p1r_test := -Wl,--wrap=work_should_stop
 LDFLAGS_find_simd_filter_verify_test := -Wl,--wrap=base_cpu_has_avx2
 LDFLAGS_find_timeout_test := -Wl,--wrap=work_should_stop
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/bench/find_bench))
+# Undo likewise uses the frozen piece model until 7b. Its suite observes the
+# span/count arrays offered to the batch planner and can refuse a replay step.
+LDFLAGS_undo_test := -Wl,--wrap=os_vm_reserve,--wrap=os_fault_poll,--wrap=piece_replace_spans,--wrap=piece_replace,--wrap=piece_span_nl_join
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/undo_test: $(B)/$(c)/tests/piece_model.o))
+$(B)/rel/tests/law2_undo_test: $(B)/rel/tests/piece_model.o
+$(B)/fuzz/undo_fuzz: $(B)/fuzz/tests/piece_model.o
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
@@ -259,6 +265,9 @@ $(B)/$(1)/bench/find_bench: $(B)/$(1)/bench/find_bench.o $(call libs_of,$(1),L1 
 	$$(CC_$(1)) $$(CF_$(1)) -pthread $$^ $$(LDLIBS) -o $$@
 endef
 $(foreach c,rel san tsan,$(eval $(call FIND_BENCH,$(c))))
+
+$(B)/rel/bench/undo_bench: $(B)/rel/bench/undo_bench.o $(call libs_of,rel,L1 L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
 
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.

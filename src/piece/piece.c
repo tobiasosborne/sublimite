@@ -8,6 +8,14 @@
 
 #define STUB_NO_OBJECT 0
 
+piece_span_nl piece_span_nl_join(piece_span left, piece_span_nl ln,
+                                 piece_span right, piece_span_nl rn)
+{
+    (void)left; (void)ln; (void)right; (void)rn;
+    ASSERT(STUB_NO_OBJECT); /* No described spans until 7b replaces the stub. */
+    return (piece_span_nl){0};
+}
+
 piece_err piece_reserve_create(piece_reserve **out)
 {
     ASSERT(out != NULL);

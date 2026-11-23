@@ -946,6 +946,31 @@ static inline piece_err pm_lines_resolve(pm_tree *t, size_t budget, bool *more)
 _Static_assert(sizeof(pm_iter) <= sizeof(piece_iter), "pm_iter fits piece_iter");
 _Static_assert(_Alignof(pm_iter) <= _Alignof(piece_iter), "pm_iter alignment");
 
+static uint32_t pm_join_counts(uint32_t a, uint32_t b)
+{
+    return a == PIECE_NL_UNKNOWN || b == PIECE_NL_UNKNOWN ? PIECE_NL_UNKNOWN : a + b;
+}
+
+piece_span_nl piece_span_nl_join(piece_span left, piece_span_nl ln,
+                                 piece_span right, piece_span_nl rn)
+{
+    ASSERT(left.len && right.len && ((left.src ^ right.src) & PIECE_SPAN_ADD) == 0);
+    ASSERT(right.src > left.src && right.src - left.src == left.len &&
+           right.len - 1 <= UINT64_MAX - right.src);
+    /* Tagged offsets preserve the chunk grid because the tag is chunk
+     * aligned. A shared seam may belong to the head, tail, or neither. */
+    uint64_t first = left.src / PIECE_CHUNK, seam = right.src / PIECE_CHUNK;
+    uint64_t last = (right.src + right.len - 1) / PIECE_CHUNK;
+    uint32_t head = first == seam ? pm_join_counts(ln.head, rn.head) : ln.head;
+    uint32_t tail = 0;
+    if (last != first) {
+        if (last != seam) tail = rn.tail;
+        else if (right.src % PIECE_CHUNK == 0) tail = rn.head;
+        else tail = pm_join_counts(ln.tail, rn.head);
+    }
+    return (piece_span_nl){head, tail};
+}
+
 piece_err piece_reserve_create(piece_reserve **out)
 {
     ASSERT(out != NULL);

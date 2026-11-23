@@ -133,9 +133,10 @@ typedef struct piece_span {
  * length (A13's copy cap and the journal's choice).
  * Provenance, the precondition of piece_replace_spans: a record is valid only
  * for the exact span it was described with by piece_iter_next_span on a view
- * of the same tree (a caller that clips a span describes it again with end);
- * for ORIGINAL in the same validated source generation; for ADD by byte
- * lineage, so invalid once a checkpoint abort has lowered the ADD length below
+ * of the same tree, or for the union produced by piece_span_nl_join from
+ * records with this provenance. A caller that clips a span describes it
+ * again with end. ORIGINAL must be in the same validated source generation.
+ * ADD provenance follows byte lineage and ends when an abort lowers ADD below
  * the span's end, also when described after the abort from a snapshot that
  * survived it. A true count stays true while the backing is trusted: it
  * belongs to its coordinates. */
@@ -145,6 +146,16 @@ typedef struct piece_span_nl {
 } piece_span_nl;
 
 #define PIECE_NL_UNKNOWN UINT32_MAX
+
+/* Joins the records for two source-adjacent spans, in source order. The
+ * result describes {left.src, left.len + right.len}. Both records must have
+ * the provenance above for the same tree and source generation. Only the
+ * union's head and tail are stored. Their contributions are added within
+ * the same chunk, with an unknown contribution making that edge unknown.
+ * The piece store supplies whole interior chunk counts. Pure and O(1).
+ * ASSERT: both spans are nonempty, adjacent and in the same store. */
+piece_span_nl piece_span_nl_join(piece_span left, piece_span_nl left_nl,
+                                 piece_span right, piece_span_nl right_nl);
 
 /* A mapped ORIGINAL: the view's bytes, its fault registration and the
  * lifetime of the mapping that owns both (os.h, mapped-file fault service).

@@ -826,6 +826,77 @@ static void lines_check_all(ph_state *st, uint64_t seed, bool want_exact, const 
                                      want_exact && !st->map, tag);
 }
 
+static void describe_single(const piece_view *v, uint64_t off, uint64_t end,
+                            piece_span *span, piece_span_nl *nl)
+{
+    piece_iter it;
+    piece_iter_init(&it, v, off);
+    ASSERT(piece_iter_next_span(&it, end, span, nl) && span->len == end - off);
+}
+
+static piece_span_nl join_descriptions(const piece_view *left, const piece_view *right,
+                                        uint64_t off, uint64_t cut, uint64_t end)
+{
+    piece_span a, b;
+    piece_span_nl an, bn;
+    describe_single(left, off, cut, &a, &an);
+    describe_single(right, cut, end, &b, &bn);
+    return piece_span_nl_join(a, an, b, bn);
+}
+
+static void t_lines_join(void)
+{
+    /* (P) Four source chunks cover a shared head, a shared tail, a
+     * boundary seam and a shared interior chunk with a chunk left over. */
+    static uint8_t bytes[4 * PIECE_CHUNK];
+    ph_fill(bytes, sizeof bytes, 1);
+    static const uint64_t ranges[][3] = {
+        {1, 3, 7},
+        {PIECE_CHUNK - 2, PIECE_CHUNK, PIECE_CHUNK + 3},
+        {PIECE_CHUNK - 2, PIECE_CHUNK - 1, PIECE_CHUNK + 3},
+        {PIECE_CHUNK - 2, PIECE_CHUNK + 1, PIECE_CHUNK + 3},
+        {1, PIECE_CHUNK + 2, sizeof bytes - 1}
+    };
+    piece_reserve *r;
+    piece_tree *t;
+    if (!open_text(&r, &t, bytes, sizeof bytes)) return;
+    const piece_view *v = piece_tree_view(t);
+    for (size_t i = 0; i < sizeof ranges / sizeof ranges[0]; i++) {
+        uint64_t off = ranges[i][0], cut = ranges[i][1], end = ranges[i][2];
+        piece_span span;
+        piece_span_nl fresh;
+        describe_single(v, off, end, &span, &fresh);
+        piece_span_nl got = join_descriptions(v, v, off, cut, end);
+        CHECK(got.head == fresh.head && got.tail == fresh.tail, "joined counted edges, shape %zu", i);
+        CHECK(piece_replace_spans(t, off, end - off, &span, &got, 1) == PIECE_OK,
+              "joined provenance, shape %zu", i);
+    }
+    close_text(r, t);
+
+    /* (P) A pre-adoption snapshot and the counted live view of its tree
+     * provide independently described unknown and known edges. */
+    ph_mapping map;
+    ASSERT(ph_map_open(&map, bytes, sizeof bytes));
+    ASSERT(piece_reserve_create(&r) == PIECE_OK);
+    ASSERT(piece_open_mapped(r, &map.b, &t) == PIECE_OK);
+    piece_snapshot *unresolved;
+    ASSERT(piece_snapshot_take(t, &unresolved) == PIECE_OK);
+    ASSERT(ph_lines_complete(t, &map, "join resolve"));
+    v = piece_tree_view(t);
+    const piece_view *old = piece_snapshot_view(unresolved);
+    piece_span_nl left = join_descriptions(old, v, 1, 3, 7);
+    piece_span_nl right = join_descriptions(v, old, 1, 3, 7);
+    CHECK(left.head == PIECE_NL_UNKNOWN && left.tail == 0, "unknown left contribution");
+    CHECK(right.head == PIECE_NL_UNKNOWN && right.tail == 0, "unknown right contribution");
+    left = join_descriptions(old, v, PIECE_CHUNK - 2, PIECE_CHUNK, PIECE_CHUNK + 3);
+    right = join_descriptions(v, old, PIECE_CHUNK - 2, PIECE_CHUNK, PIECE_CHUNK + 3);
+    CHECK(left.head == PIECE_NL_UNKNOWN && left.tail != PIECE_NL_UNKNOWN, "unknown head only");
+    CHECK(right.head != PIECE_NL_UNKNOWN && right.tail == PIECE_NL_UNKNOWN, "unknown tail only");
+    piece_snapshot_release(unresolved);
+    close_text(r, t);
+    ph_map_unref(&map);
+}
+
 /* A private-copy tree is exact from open on, through every operation. */
 static void t_lines_private(void)
 {
@@ -1135,6 +1206,7 @@ int main(void)
     t_threads();
     t_random();
     /* Lines (draft section) */
+    t_lines_join();
     t_lines_private();
     t_lines_mapped();
     t_lines_carried(true);
