@@ -1,0 +1,97 @@
+/* Link-time controls for the real editor loop. The normal oracle has no faults. */
+#include "editor/private.h"
+#include <limits.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+
+static int control;
+static bool drop_next, dropped, reject_check, holding;
+
+int __real_main(int argc, char **argv);
+int __wrap_main(int argc, char **argv)
+{
+    if (argc < 2) return EXIT_FAILURE;
+    char *end;
+    long fd = strtol(argv[1], &end, 10);
+    if (*end || fd <= STDERR_FILENO || fd > INT_MAX) return EXIT_FAILURE;
+    control = (int)fd;
+    argv[1] = argv[0];
+    return __real_main(argc - 1, argv + 1);
+}
+
+static void notify(char code)
+{
+    if (send(control, &code, sizeof code, MSG_DONTWAIT | MSG_NOSIGNAL) != sizeof code)
+        _Exit(EXIT_FAILURE);
+}
+
+static bool take(char expected)
+{
+    char action;
+    return recv(control, &action, sizeof action, MSG_PEEK | MSG_DONTWAIT) == sizeof action &&
+        action == expected && recv(control, &action, sizeof action, MSG_DONTWAIT) == sizeof action;
+}
+
+bool __real_editor_inspect_marker(void *ctx, uint32_t atom, const uint32_t *words);
+bool __wrap_editor_inspect_marker(void *ctx, uint32_t atom, const uint32_t *words)
+{
+    bool handled = __real_editor_inspect_marker(ctx, atom, words);
+    if (handled) drop_next = take('D');
+    return handled;
+}
+
+void __real_editor_inspect_force_repaint(editor *e);
+void __wrap_editor_inspect_force_repaint(editor *e)
+{
+    notify('P');
+    __real_editor_inspect_force_repaint(e);
+}
+
+void __real_edit_malloc_guard_begin_thread(void);
+void __wrap_edit_malloc_guard_begin_thread(void)
+{
+    __real_edit_malloc_guard_begin_thread();
+    if (take('A')) {
+        void *(*volatile allocate)(size_t) = malloc;
+        free(allocate(1)); /* one intentional, visible allocation in the foreground scope */
+    }
+}
+
+int __real_render_backend_submit(render_backend *, const render_grid *, const render_strip *, size_t);
+int __wrap_render_backend_submit(render_backend *b, const render_grid *g,
+                                 const render_strip *strips, size_t count)
+{
+    if (drop_next) {
+        drop_next = false;
+        reject_check = dropped = holding = true;
+        return RENDER_ERR_CAPACITY;
+    }
+    if (holding) {
+        if (!take('R')) return RENDER_ERR_BUSY;
+        holding = false;
+    }
+    return __real_render_backend_submit(b, g, strips, count);
+}
+
+int __real_render_backend_check(const render_backend *, const render_grid *, const render_strip *, size_t);
+int __wrap_render_backend_check(const render_backend *b, const render_grid *g,
+                                const render_strip *strips, size_t count)
+{
+    if (reject_check) {
+        reject_check = false;
+        return RENDER_ERR_CAPACITY;
+    }
+    return __real_render_backend_check(b, g, strips, count);
+}
+
+int __real_plat_run_for(plat *p, const plat_callbacks *cb, int timeout);
+int __wrap_plat_run_for(plat *p, const plat_callbacks *cb, int timeout)
+{
+    if (dropped) {
+        dropped = false;
+        if (!((editor *)cb->ud)->render_dropped) _Exit(EXIT_FAILURE);
+        notify('D'); /* The normal drop branch and any inspector callback have already run. */
+    }
+    return __real_plat_run_for(p, cb, timeout);
+}

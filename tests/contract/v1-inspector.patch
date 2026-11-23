@@ -1,0 +1,584 @@
+diff --git a/src/base/base.h b/src/base/base.h
+index fc25433d0e17c795e4bd2e8034c8167f6577183e..15aac46eb5127f7d7f537d9c3045413f1604304d 100644
+--- a/src/base/base.h
++++ b/src/base/base.h
+@@ -78,6 +78,9 @@ bool   edit_malloc_guard_active(void);
+ void   edit_malloc_guard_begin(void);
+ /* Returns the number of malloc/calloc/realloc calls since begin. */
+ size_t edit_malloc_guard_end(void);
++/* Foreground probe: concurrent workers are outside the calling thread's scope. */
++void   edit_malloc_guard_begin_thread(void);
++size_t edit_malloc_guard_end_thread(void);
+ /* Calling-thread-only exemption (nests). Bracket only exempt library calls
+  * (libxcb packet allocation in post-submit completion, P2.0 addendum), never
+  * our own code. Other threads keep counting. */
+diff --git a/src/base/malloc_guard.c b/src/base/malloc_guard.c
+index 95b408c23c336ebd18a58886c9d05284a42ff5f3..823a2bd8eb5230bd2a6be0f509e62421cf45efc7 100644
+--- a/src/base/malloc_guard.c
++++ b/src/base/malloc_guard.c
+@@ -32,9 +32,13 @@ static size_t guard_count;         /* calls counted while guard_on */
+  * on the x11 keymap worker) runs concurrently with a UI typing window.
+  * Thread-local, so it never hides another thread's allocation. */
+ static _Thread_local unsigned guard_exempt;
++static _Thread_local bool thread_guard;
++static _Thread_local size_t thread_count;
+ 
+ static void count_call(void) {
+-    if (__atomic_load_n(&guard_on, __ATOMIC_RELAXED) && !guard_exempt)
++    if (guard_exempt) return;
++    if (thread_guard) thread_count++;
++    if (__atomic_load_n(&guard_on, __ATOMIC_RELAXED))
+         __atomic_fetch_add(&guard_count, 1, __ATOMIC_RELAXED);
+ }
+ 
+@@ -65,6 +69,9 @@ size_t edit_malloc_guard_end(void) {
+     return __atomic_load_n(&guard_count, __ATOMIC_RELAXED);
+ }
+ 
++void edit_malloc_guard_begin_thread(void) { thread_count = 0; thread_guard = true; }
++size_t edit_malloc_guard_end_thread(void) { thread_guard = false; return thread_count; }
++
+ void edit_malloc_guard_exempt_begin(void) { guard_exempt++; }
+ void edit_malloc_guard_exempt_end(void) { if (guard_exempt) guard_exempt--; }
+ 
+@@ -73,6 +80,8 @@ void edit_malloc_guard_exempt_end(void) { if (guard_exempt) guard_exempt--; }
+ bool edit_malloc_guard_active(void) { return false; }
+ void edit_malloc_guard_begin(void) {}
+ size_t edit_malloc_guard_end(void) { return 0; }
++void edit_malloc_guard_begin_thread(void) {}
++size_t edit_malloc_guard_end_thread(void) { return 0; }
+ void edit_malloc_guard_exempt_begin(void) {}
+ void edit_malloc_guard_exempt_end(void) {}
+ #endif
+diff --git a/src/editor/editor.c b/src/editor/editor.c
+index f24acdb04dc9840f572d87c674d95ee84f39f137..d80566b83195b1475352cab0fc38776a43e81d0d 100644
+--- a/src/editor/editor.c
++++ b/src/editor/editor.c
+@@ -508,6 +508,9 @@ static int pump(editor *e, int timeout)
+     ) {
+         plat_callbacks cb = {.ud = e, .on_event = platform_event, .on_work = platform_work,
+             .on_present_complete = platform_complete
++#if !defined(_WIN32)
++            , .on_client_message = e->inspector ? editor_inspect_marker : NULL
++#endif
+ #if defined(_WIN32)
+             , .on_modal_turn = platform_modal_turn
+ #endif
+@@ -1097,6 +1100,9 @@ static void queue_remove(editor *e, size_t n)
+ }
+ static bool runnable(const editor *e)
+ {
++#if !defined(_WIN32)
++    if (e->inspector && editor_inspect_repaint(e)) return true;
++#endif
+     bool can_drain = queue_pick(e) != SIZE_MAX;
+     for (size_t i = 0; i < e->buffer_capacity; i++) {
+         const editor_buffer *b = e->buffers[i];
+@@ -1258,6 +1264,9 @@ int editor_inject(editor *e, const plat_event *event)
+ }
+ static int close_result(editor *e, int timeout_ms)
+ {
++#if !defined(_WIN32)
++    if (e->inspector) editor_inspect_end_scope(e->inspector);
++#endif
+ #if defined(_WIN32)
+     /* Leave native modality before flush/close: its ordinary boundary owns
+      * accepted FIFO entries, clipboard settlement and durability. */
+@@ -1382,6 +1391,9 @@ int editor_step(editor *e, int timeout_ms)
+     if (e->dirty || e->journal_metadata_pending) { rc = editor_journal_changed(e); if (rc) return fail(e, rc); }
+     editor_hl_request(e);
+     rc = input_notice(e); if (rc) return fail(e, rc);
++#if !defined(_WIN32)
++    if (e->inspector && editor_inspect_repaint(e)) editor_inspect_force_repaint(e);
++#endif
+     uint64_t submit_start = trace_now_ns(); rc = submit(e);
+     record_slice(e, submit_start); if (rc) return rc;
+     if (e->cfg.on_io) e->cfg.on_io(e->cfg.hook_ctx, true);
+diff --git a/src/editor/editor.h b/src/editor/editor.h
+index bcac6e696229faa44faf5994a4e25fa9aba9b2ef..28bad04f38de367dd8f448543a2f54f7cea9496f 100644
+--- a/src/editor/editor.h
++++ b/src/editor/editor.h
+@@ -44,6 +44,13 @@ typedef struct editor_refresh {
+     bool synthetic, opportunity_stream, metadata_valid;
+     editor_frame frame; /* immutable submission, not the current viewport */
+ } editor_refresh;
++typedef struct editor_inspector editor_inspector;
++#if !defined(_WIN32)
++editor_inspector *editor_inspect_open(const char *arg);
++int editor_inspect_attach(editor *e, editor_inspector *in);
++void editor_inspect_close(editor_inspector *in);
++#endif
++
+ typedef struct editor_config {
+     const char *path;                 /* existing file; NULL uses initial bytes */
+     const uint8_t *initial;
+diff --git a/src/editor/private.h b/src/editor/private.h
+index d5f4ab2d30e10b231e2e609aedd4f8ec629a784c..c94de0c7b512c513475c41882775b1fa4d23a19a 100644
+--- a/src/editor/private.h
++++ b/src/editor/private.h
+@@ -292,6 +292,9 @@ typedef struct editor_font_size {
+     uint64_t worker;
+ } editor_font_size;
+ struct editor {
++#if !defined(_WIN32)
++    editor_inspector *inspector;
++#endif
+     editor_clip *clipboard;
+     editor_config cfg;
+     editor_highlight hl;
+@@ -641,6 +644,12 @@ void editor_font_bad_config(editor *e);
+ /* edit-6e2: editor_font_request plus the '\n'-joined fallback chain (NULL keeps it). */
+ int editor_font_request_chain(editor *e, const char *family, const char *file, const char *fallbacks);
+ int editor_begin_frame(editor *e);
++#if !defined(_WIN32)
++bool editor_inspect_marker(void *ctx, uint32_t atom, const uint32_t *words);
++bool editor_inspect_repaint(const editor *e);
++void editor_inspect_force_repaint(editor *e);
++void editor_inspect_end_scope(editor_inspector *in);
++#endif
+ int editor_full_layout(editor *e);
+ int editor_refresh_cursor(editor *e, uint64_t old_cursor);
+ int editor_refresh_placed(editor *e, uint64_t old_cursor);
+diff --git a/src/font/async.c b/src/font/async.c
+index c26149762104b3378ef9aa0b1d2c109745773180..8e60e5c9c83092dcb29ef38690381ee7a6536ed9 100644
+--- a/src/font/async.c
++++ b/src/font/async.c
+@@ -489,6 +489,15 @@ static render_glyph blank_descriptor(const font_async *owner, size_t slot)
+     return glyph;
+ }
+ 
++uint32_t font_async_artwork(const font_async *owner, const render_grid *grid, uint32_t slot)
++{
++    if (slot == RENDER_NO_SLOT) return 0;
++    const render_glyph *image = &grid->glyphs[slot];
++    /* Page zero is baked, including the aliased '?', '#' and repair space. */
++    if (!image->page) return image->x ? image->x / grid->dims.cell_w + ' ' : 0;
++    return owner->requests[slot - ASYNC_ASCII].result < FONT_OK ? 0xfffdu : UINT32_MAX;
++}
++
+ bool font_async_inked(const font_async *owner, uint32_t slot)
+ {
+     if (!owner || slot < ASYNC_ASCII || slot >= ASYNC_ASCII + owner->count) return false;
+diff --git a/src/font/font.h b/src/font/font.h
+index 30bcd6c2553d9364d7b2549dad4d31e18149d242..17d640eae0fd7a66264941086c49f3bada374190 100644
+--- a/src/font/font.h
++++ b/src/font/font.h
+@@ -381,6 +381,8 @@ uint32_t font_async_event(font_async *owner, const work_msg *msg);
+ /* edit-2ghs: true while slot is a runtime slot whose image has ink (or is
+  * still pending behind its placeholder). Blank and vacant slots keep a valid
+  * blank descriptor in the bound table, but cells must use RENDER_NO_SLOT. */
++/* Validated submitted binding: zero is blank, UINT32_MAX is unresolved. */
++uint32_t font_async_artwork(const font_async *owner, const render_grid *grid, uint32_t slot);
+ bool font_async_inked(const font_async *owner, uint32_t slot);
+ 
+ /* edit-6e2: configured fallback chain (font.fallbacks). Text is the ordered
+diff --git a/src/main.c b/src/main.c
+index 62ae5827d9e962c8329b4dfb850a21ef412f2edf..1c68feb51c54ab14351935bc15873cc6a762d699 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -56,13 +56,16 @@ static void finish_launcher(ipc_server *server, ipc_token token, uint32_t parent
+     if (launcher) { (void)WaitForSingleObject(launcher, INFINITE); CloseHandle(launcher); }
+ }
+ #endif
+-static int editor_main(int argc, char **argv, const char *launcher_endpoint, uint32_t launcher_pid)
++static int editor_main(int argc, char **argv, const char *launcher_endpoint, uint32_t launcher_pid,
++                       editor_inspector *inspection)
+ {
+ #if !defined(_WIN32)
+     (void)launcher_endpoint; (void)launcher_pid;
++#else
++    (void)inspection;
+ #endif
+     const char *usage = "usage: sublimite [--wait] [--new-instance] [--font-family PATTERN] [--font-file PATH[#INDEX]] [--font-fallbacks A,B] [--] [path[:line[:col]] ...] [-]";
+-    if (argc == 2 && !strcmp(argv[1], "--help")) { /* (P) executable plus help option. */
++    if (!inspection && argc == 2 && !strcmp(argv[1], "--help")) { /* (P) executable plus help option. */
+         puts(usage); return EXIT_SUCCESS;
+     }
+     uint64_t startup_ns = trace_now_ns();
+@@ -108,6 +111,9 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
+     plat_backend platform_backend = plat_backend_select(display, wayland_display);
+     /* Legacy EDIT_ALLOW_REAL_DISPLAY is accepted as a no-op. Refusal wins. */
+     const char *refuse = getenv("EDIT_REFUSE_REAL_DISPLAY");
++    if (inspection && platform_backend != PLAT_BACKEND_X11) {
++        fprintf(stderr, "sublimite: --inspect-fds requires X11\n"); goto startup_fail;
++    }
+     const char *selected = editor_runtime_display(display, getenv("EDIT_DISPLAY"), refuse);
+     if (platform_backend == PLAT_BACKEND_X11 && selected != display) {
+         if (display && *display) {
+@@ -132,7 +138,11 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
+     if (!args.request.new_instance) {
+         ipc_result role = ipc_server_init_display(&server, NULL, display);
+         if (role == IPC_EXISTS) {
+-#if defined(_WIN32)
++#if !defined(_WIN32)
++            if (inspection) {
++                fprintf(stderr, "sublimite: cannot forward --inspect-fds\n"); goto startup_fail;
++            }
++#else
+             ipc_token forwarded = 0;
+             if (launcher_endpoint) {
+                 if (ipc_server_init_isolated(&server) != IPC_OK) goto startup_fail;
+@@ -294,6 +304,9 @@ static int editor_main(int argc, char **argv, const char *launcher_endpoint, uin
+         }
+     }
+     if (!rc) rc = editor_open(&e, &config, &backend);
++#if !defined(_WIN32)
++    if (!rc && inspection) rc = editor_inspect_attach(e, inspection);
++#endif
+     if (!rc) rc = editor_open_request(e, &args.request, initial_token);
+     ipc_args_fini(&args);
+ #if defined(_WIN32)
+@@ -384,10 +397,19 @@ int main(int argc, char **argv)
+         if (!id || !end || *end != ':' || !end[1]) valid = false;
+         else { parent = (uint32_t)id; endpoint = end + 1; cli_argc--; }
+     }
+-    int rc = valid ? editor_main(cli_argc, utf8, endpoint, parent) : 1;
++    int rc = valid ? editor_main(cli_argc, utf8, endpoint, parent, NULL) : 1;
+     for (int i = 0; i < wide_argc; i++) free(utf8[i]);
+     free(utf8); return rc;
+ #else
+-    return editor_main(argc, argv, NULL, 0);
++    editor_inspector *inspection = NULL;
++    static const char option[] = "--inspect-fds=";
++    if (argc > 1 && !strncmp(argv[1], option, sizeof option - 1u)) {
++        inspection = editor_inspect_open(argv[1] + sizeof option - 1u);
++        if (!inspection) { fprintf(stderr, "sublimite: invalid --inspect-fds capability\n"); return 2; }
++        argv[1] = argv[0]; argv++; argc--;
++    }
++    int rc = editor_main(argc, argv, NULL, 0, inspection);
++    if (inspection) editor_inspect_close(inspection);
++    return rc;
+ #endif
+ }
+diff --git a/src/x11/plat.h b/src/x11/plat.h
+index 716f4b4803de922c885a1a253ff2efad77b74bfa..7cd90ae3f5b4df74832c070892149ffe5122d4d8 100644
+--- a/src/x11/plat.h
++++ b/src/x11/plat.h
+@@ -69,6 +69,7 @@ typedef struct plat_event {
+ typedef struct plat_callbacks {
+     void *ud;
+     void (*on_event)(void *ud, const plat_event *ev);
++    bool (*on_client_message)(void *ud, uint32_t atom, const uint32_t *words);
+     void (*on_blink)(void *ud);                       /* blink timer fired */
+     void (*on_work)(void *ud);                        /* work wake readable */
+     void (*on_present_complete)(void *ud, uint32_t serial, uint64_t ust, uint64_t msc); /* T6 */
+diff --git a/src/x11/x11.c b/src/x11/x11.c
+index 349aad07b13b3c2537302a6dda19499da4cde185..15b30a1f6cb381cea5942cf97b23c50a0084db67 100644
+--- a/src/x11/x11.c
++++ b/src/x11/x11.c
+@@ -732,6 +732,8 @@ static void dispatch(plat *p, const plat_callbacks *cb, xcb_generic_event_t *e)
+     case XCB_CLIENT_MESSAGE: {
+         x11_dnd_event(p, (const xcb_client_message_event_t *)e);
+         xcb_client_message_event_t *x = (xcb_client_message_event_t *)e;
++        if (cb->on_client_message && x->window == x11_private(p)->win &&
++            cb->on_client_message(cb->ud, x->type, x->format == 32 ? x->data.data32 : NULL)) break;
+         if (x->type == x11_private(p)->wm_protocols && x->data.data32[0] == x11_private(p)->wm_delete) {
+             ev.kind = PLAT_EV_CLOSE; if (cb->on_event) cb->on_event(cb->ud, &ev);
+         }
+diff --git a/src/editor/inspect.c b/src/editor/inspect.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bae19f6a783859778aae978d08675dced405e37
+--- /dev/null
++++ b/src/editor/inspect.c
+@@ -0,0 +1,301 @@
++/* Linux X11 oracle adapter. Field order and values: W0.6c wire revision 1. */
++#if !defined(_WIN32)
++#include "editor/private.h"
++#include <endian.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <xcb/xcb.h>
++
++enum { REVISION = 1, SNAP = 1, NEXT = 2 };
++enum result { OK = 0, VERSION = 2, ORDER = 3, SIZE = 4, INVALID = 5 };
++enum ticket_state { IDLE, WAIT_PAINT, WAIT_NATURAL, WAIT_SUBMIT };
++
++struct editor_inspector {
++    uint8_t *mapping;
++    size_t capacity, allocations, scopes;
++    int fd; /* negative after disconnect */
++    uint32_t atom, ticket;
++    enum ticket_state state;
++    bool measuring;
++};
++
++static int descriptor(const char *arg, char **end)
++{
++    if (*arg < '0' || *arg > '9') return -1;
++    long value = strtol(arg, end, 10);
++    return value > STDERR_FILENO && value <= INT_MAX ? (int)value : -1;
++}
++
++static bool socketpair_end(int fd)
++{
++    struct sockaddr_un addr;
++    struct ucred peer;
++    int flags = fcntl(fd, F_GETFL), type;
++    socklen_t len = sizeof type;
++    if (flags < 0 || !(flags & O_NONBLOCK) ||
++        getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) || type != SOCK_SEQPACKET) return false;
++    len = sizeof addr;
++    if (getsockname(fd, (struct sockaddr *)&addr, &len) || addr.sun_family != AF_UNIX ||
++        len != offsetof(struct sockaddr_un, sun_path)) return false;
++    len = sizeof addr;
++    if (getpeername(fd, (struct sockaddr *)&addr, &len) ||
++        len != offsetof(struct sockaddr_un, sun_path)) return false;
++    len = sizeof peer;
++    return !getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &len) &&
++        len == sizeof peer && peer.pid == getppid() && peer.uid == getuid();
++}
++
++editor_inspector *editor_inspect_open(const char *arg)
++{
++    char *end;
++    int m = descriptor(arg, &end);
++    if (m < 0 || *end != ',') return NULL;
++    int s = descriptor(end + 1, &end);
++    if (s < 0 || *end || m == s || !socketpair_end(s)) return NULL;
++    int seals = fcntl(m, F_GET_SEALS);
++    const int required = F_SEAL_GROW | F_SEAL_SHRINK;
++    struct stat info;
++    char link[sizeof "/proc/self/fd/" + sizeof(int) * CHAR_BIT], name[sizeof "/memfd:" - 1u];
++    (void)snprintf(link, sizeof link, "/proc/self/fd/%d", m);
++    if (seals < 0 || (seals & required) != required ||
++        readlink(link, name, sizeof name) != (ssize_t)sizeof name || memcmp(name, "/memfd:", sizeof name) ||
++        fstat(m, &info) || info.st_size <= 0 || (uintmax_t)info.st_size > UINT32_MAX ||
++        fcntl(m, F_SETFD, FD_CLOEXEC) || fcntl(s, F_SETFD, FD_CLOEXEC)) return NULL;
++    editor_inspector *in = calloc(1, sizeof *in);
++    if (!in) return NULL;
++    in->fd = s;
++    in->capacity = (size_t)info.st_size;
++    /* The writable mapping also checks access mode and write seals. */
++    in->mapping = mmap(NULL, in->capacity, PROT_READ | PROT_WRITE, MAP_SHARED, m, 0);
++    close(m);
++    if (in->mapping == MAP_FAILED) { free(in); return NULL; }
++    memset(in->mapping, 0, in->capacity); /* prefault before input */
++    return in;
++}
++
++static void disconnect(editor_inspector *in)
++{
++    if (in->fd >= 0) close(in->fd);
++    in->fd = -1;
++    in->state = IDLE;
++}
++
++void editor_inspect_end_scope(editor_inspector *in)
++{
++    if (!in->measuring) return;
++    in->allocations += edit_malloc_guard_end_thread();
++    in->measuring = false;
++}
++
++void editor_inspect_close(editor_inspector *in)
++{
++    editor_inspect_end_scope(in);
++    fprintf(stderr, "oracle law2: active=%d allocations=%zu scopes=%zu\n",
++            edit_malloc_guard_active(), in->allocations, in->scopes);
++    disconnect(in);
++    munmap(in->mapping, in->capacity);
++    free(in);
++}
++
++typedef struct writer {
++    uint8_t *bytes;
++    size_t capacity, used;
++    bool failed;
++} writer;
++
++static void bytes(writer *w, const void *value, size_t n)
++{
++    if (n > w->capacity - w->used) { w->failed = true; return; }
++    memcpy(w->bytes + w->used, value, n);
++    w->used += n;
++}
++
++static void words(writer *w, const uint32_t *values, size_t n)
++{
++    for (size_t i = 0; i < n && !w->failed; i++) {
++        uint32_t le = htole32(values[i]);
++        bytes(w, &le, sizeof le);
++    }
++}
++#define PUT(w, ...) words((w), (const uint32_t[]){__VA_ARGS__}, \
++                          sizeof((const uint32_t[]){__VA_ARGS__}) / sizeof(uint32_t))
++
++static void reply(editor *e, uint32_t ticket, enum result result, uint32_t size)
++{
++    editor_inspector *in = e->inspector;
++    uint8_t packet[sizeof "SCEL" - 1u + 5u * sizeof(uint32_t)] = "SCEL";
++    writer w = {.bytes = packet, .capacity = sizeof packet, .used = sizeof "SCEL" - 1u};
++    PUT(&w, REVISION, ticket, result, e->active_frame.id, size);
++    if (send(in->fd, packet, sizeof packet, MSG_DONTWAIT | MSG_NOSIGNAL) != sizeof packet)
++        disconnect(in);
++}
++
++bool editor_inspect_marker(void *ctx, uint32_t atom, const uint32_t *request)
++{
++    editor *e = ctx;
++    editor_inspector *in = e->inspector;
++    if (atom != in->atom) return false;
++    if (in->fd < 0) return true;
++    uint8_t byte;
++    /* The request channel is X11. EOF or data on the output socket retires it. */
++    if (!request || recv(in->fd, &byte, sizeof byte, MSG_PEEK | MSG_DONTWAIT) >= 0 || errno != EAGAIN) {
++        disconnect(in); return true;
++    }
++    e->pump_stopped = true;
++    plat_quit(&e->platform); /* ordered after preceding input delivery */
++    uint32_t rev = request[0], op = request[1], ticket = request[2], previous = request[3];
++    if (!ticket) reply(e, ticket, INVALID, 0);
++    else if (ticket <= in->ticket || in->state != IDLE) reply(e, ticket, ORDER, 0);
++    else {
++        in->ticket = ticket;
++        if (rev != REVISION) reply(e, ticket, VERSION, 0);
++        else if (request[4] || (op != SNAP && op != NEXT) || (op == SNAP && previous))
++            reply(e, ticket, INVALID, 0);
++        else if (previous > e->active_frame.id) reply(e, ticket, ORDER, 0);
++        else in->state = op == NEXT && previous == e->active_frame.id ? WAIT_NATURAL : WAIT_PAINT;
++    }
++    return true;
++}
++
++static bool prefix_done(const editor *e)
++{
++    return !e->queue_count && !e->op_count && !e->journal_metadata_pending &&
++        !e->journal_group_open && !e->explicit_group && !e->resize_pending &&
++        e->file_command == KEYS_ACTION_NONE && e->action == EDITOR_ACTION_NONE &&
++        !e->find_replace_request && !e->find_replace_active && !e->find_select_pending &&
++        !e->wheel_pending && !editor_scroll_waiting(e) && !editor_clip_busy(e) &&
++        !view_busy(&e->v) && !layout_busy(&e->lay) && !e->buffer->pending_open &&
++        !e->buffer->placeholder;
++}
++
++bool editor_inspect_repaint(const editor *e)
++{
++    return e->inspector->state == WAIT_PAINT && !e->dirty && !e->backend->active && prefix_done(e);
++}
++
++void editor_inspect_force_repaint(editor *e)
++{
++    editor_inspector *in = e->inspector;
++    in->state = WAIT_SUBMIT;
++    if (editor_begin_frame(e) || render_mark_full(&e->grid)) disconnect(in);
++}
++
++static void write_cells(writer *w, const editor *e, uint32_t count)
++{
++    const render_grid *g = &e->grid;
++    uint32_t color_origin = g->cells[0].bg; /* frame-local equality classes */
++    PUT(w, count);
++    for (uint32_t i = 0; i < count && !w->failed; i++) {
++        const render_cell *c = &g->cells[i];
++        bool right = (c->attrs & RENDER_ATTR_WIDE_RIGHT) != 0;
++        uint32_t cp = right ? 0 : font_async_artwork(e->fonts, g, c->atlas_slot);
++        enum { BLANK, TEXT, CONTINUATION, UNRESOLVED } kind =
++            right ? CONTINUATION : cp == UINT32_MAX ? UNRESOLVED : cp ? TEXT : BLANK;
++        uint32_t attrs = (c->attrs & RENDER_ATTR_CURSOR ? 1u : 0u) |
++            (c->attrs & RENDER_ATTR_UNDERLINE ? 2u : 0u) |
++            (kind != BLANK && (c->attrs & RENDER_ATTR_WIDE_LEFT) ? 4u : 0u);
++        bool inverse = (c->attrs & RENDER_ATTR_INVERSE) != 0;
++        uint8_t utf8[4]; /* utf8_encode's maximum bytes per scalar */
++        size_t len = kind == TEXT ? utf8_encode(cp, utf8) : 0;
++        PUT(w, kind, attrs, (inverse ? c->bg : c->fg) ^ color_origin,
++            (inverse ? c->fg : c->bg) ^ color_origin, (uint32_t)len);
++        bytes(w, utf8, len);
++    }
++}
++
++static void write_tabs(writer *w, const editor *e)
++{
++    const tabs_strip *s = &e->strip;
++    size_t available = tabs_count(&e->tabs);
++    /* The open menu's dropdown spans the entire tab row. */
++    if (e->tab_rows <= e->menu_rows || e->menu.open >= 0 || !s->col_count) {
++        PUT(w, 0); return;
++    }
++    available -= s->first_tab;
++    uint32_t count = (s->col_count - 1u) / s->tab_cols + 1u; /* ceiling */
++    if (count > available) count = (uint32_t)available;
++    size_t active = tabs_active_index(&e->tabs);
++    PUT(w, count);
++    for (uint32_t i = 0; i < count; i++) {
++        uint32_t offset = i * s->tab_cols, width = s->col_count - offset;
++        if (width > s->tab_cols) width = s->tab_cols;
++        PUT(w, s->first_col + offset, e->menu_rows, width, 1, active == s->first_tab + i);
++    }
++}
++
++static void snapshot(editor *e)
++{
++    editor_inspector *in = e->inspector;
++    const render_dims d = e->grid.dims;
++    const render_scroll s = e->grid.scroll;
++    uint32_t extra = s.origin_y_q8 != 0, gutter = e->lay.gw;
++    writer w = {.bytes = in->mapping, .capacity = in->capacity};
++    PUT(&w, 1, 0, e->active_frame.id, e->font.window_width, e->font.window_height,
++        d.cols, d.rows, d.cell_w, d.cell_h, gutter, e->tab_rows, e->text_grid.dims.cols - gutter,
++        e->v.config.rows, (uint32_t)s.origin_y_q8, 0, s.first_row, s.cols, s.rows, extra, 1u | 2u | 4u);
++    /* v1 bounds each grid axis at open/resize. Submit validated the backing storage. */
++    write_cells(&w, e, d.cols * (d.rows + extra));
++    write_tabs(&w, e);
++    PUT(&w, 0, d.rows - 1u, d.cols, 1);
++    reply(e, in->ticket, w.failed ? SIZE : OK, w.failed ? 0 : (uint32_t)w.used);
++}
++
++static void on_ingress(void *ctx, uint64_t sequence, uint64_t ns)
++{
++    (void)sequence; (void)ns;
++    editor_inspector *in = ((editor *)ctx)->inspector;
++    if (!in->measuring) {
++        in->measuring = true;
++        edit_malloc_guard_begin_thread();
++    }
++}
++
++static void on_io(void *ctx, bool entering)
++{
++    (void)ctx;
++    if (entering) edit_malloc_guard_exempt_begin();
++    else edit_malloc_guard_exempt_end();
++}
++
++static void on_submit(void *ctx, const editor_frame *frame)
++{
++    editor *e = ctx;
++    editor_inspector *in = e->inspector;
++    if (in->state != IDLE && prefix_done(e)) {
++        in->state = IDLE;
++        snapshot(e);
++    } else if (in->state == WAIT_NATURAL) {
++        in->state = WAIT_PAINT; /* the lower bound passed while input still drained */
++    }
++    if (frame->last_sequence && in->measuring) {
++        editor_inspect_end_scope(in);
++        in->scopes++;
++    }
++}
++
++int editor_inspect_attach(editor *e, editor_inspector *in)
++{
++    static const char name[] = "_SUBLIMITE_CONTRACT";
++    xcb_connection_t *c = plat_native_x11(&e->platform).connection;
++    xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(c,
++        xcb_intern_atom(c, 0, sizeof name - 1u, name), NULL);
++    if (!r) return EDITOR_ERR_IO;
++    in->atom = r->atom;
++    free(r);
++    e->inspector = in;
++    e->cfg.hook_ctx = e;
++    e->cfg.on_ingress = on_ingress;
++    e->cfg.on_io = on_io;
++    e->cfg.on_submit = on_submit;
++    return 0;
++}
++#endif

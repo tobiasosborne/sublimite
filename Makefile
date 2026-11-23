@@ -98,6 +98,13 @@ $(B):
 check-xdriver: $(B)/xdriver $(B)/xdriver-test-client
 	python3 -B tests/contract/test_xdriver.py
 
+ORACLE_JOBS ?= 1
+.PHONY: check-contract-oracle
+check-contract-oracle: $(B)/xdriver
+	@test -n "$(ORACLE_TREE)" && test -n "$(ORACLE_DISPLAY)" || { echo "Set ORACLE_TREE and ORACLE_DISPLAY (:130 through :139)" >&2; exit 2; }
+	python3 -B tests/contract/build_oracle.py --jobs "$(ORACLE_JOBS)" "$(ORACLE_TREE)"
+	python3 -B tests/contract/test_oracle_inspector.py --build-dir "$(ORACLE_TREE)/build/contract-oracle" --driver "$(abspath $(B)/xdriver)" --display "$(ORACLE_DISPLAY)"
+
 .PHONY: check-contract-recovery
 check-contract-recovery: $(B)/xdriver
 	python3 -B tests/contract/cases/recovery.py --oracle "$$ORACLE" \
