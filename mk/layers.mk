@@ -1,6 +1,5 @@
-# The 5-layer acyclic module DAG (docs/PLAN_V2.md §2). Single source of truth
-# for module -> layer: tools/check_dag.py parses the L<n>_MODS lines below, so
-# keep them one per line, `:=`, no trailing comments.
+# The acyclic module DAG (docs/PLAN_V2.md §2). Make expands L<n>_MODS
+# for both the archive source lists and tools/check_dag.py.
 #
 # A layer links only lower layers. Archives per configuration live at
 # build/<cfg>/<archive>; objects at build/<cfg>/src/<module>/<file>.o.
@@ -33,9 +32,15 @@ LOWER_L5 := L4 L3 L2 L1 L0
 
 # Sources per layer. src/main.c is outside every archive (it is linked as an
 # object ahead of L5). Vendored tree-sitter objects ride in libui.a next to hl.
-$(foreach l,$(LAYERS),$(eval $(l)_SRCS := $$(sort $$(foreach m,$$($(l)_MODS),$$(wildcard src/$$(m)/*.c)))))
+LAYER_MODULES := $(foreach l,$(LAYERS),$(addprefix $(l):,$($(l)_MODS)))
+layer_modules = $(patsubst $(1):%,%,$(filter $(1):%,$(LAYER_MODULES)))
+$(foreach l,$(LAYERS),$(eval $(l)_SRCS := $$(sort $$(foreach m,$$(call layer_modules,$(l)),$$(wildcard src/$$(m)/*.c)))))
 L4_SRCS += $(TS_SRCS)
 MAIN_SRC := $(wildcard src/main.c)
+
+.PHONY: print-layer-map
+print-layer-map:
+	@printf '%s\n' $(LAYER_MODULES)
 
 # Per-layer object lists in every configuration tree: L<n>_OBJ_<cfg>.
 $(foreach c,$(CFGS),$(foreach l,$(LAYERS),$(eval $(l)_OBJ_$(c) := $$(patsubst %.c,$$(B)/$(c)/%.o,$$($(l)_SRCS)))))

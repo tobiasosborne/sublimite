@@ -56,6 +56,11 @@ include mk/layers.mk
 
 TESTS      := $(sort $(wildcard tests/*_test.c))
 FUZZS      := $(sort $(wildcard fuzz/*_fuzz.c))
+# The dependency lints cover every translation unit in these directories,
+# including sources that are not linked by a check lane.
+LINT_REL_SRCS := $(shell find $(wildcard src tests) -name '*.c' \( -type f -o -xtype f \))
+LINT_FUZZ_SRCS := $(if $(wildcard fuzz),$(shell find fuzz -name '*.c' \( -type f -o -xtype f \)))
+LINT_OBJS := $(LINT_REL_SRCS:%.c=$(B)/rel/%.o) $(LINT_FUZZ_SRCS:%.c=$(B)/fuzz/%.o)
 # Law-2 + G1 suites run on the release (gcc -O2) tree: the allocation guard is
 # live there, and the suite must fail closed if it is inert.
 LAW2_TESTS := $(filter tests/law2_%_test.c tests/g1_%_test.c,$(TESTS))
@@ -126,12 +131,12 @@ check:
 	@$(MAKE) --no-print-directory check-law2
 	@echo "check: ok"
 
-# Structural lints: per-module include DAG, no `#include "*.c"` in tests/fuzz,
-# v2 namespace isolation. Generator --check steps join here as generators land.
-check-lints:
-	python3 tools/check_dag.py
-	python3 tools/check_no_c_includes.py
+# The include lints use the .d files emitted when compiling these objects.
+check-lints: $(LINT_OBJS)
+	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
+	python3 tools/check_no_c_includes.py --build-dir "$(B)"
 	python3 tools/check_isolation.py
+	python3 tests/lint/run.py
 
 # Isolated --whole-archive link per layer against lower archives only, then run.
 check-layers: $(LAYER_TEST_BINS) $(LAYER_L5_BIN)

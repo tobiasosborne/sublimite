@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
-"""Include-DAG checker: inter-layer AND intra-layer module partial orders.
+"""Check layer and module include orders using compiler dependency files.
 
-Layers come from mk/layers.mk (L<n>_MODS); L5 additionally owns src/main.c
-(module "main"). Rules, all on quoted #include edges inside src/:
+Every translation unit under src/ may reach files in its own module, in a
+lower layer, or in a module ordered below it in the same layer. L5 may never
+reach x11/, wayland/, gl/, or raster/. Every src/ subdirectory needs a layer.
 
-  1. Inter-layer: a module may include only modules of its own or a LOWER
-     layer (L0 < L1 < ... < L5).
-  2. Intra-layer: INTRA_RULES below declare "a < b" (b may include a, never
-     the reverse). The relation is transitively closed; two modules of one
-     layer that are not related must not include each other at all (this is
-     what bans x11 <-> wayland, the v1 x11/clip.c <-> wayland/dispatch.c
-     private.h cycle).
-  3. FORBIDDEN: L5 (src/app, src/main.c) never includes x11/, wayland/, gl/
-     or raster/ headers; it reaches L3 through plat/render public headers.
-  4. Every src/<dir> must be assigned to a layer.
-
-Exit 0 clean, 1 on violations (file:line diagnostics), 2 on a bad rule table.
-Usage: check_dag.py [--root DIR]
+Exit 0 clean, 1 on violations, 2 on a bad layer or module table.
 """
 import argparse
-import os
+from pathlib import Path
 import re
+import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import clex  # noqa: E402
+ROOT = Path(__file__).resolve().parents[1]
 
 # Edit here (and in docs/PLAN_V2.md §2) when an order legitimately changes.
 INTRA_RULES = [
@@ -52,7 +41,8 @@ FORBIDDEN = {            # includer module -> modules it must never include
     'main': ('x11', 'wayland', 'gl', 'raster'),
 }
 EXTS = ('.c', '.h', '.inc')
-QUOTED = re.compile(r'^[ \t]*#[ \t]*(?:include|include_next|import)[ \t]*"([^"\n]+)"', re.M)
+MAKE_WORD = re.compile(r'(?:\\[ \t#]|[^\s])+')
+MAKE_ESCAPE = re.compile(r'\\([ \t#])|\$\$')
 
 
 def fail_config(msg):
@@ -60,22 +50,28 @@ def fail_config(msg):
     sys.exit(2)
 
 
-def read_layers(root):
-    path = os.path.join(root, 'mk', 'layers.mk')
-    if not os.path.isfile(path):
-        fail_config('%s not found' % path)
+def read_layers(root, assignments):
+    if assignments is None:
+        try:
+            result = subprocess.run(['make', '--no-print-directory', '-s', 'print-layer-map'],
+                                    cwd=root, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as err:
+            fail_config('make print-layer-map failed: %s' % err.stderr.strip())
+        except OSError as err:
+            fail_config(str(err))
+        assignments = result.stdout.split()
+
     layer_of = {}
-    for line in clex.read_text(path).splitlines():
-        m = re.match(r'^L([0-9])_MODS\s*:=\s*([^#]*)', line)
+    for assignment in assignments:
+        m = re.fullmatch(r'L([0-5]):([^:\s]+)', assignment)
         if not m:
-            continue
-        n = int(m.group(1))
-        for mod in m.group(2).split():
-            if mod in layer_of:
-                fail_config('module %s listed in two layers' % mod)
-            layer_of[mod] = n
+            fail_config('invalid layer assignment %r' % assignment)
+        n, mod = m.groups()
+        if mod in layer_of:
+            fail_config('module %s listed in two layers' % mod)
+        layer_of[mod] = int(n)
     if not layer_of:
-        fail_config('no L<n>_MODS lines found in %s' % path)
+        fail_config('no module assignments from mk/layers.mk')
     if 'main' in layer_of:
         fail_config('"main" is implicit (src/main.c); do not list it in layers.mk')
     layer_of['main'] = MAIN_LAYER
@@ -111,83 +107,110 @@ def build_order(layer_of):
     return lt
 
 
-def module_of(src, path):
-    rel = os.path.relpath(path, src).replace(os.sep, '/')
-    if '/' not in rel:
-        return 'main' if rel in ('main.c', 'main.h') else None
-    return rel.split('/', 1)[0]
+def translation_units(root, directory):
+    return sorted(path.relative_to(root) for path in (root / directory).rglob('*.c')
+                  if path.is_file())
 
 
-def resolve(src, includer, inc):
-    """Module an include refers to, or None (system/vendor/unknown)."""
-    for base in (os.path.dirname(includer), src):
-        cand = os.path.normpath(os.path.join(base, inc))
-        if os.path.isfile(cand):
-            if os.path.commonpath([os.path.abspath(cand), os.path.abspath(src)]) == os.path.abspath(src):
-                return module_of(src, cand)
-            return None
-    return inc.split('/', 1)[0] if '/' in inc else None   # header not written yet
+def make_paths(words):
+    return [Path(MAKE_ESCAPE.sub(lambda m: m[1] or '$', word))
+            for word in MAKE_WORD.findall(words)]
+
+
+def read_dependencies(root, obj, source):
+    """Return prerequisites as (compiler path, resolved path) pairs."""
+    dep = obj.with_suffix('.d')
+    try:
+        stamp = (root / dep).stat().st_mtime_ns
+        # -MP adds empty rules after the first logical line.
+        data = (root / dep).read_text(encoding='utf-8', errors='surrogateescape')
+    except FileNotFoundError:
+        raise ValueError(f'missing dependency file {dep}') from None
+
+    rule = data.replace('\\\n', ' ').partition('\n')[0]
+    targets, _, prerequisites = rule.partition(':')
+    paths = make_paths(prerequisites)
+    full_source = root / source
+    if [root / target for target in make_paths(targets)] != [root / obj] or not any(
+            root / path == full_source for path in paths):
+        raise ValueError(f'invalid dependency file {dep} for {source}')
+
+    dependencies = []
+    for path in paths:
+        full_path = root / path
+        try:
+            if full_path.stat().st_mtime_ns > stamp:
+                raise ValueError(f'stale dependency file {dep} (older than {path})')
+        except FileNotFoundError:
+            raise ValueError(f'dependency {path} from {dep} is missing') from None
+        if full_path != full_source:
+            dependencies.append((path, full_path.resolve()))
+    return dependencies
+
+
+def module_of(path):
+    if len(path.parts) > 1:
+        return path.parts[0]
+    return 'main' if path.name in ('main.c', 'main.h') else None
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--root', default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument('--root', type=Path, default=ROOT)
+    ap.add_argument('--build-dir', type=Path, default=Path('build'))
+    ap.add_argument('--layers', nargs='*', metavar='LAYER:MODULE')
     args = ap.parse_args()
-    root = os.path.abspath(args.root)
-    src = os.path.join(root, 'src')
-    layer_of = read_layers(root)
+    root = args.root.resolve()
+    src = root / 'src'
+    layer_of = read_layers(root, args.layers)
     lt = build_order(layer_of)
 
     errors = []
     nfiles = nedges = 0
-    if not os.path.isdir(src):
+    if not src.is_dir():
         fail_config('%s not found' % src)
-    for entry in sorted(os.listdir(src)):
-        p = os.path.join(src, entry)
-        if os.path.isdir(p) and entry not in layer_of:
-            errors.append('src/%s/: error: directory is not assigned to a layer in mk/layers.mk' % entry)
-        elif os.path.isfile(p) and entry.endswith(EXTS) and entry not in ('main.c', 'main.h'):
-            errors.append('src/%s: error: stray file in src/ (only main.c lives outside a module)' % entry)
+    for entry in sorted(src.iterdir()):
+        if entry.is_dir() and entry.name not in layer_of:
+            errors.append(f'src/{entry.name}/: error: directory is not assigned to a layer in mk/layers.mk')
+        elif entry.is_file() and entry.suffix in EXTS and not module_of(Path(entry.name)):
+            errors.append(f'src/{entry.name}: error: stray file in src/ (only main belongs outside a module)')
 
-    for dirpath, dirnames, filenames in os.walk(src):
-        dirnames.sort()
-        for fn in sorted(filenames):
-            if not fn.endswith(EXTS):
+    src = src.resolve()
+    for source in translation_units(root, 'src'):
+        me = module_of(source.relative_to('src'))
+        if me not in layer_of:
+            continue  # already reported as unassigned
+        nfiles += 1
+        where = f'{source}: error:'
+        obj = args.build_dir / 'rel' / source.with_suffix('.o')
+        try:
+            dependencies = read_dependencies(root, obj, source)
+        except (OSError, ValueError) as err:
+            errors.append(f'{where} {err}')
+            continue
+
+        for inc in sorted({resolved.relative_to(src) for _, resolved in dependencies
+                           if resolved.is_relative_to(src)}):
+            other = module_of(inc)
+            if other == me:
                 continue
-            path = os.path.join(dirpath, fn)
-            me = module_of(src, path)
-            if me not in layer_of:
-                continue                       # already reported as unassigned
-            nfiles += 1
-            text = clex.blank_comments(clex.read_text(path))
-            line_of = clex.line_mapper(text)
-            rel = os.path.relpath(path, root)
-            for m in QUOTED.finditer(text):
-                inc = m.group(1)
-                other = resolve(src, path, inc)
-                if other is None or other == me or other not in layer_of:
-                    continue
-                nedges += 1
-                where = '%s:%d: error:' % (rel, line_of(m.start()))
-                who = '%s (L%d) includes "%s" (%s, L%d)' % (me, layer_of[me], inc, other, layer_of[other])
-                if other in FORBIDDEN.get(me, ()):
-                    errors.append('%s [forbidden] %s: L5 must reach L3 only through plat/render public headers'
-                                  % (where, who))
-                elif layer_of[other] > layer_of[me]:
-                    errors.append('%s [inter-layer] %s: upward include (L%d may only include L0..L%d)'
-                                  % (where, who, layer_of[me], layer_of[me]))
-                elif layer_of[other] == layer_of[me] and (other, me) not in lt:
-                    why = ('%s is declared above %s in this layer: downward-only' % (other, me)
-                           if (me, other) in lt else
-                           '%s and %s are unrelated: modules of one layer must not couple unless ordered' % (me, other))
-                    errors.append('%s [intra-layer] %s: %s (see INTRA_RULES in tools/check_dag.py)'
-                                  % (where, who, why))
+            if other not in layer_of:
+                errors.append(f'{where} reaches src/{inc}, which has no assigned layer')
+                continue
+            nedges += 1
+            who = f'{me} (L{layer_of[me]}) reaches "src/{inc}" ({other}, L{layer_of[other]})'
+            if other in FORBIDDEN.get(me, ()):
+                errors.append(f'{where} [forbidden] {who}: L5 may not reach backend headers')
+            elif layer_of[other] > layer_of[me]:
+                errors.append(f'{where} [inter-layer] {who}: upward include')
+            elif layer_of[other] == layer_of[me] and (other, me) not in lt:
+                errors.append(f'{where} [intra-layer] {who}: {other} is not below {me} in INTRA_RULES')
     for e in errors:
         print(e)
     if errors:
         print('check_dag: FAIL: %d violation(s)' % len(errors))
         return 1
-    print('check_dag: ok (%d files, %d cross-module includes, %d modules in %d layers)'
+    print('check_dag: ok (%d translation units, %d cross-module dependencies, %d modules in %d layers)'
           % (nfiles, nedges, len(layer_of), len(set(layer_of.values()))))
     return 0
 

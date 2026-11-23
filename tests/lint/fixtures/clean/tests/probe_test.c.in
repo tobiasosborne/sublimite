@@ -1,0 +1,2 @@
+#include "os/os.h"
+int probe(void) { return 0; }

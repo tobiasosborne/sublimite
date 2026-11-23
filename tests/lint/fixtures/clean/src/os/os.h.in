@@ -1,0 +1,1 @@
+struct os_probe { int value; };

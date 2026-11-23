@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Minimal C lexer shared by the structural linters (stdlib only).
+"""Minimal C lexer for the namespace isolation lint (stdlib only).
 
 Splits C source into code / comment / string / char / header tokens so the
-linters never trip over `#include` text inside comments or string contents.
-Not a preprocessor: it does not expand macros or follow includes.
+isolation lint can examine identity strings.
 """
 import bisect
 import re
@@ -69,16 +68,6 @@ def lex(text):
             i += 1
     flush(n)
     return toks
-
-
-def blank_comments(text):
-    """`text` with every comment replaced by spaces (newlines kept), so line
-    numbers and columns are unchanged."""
-    out = []
-    for kind, a, b in lex(text):
-        seg = text[a:b]
-        out.append(re.sub(r'[^\n]', ' ', seg) if kind == 'comment' else seg)
-    return ''.join(out)
 
 
 def line_mapper(text):
