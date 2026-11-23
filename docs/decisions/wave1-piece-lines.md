@@ -45,7 +45,8 @@ before the worker batch arrives returns exact text as unknown). Corrected set:
 4. Edit-path cuts: a counted descriptor is cut by scanning its shorter half, at most C/2 = 32,768 B (P), and
    subtracting; an unknown descriptor's halves stay unknown and nothing is read. piece_replace_spans reads no byte. One
    replace reads at most 2 × 32,768 = 65,536 B of mapped text (P); a one-span delete and its undo together read at most
-   65,536 B (the undo reinserts at an entry boundary and cuts nothing).
+   131,072 B (P, A13's signed figure; advisor ruling on 7a point 1): undo's describe scans up to 32,768 B at each end
+   inside a counted descriptor and the delete repeats that scan; distinct mapped bytes touched stay at most 65,536 B.
 5. Counts travel with spans, outside piece_span. piece_span stays 16 B: it is the journal's and the description's unit,
    and a cached count never reaches disk. An optional parallel record of 8 B per span, kept only by undo, holds
    (head count, tail count), each at most 65,536 or the unknown sentinel, 2 × 32 bits (P): descriptors are aligned to

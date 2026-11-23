@@ -204,8 +204,12 @@ under Astra review until frozen). Consequences:
   follows it.
 - After Astra's review (docs/reviews/wave1-piece-lines-astra.md; advisor rulings the same day): counts travel with
   spans in an optional 8 B (head, tail) record kept by undo, never inside the 16 B piece_span; piece_replace_spans reads
-  no byte; edit-path cuts scan only the shorter half of a counted descriptor. A13's bound is tightened: one replace reads
-  at most 2 × 32,768 = 65,536 B of mapped text (P), and a one-span delete plus its undo together at most 65,536 B (the
-  131,072 B figure stays true). The text length is held at or below a named maximum 2^60 by an ASSERT at every edit
+  no byte; edit-path cuts scan only the shorter half of a counted descriptor. One replace reads at most 2 × 32,768 =
+  65,536 B of mapped text (P). A one-span delete plus its undo reads at most 131,072 B, A13's signed figure (advisor,
+  withdrawing an unforced tightening to 65,536): undo describes the range first, scanning up to 32,768 B at each end
+  inside a counted descriptor, and the delete repeats that scan, so bytes read are at most 2 × 2 × 32,768 = 131,072 (P)
+  while distinct mapped bytes touched stay at most 65,536 (P). Removing the repeat would need a combined
+  describe-and-delete primitive or a cut that is an edit of its own, reopening the frozen Editing section for no
+  input-visible gain. The test counts bytes read against 131,072. The text length is held at or below a named maximum 2^60 by an ASSERT at every edit
   (the 2^47-byte address-space argument holds only on 4-level paging). Undo literal threshold stays 16 × spans > length;
   the in-memory inverse entry is 24 B.

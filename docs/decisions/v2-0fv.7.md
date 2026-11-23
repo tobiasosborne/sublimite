@@ -122,6 +122,14 @@ The pair with a reinsert-at-boundary undo therefore reads up to 2 × 32,768 (des
 
 Recommendation: **(A)**. The header currently states per-call bounds that are consistent with (A).
 
+**Ruled (advisor, 2026-11-23): (A).** Bytes read by the pair are at most 131,072 (P); distinct mapped bytes touched at most
+65,536 (P); the second scan is warm memory with no new page fault. (B) and (C) would reopen the frozen Editing section or
+break carried-count exactness for no input-visible gain. The real-tree test (7b) counts bytes read against 131,072.
+
+**Suite red controls.** Five mutated models, each linked as the implementation against the unchanged model as
+reference, must each fail the suite: no snapshot cache; abort keeping the ADD length; next_span ignoring end; no span
+merging; capture off by one (evidence in §12).
+
 ## 7. The model and how a client links it
 
 `tests/piece_model.h` is a flat model of exactly this API: no pool and no tree.
