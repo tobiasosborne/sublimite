@@ -246,3 +246,24 @@ comparison (v2 is 0.47 % above it: the 96 B per page a 400 B slot leaves). Re-de
   needs memory for the parsed result, the caller passes a base arena and the parser owns nothing. In neither case does
   the parser own a pool (a pool it does not need is state). PLAN §2 corrected.
 
+## A22. Rulings on the L2 derivations (advisor, 2026-11-23; docs/decisions/wave1-L2-derivations.md)
+
+- Q6 accepted as the design: one os_file_pwrite_once per encoded journal record on the UI thread (the contract is that a
+  drawn edit survives a kill; a worker design must fence the draw on the worker's write anyway). Wave 1 exit number:
+  input-to-submit median and tail with the append, during ordinary typing and under heavy writeback from another
+  process, stamped [bat]/[AC] + load. If the tail fails G1, the comparison is a preallocated shared mapping of the
+  journal segment, not a worker.
+- Q12 accepted: on OS_E_NOSPC a mapped open or reload is refused visibly. OS_FAULT_SLOTS = 256 is derived from the copy
+  threshold (only files at or above it are mapped; v1 256 MiB, so a 257th distinct mapping needs at least 64 GiB of
+  open files (P)), written beside the constant in os.h; L2 file's copy threshold carries the note that the slot count
+  is derived from it.
+- Q3 accepted as the design; its 10 GiB measurement (peak ADD extents, nodes, scratch, RSS, temporary disk) is an
+  acceptance line of L2-2.
+- Q2, Q4, Q11 NOT settled: challenged by the advisor (no retention of the old file at all: (a) a synced save-prepared
+  record naming the written temporary's identity and the journal position of the save snapshot; (b) from the moment a
+  save of generation G is prepared, restores from G are journaled by value; (c) in-place rewrite of a mapped file as
+  already decided). Back to Astra for a kill-at-every-step trace. os_file_clone and os_link_at are not built until it
+  is decided. It gates L2-2's record set and L2-3, not L2-0a or L2-1.
+- The other ten (Q1, Q5, Q7, Q8, Q9, Q10, Q13, Q14, Q15, Q16) accepted as one-liners; each is read again in its
+  bead's brief.
+

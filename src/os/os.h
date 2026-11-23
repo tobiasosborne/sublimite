@@ -330,7 +330,14 @@ void os_map_prefetch(const os_map *m, size_t off, size_t len);
  * emulated, and a prior SIG_IGN counts as SIG_DFL. os is the only module that
  * sets a signal action; the service installs on first registration.
  *
- * Capacity (M): v1 OS_FAULT_SLOTS, from v1 src/file/file.c FILE_GUARD_SLOTS.
+ * Capacity: 256 slots, derived from the copy threshold, not inherited. Only
+ * files at or above the copy threshold are mapped (v1: 256 MiB on this
+ * machine class, (M) v1 src/file/file.c:10 and :139), so the 257th
+ * simultaneously registered distinct mapping needs at least
+ * 256 x 256 MiB = 64 GiB of open files (P); snapshots of one backing share its
+ * slot. Whoever lowers L2 file's copy threshold re-derives this count. On
+ * exhaustion register returns OS_E_NOSPC and the open or reload is refused
+ * visibly (docs/decisions/wave1-L2-derivations.md Q12).
  * An id is a copyable value. Generation 0 is the absent id; issued
  * generations never repeat, so a stale id never reads another registration.
  * An id grants no access to bytes: readers hold the backing that owns the
