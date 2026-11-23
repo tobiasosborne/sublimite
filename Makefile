@@ -56,6 +56,16 @@ B := build
 
 include mk/grammars.mk
 -include tests/lanes.mk
+# Lane lists are derived from the suite-lane table, never assigned by hand
+# (docs/decisions/v2-he7.26.md): each table line is a variable named by the
+# suite's path whose value is its lanes.
+LANE_TABLE := $(sort $(filter tests/%.c fuzz/%.c,$(.VARIABLES)))
+lane_suites = $(foreach s,$(LANE_TABLE),$(if $(filter $(1),$($(s))),$(s)))
+LAYER_SUITES := $(call lane_suites,layers)
+SAN_SUITES   := $(call lane_suites,san)
+LAW2_SUITES  := $(call lane_suites,law2)
+TSAN_SUITES  := $(call lane_suites,tsan)
+FUZZ_SUITES  := $(call lane_suites,fuzz)
 include mk/layers.mk
 
 # Include unlinked translation units under src/, tests/ and fuzz/. The test
@@ -163,6 +173,13 @@ $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
                    os_cond_init os_cond_destroy os_thread_start os_thread_join
 $(foreach c,rel san tsan,$(B)/$(c)/tests/work_test): private LDLIBS += $(foreach s,$(WORK_TEST_WRAPS),-Wl,--wrap=$(s))
+# Fault-service faults are injected beneath os (v2-0fv.2): per-suite link flags,
+# LDFLAGS_<suite stem>, consumed by the test link rules.
+LDFLAGS_os_fault_test := -Wl,--wrap=mmap,--wrap=sigaction,--wrap=sysconf,--wrap=syscall \
+                         -Wl,--wrap=sem_init,--wrap=sem_destroy,--wrap=sem_wait,--wrap=sem_post
+# Test-hook objects (A15 generation setter) only for the fault suites.
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/os_fault_test: $(B)/$(c)/src/os/os_posix_test_hooks.o))
+$(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
@@ -264,9 +281,7 @@ check-layout: check-suites
 check-suites:
 	@python3 tools/check_layout.py suites \
 	    --required-layers $(LAYER_TESTS_SRC) --layers $(LAYER_SUITES) --san $(SAN_SUITES) \
-	    --law2 $(LAW2_SUITES) --law2-empty-wave "$(LAW2_EMPTY_WAVE)" \
-	    --tsan $(TSAN_SUITES) --tsan-empty-wave "$(TSAN_EMPTY_WAVE)" \
-	    --fuzz $(FUZZ_SUITES) --fuzz-empty-wave "$(FUZZ_EMPTY_WAVE)" \
+	    --law2 $(LAW2_SUITES) --tsan $(TSAN_SUITES) --fuzz $(FUZZ_SUITES) \
 	    --tests-on-disk $(filter %_test.c,$(LINT_TEST_SRCS)) \
 	    --fuzz-on-disk $(filter %_fuzz.c,$(LINT_FUZZ_SRCS))
 
@@ -278,7 +293,6 @@ check-includes: $(LINT_OBJS)
 run_test_binaries = for t in $(1); do echo "== $$t"; $(RUN)"$$t"; n=$$((n+1)); done
 assert_suite_count = if [ "$$n" -ne "$(words $(1))" ]; then \
 	echo "$@: FAIL ran $$n of $(words $(1)) declared suites"; exit 1; fi
-declared_empty = echo "$@: declared empty (first suites due in Wave $(1))"
 
 # Isolated --whole-archive link per layer against lower archives only, then run.
 check-layers: check-suites $(LAYER_TEST_BINS) $(LAYER_L5_BIN)
@@ -312,17 +326,15 @@ check-san: check-suites $(TEST_SAN)
 # and requires a live guard with a zero count for every Law-2 window.
 check-law2: check-suites $(TEST_LAW2)
 	@set -e; n=0; $(call run_test_binaries,$(TEST_LAW2)); \
-	$(call assert_suite_count,$(LAW2_SUITES)); \
-	if [ "$$n" -eq 0 ]; then $(call declared_empty,$(LAW2_EMPTY_WAVE)); else echo "$@: $$n release suites passed"; fi
+	$(call assert_suite_count,$(LAW2_SUITES)); echo "$@: $$n release suites passed"
 
 # TSan is a wave-end / per-touched-module gate.
 check-tsan: check-suites $(TEST_TSAN)
 	@set -e; n=0; $(call run_test_binaries,$(TEST_TSAN)); \
-	$(call assert_suite_count,$(TSAN_SUITES)); \
-	if [ "$$n" -eq 0 ]; then $(call declared_empty,$(TSAN_EMPTY_WAVE)); else echo "$@: $$n threaded suites passed"; fi
+	$(call assert_suite_count,$(TSAN_SUITES)); echo "$@: $$n threaded suites passed"
 
 fuzz: check-suites $(FUZZ_BIN)
-	@$(if $(FUZZ_BIN),echo "$@: $(words $(FUZZ_BIN)) fuzzers built",$(call declared_empty,$(FUZZ_EMPTY_WAVE)))
+	@echo "$@: $(words $(FUZZ_BIN)) fuzzers built"
 
 # Replay each fuzzer over its committed seed corpus fuzz/corpus/<name>/ only
 # (-runs=0: no generated inputs, so no invented iteration budget).
@@ -330,8 +342,7 @@ fuzz-smoke: check-suites $(FUZZ_BIN)
 	@set -e; n=0; for f in $(FUZZ_BIN); do m=$${f#$(B)/fuzz/}; corpus=fuzz/corpus/$${m%_fuzz}; \
 	  if [ ! -d "$$corpus" ]; then echo "$@: FAIL $$corpus missing (commit minimal seeds)"; exit 1; fi; \
 	  echo "== $$f $$corpus"; $(RUN)"$$f" -runs=0 "$$corpus"; n=$$((n+1)); done; \
-	$(call assert_suite_count,$(FUZZ_SUITES)); \
-	if [ "$$n" -eq 0 ]; then $(call declared_empty,$(FUZZ_EMPTY_WAVE)); else echo "$@: $$n fuzzers replayed their seeds"; fi
+	$(call assert_suite_count,$(FUZZ_SUITES)); echo "$@: $$n fuzzers replayed their seeds"
 
 clean:
 	rm -rf $(B)

@@ -4,6 +4,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,6 +24,22 @@ def append(root, path, text):
     dest = root / path
     previous = dest.read_text(encoding='utf-8') if dest.exists() else ''
     write(root, path, previous + text)
+
+
+class MutationMissed(Exception):
+    pass
+
+
+def edit(root, path, pattern, replacement):
+    text, count = re.subn(pattern, replacement, (root / path).read_text(encoding='utf-8'),
+                          flags=re.MULTILINE)
+    if not count:
+        raise MutationMissed(f'{path} has no match for {pattern!r}')
+    write(root, path, text)
+
+
+def suite_line(suite):
+    return rf'^{re.escape(suite)}[ \t]*:=.*\n'
 
 
 def prepare(root):
@@ -58,7 +75,7 @@ void base_malloc_guard_exempt_end(void) {{}}
 
 
 def leave_stale_suite_binary(root):
-    append(root, MANIFEST, '\nSAN_SUITES += tests/absent_test.c\n')
+    append(root, MANIFEST, 'tests/absent_test.c := san\n')
     binary = 'build/case/san/tests/absent_test'
     write(root, binary, '#!/bin/sh\nexit 0\n')
     (root / binary).chmod(0o755)
@@ -66,9 +83,44 @@ def leave_stale_suite_binary(root):
 
 def cases(baseline):
     registry = 'check-lints' if baseline else 'check-layout'
-    yield ('empty Law-2 lane without a declaration',
-           lambda repo: append(repo, MANIFEST, '\nLAW2_SUITES :=\n'),
-           ('check-law2',), 'check-law2 has no suites and no first-wave declaration')
+    yield ('no line names the Law-2 lane',
+           lambda repo: edit(repo, MANIFEST, r'[ \t]law2\b', ''),
+           ('check-law2',), 'check-law2 requires at least one suite')
+    # v2-he7.26: the manifest is a table, one line per suite naming its lanes.
+    yield ('suite line deleted',
+           lambda repo: edit(repo, MANIFEST, suite_line('tests/trace_test.c'), ''),
+           ('check-san',), 'unlisted suite: tests/trace_test.c')
+    yield ('duplicate suite line',
+           lambda repo: edit(repo, MANIFEST, suite_line('tests/trace_test.c'),
+                             'tests/trace_test.c := san tsan\ntests/trace_test.c := san\n'),
+           ('check-tsan',), 'duplicate line for tests/trace_test.c')
+    yield ('unknown lane',
+           lambda repo: edit(repo, MANIFEST, suite_line('tests/trace_test.c'),
+                             'tests/trace_test.c := san tsna\n'),
+           ('check-san',), 'tests/trace_test.c: unknown lane tsna')
+    yield ('unsorted lines',
+           lambda repo: edit(repo, MANIFEST, suite_line('tests/base_test.c'), '')
+           or append(repo, MANIFEST, 'tests/base_test.c := san tsan\n'),
+           ('check-san',), 'not sorted: tests/base_test.c after tests/work_test.c')
+    # The ipc merge shape (v2-0fv.6): a lane re-assigned after the += blocks.
+    # The exact shape also drops work, which the threaded-name rule happened to
+    # catch; the second case drops only trace, which nothing else would catch.
+    yield ('lane re-assigned after += (exact ipc merge shape)',
+           lambda repo: append(repo, MANIFEST,
+                               'TSAN_SUITES := tests/os_test.c tests/base_test.c tests/ipc_test.c\n'),
+           ('check-tsan',),
+           'not a suite line: TSAN_SUITES := tests/os_test.c tests/base_test.c tests/ipc_test.c')
+    yield ('lane re-assigned after += (drops only trace)',
+           lambda repo: append(repo, MANIFEST, 'TSAN_SUITES := tests/os_test.c tests/base_test.c '
+                               'tests/ipc_test.c tests/work_test.c\n'),
+           ('check-tsan',), 'not a suite line: TSAN_SUITES := tests/os_test.c')
+    yield ('misspelled lane variable',
+           lambda repo: append(repo, MANIFEST, 'TSAN_SUITE += tests/os_endpoint_test.c\n'),
+           ('check-tsan',), 'not a suite line: TSAN_SUITE += tests/os_endpoint_test.c')
+    yield ('Makefile derivation disagrees with the table',
+           lambda repo: edit(repo, 'Makefile', r'^(TSAN_SUITES *:= *)(.*)$',
+                             r'\1$(filter-out tests/trace_test.c,\2)'),
+           ('check-tsan',), 'check-tsan: make derived a list that differs from tests/lanes.mk')
     yield ('listed suite missing on disk',
            leave_stale_suite_binary, ('check-san',),
            'listed suite is missing: tests/absent_test.c')
@@ -142,7 +194,11 @@ def main():
             repo = root / f'case-{total}'
             repo.mkdir()
             prepare(repo)
-            mutate(repo)
+            try:
+                mutate(repo)
+            except MutationMissed as error:
+                print(f'{name}: FAIL fixture did not apply: {error}')
+                continue
             result = run(repo, *targets)
             if reject(result, diagnostic):
                 print(f'{name}: rejected as expected')

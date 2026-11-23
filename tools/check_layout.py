@@ -24,48 +24,82 @@ def finish(check, errors):
     return int(bool(errors))
 
 
+MANIFEST = 'tests/lanes.mk'
+# Lane name in the table -> make target that runs it. Each line of the table is
+# also a make assignment (docs/decisions/v2-he7.26.md), so the grammar admits
+# exactly the lines whose make meaning equals their table meaning: no '$', no
+# '+=', no continuation, no other variable.
+LANES = {'layers': 'check-layers', 'san': 'check-san', 'law2': 'check-law2',
+         'tsan': 'check-tsan', 'fuzz': 'fuzz-smoke'}
+LINE = re.compile(r'((?:tests/[\w./-]+_test|fuzz/[\w./-]+_fuzz)\.c)[ \t]+:=((?:[ \t]+\w+)+)[ \t]*')
+
+
+def read_table(text, errors):
+    """Return {suite: lanes} from the table, reporting every malformed line."""
+    table = {}
+    previous = None
+    for number, line in enumerate(text.splitlines(), 1):
+        where = f'{MANIFEST}:{number}'
+        if not line.strip() or line.startswith('#'):
+            continue
+        match = LINE.fullmatch(line)
+        if not match:
+            errors.append(f'{where}: not a suite line: {line}')
+            continue
+        suite, lanes = match[1], match[2].split()
+        if suite in table:
+            errors.append(f'{where}: duplicate line for {suite}')
+        elif previous is not None and suite < previous:
+            errors.append(f'{where}: not sorted: {suite} after {previous}')
+        previous = suite if previous is None else max(previous, suite)
+        for lane, count in Counter(lanes).items():
+            if lane not in LANES:
+                errors.append(f'{where}: {suite}: unknown lane {lane}')
+            if count > 1:
+                errors.append(f'{where}: {suite}: names lane {lane} twice')
+        table[suite] = set(lanes)  # make keeps the last assignment too
+    return table
+
+
 def check_suites(args):
     tests = set(args.tests_on_disk)
     fuzzers = set(args.fuzz_on_disk)
-    lanes = (
-        ('check-layers', args.layers, None, tests),
-        ('check-san', args.san, None, tests),
-        ('check-law2', args.law2, args.law2_empty_wave, tests),
-        ('check-tsan', args.tsan, args.tsan_empty_wave, tests),
-        ('fuzz-smoke', args.fuzz, args.fuzz_empty_wave, fuzzers),
-    )
+    derived = {'layers': args.layers, 'san': args.san, 'law2': args.law2,
+               'tsan': args.tsan, 'fuzz': args.fuzz}
     errors = []
-    if not (ROOT / 'tests/lanes.mk').is_file():
-        errors.append('missing manifest: tests/lanes.mk')
-    for lane, suites, wave, on_disk in lanes:
-        if not suites and wave is None:
-            errors.append(f'{lane} requires at least one suite')
-        elif not suites and not re.fullmatch(r'[1-9][0-9]*', wave):
-            errors.append(f'{lane} has no suites and no first-wave declaration (positive wave number required)')
-        elif suites and wave:
-            errors.append(f'{lane} declares suites and a first-wave marker; remove the marker')
-        for suite, count in Counter(suites).items():
-            if count > 1:
-                errors.append(f'{lane} lists a suite twice: {suite}')
-            if not (ROOT / suite).is_file():
-                errors.append(f'{lane} listed suite is missing: {suite}')
-            elif suite not in on_disk:
-                errors.append(f'{lane} lists a file outside its suite inventory: {suite}')
+    try:
+        text = (ROOT / MANIFEST).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return finish('check-suites', [f'missing manifest: {MANIFEST}'])
+    table = read_table(text, errors)
 
-    if set(args.layers) != set(args.required_layers):
+    for lane, target in LANES.items():
+        suites = sorted(suite for suite, lanes in table.items() if lane in lanes)
+        on_disk = fuzzers if lane == 'fuzz' else tests
+        if sorted(derived[lane]) != suites:
+            errors.append(f'{target}: make derived a list that differs from {MANIFEST}')
+        if not suites:
+            errors.append(f'{target} requires at least one suite')
+        for suite in suites:
+            if not (ROOT / suite).is_file():
+                errors.append(f'{target} listed suite is missing: {suite}')
+            elif suite not in on_disk:
+                errors.append(f'{target} lists a file outside its suite inventory: {suite}')
+
+    if {s for s, lanes in table.items() if 'layers' in lanes} != set(args.required_layers):
         errors.append('check-layers must register exactly the L0–L4 isolated link suites')
     if not (ROOT / 'src/main.c').is_file():
         errors.append('check-layers listed suite is missing: src/main.c (L5 link entry point)')
 
-    registered = {suite for _, suites, _, _ in lanes for suite in suites}
-    for suite in sorted((tests | fuzzers) - registered):
-        errors.append(f'unlisted suite: {suite}')
+    for suite in sorted((tests | fuzzers) - table.keys()):
+        errors.append(f'unlisted suite: {suite} (add its line to {MANIFEST})')
     for suite in sorted(tests):
+        lanes = table.get(suite, set())
         path = Path(suite)
         if (path.name.startswith(('law2_', 'g1_')) or {'law2', 'g1'}.intersection(path.parts[1:-1])):
-            if suite not in args.law2:
+            if 'law2' not in lanes:
                 errors.append(f'Law-2/G1 suite must be registered in check-law2: {suite}')
-        if path.name in TSAN_NAMES and suite not in args.tsan:
+        if path.name in TSAN_NAMES and 'tsan' not in lanes:
             errors.append(f'threaded suite must be registered in check-tsan: {suite}')
     return finish('check-suites', errors)
 
@@ -140,8 +174,6 @@ def main():
     for name in ('required-layers', 'layers', 'san', 'law2', 'tsan', 'fuzz',
                  'tests-on-disk', 'fuzz-on-disk'):
         suites.add_argument(f'--{name}', nargs='*', required=True)
-    for name in ('law2', 'tsan', 'fuzz'):
-        suites.add_argument(f'--{name}-empty-wave', required=True)
     commands.add_parser('registry')
     includes = commands.add_parser('includes')
     includes.add_argument('--build-dir', type=Path, required=True)
