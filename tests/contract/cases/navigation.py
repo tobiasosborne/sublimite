@@ -1,4 +1,7 @@
-"""Run R1 and R6 once against the pinned v1 snapshot oracle."""
+"""Run R1 and R6 once against the pinned v1 snapshot oracle.
+
+Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
+"""
 
 import argparse
 from contextlib import ExitStack, contextmanager
@@ -6,7 +9,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import selectors
 import shutil
 import signal
@@ -18,11 +20,12 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
 from cases.files import GEOMETRY, IN_MOVED_TO, directory_watch, display_ready, wait_for_file_event
+import records
 from navigation_fixtures import (
     LOG_BYTES, LOG_SEED, RECORD_BYTES, SEARCH_TOKEN, SHARD_BYTES, WINDOW_BYTES, WRAP_LINES,
     Row, log_fixture, read_log_rows, search_shards, visual_rows, wrapped_fixture,
 )
-from sandbox import Refused, RunTarget, Sandbox
+from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
 from test_oracle_inspector import Inspector
 from test_xdriver import WATCHDOG, available
@@ -182,7 +185,7 @@ class Case:
         self.results.append({
             "run_id": self.root.name, "case_id": self.id, "assertion_id": self.assertion,
             "evidence": "A" if self.assertion == "saved-bytes" else "B",
-            "first_required_wave": "W0", "status": status, "predicate": self.predicate,
+            "first_required_wave": 2, "status": status, "predicate": self.predicate,
             "observed": self.observed, "expected": self.expected, "reason": reason,
             "seed": LOG_SEED if self.id == "R6" else None, "negative": self.negative,
             "ticket": self.ticket, "submit_serial": self.serial, "artifacts": str(self.path),
@@ -193,9 +196,8 @@ class Case:
             for record in self.results:
                 record["child_status"] = ({"pid": self.child.pid, "exit": self.child.poll()}
                                           if self.child else None)
-                receipt = json.dumps(record, default=describe)
-                print(receipt, file=log)
-                print(receipt, flush=True)
+                print(json.dumps(record, default=describe), file=log)
+                records.emit(record, default=describe)
                 if record["status"] != "PASS":
                     print(f"{self.id}.{record['assertion_id']}: {record['status']} {record['reason']}",
                           file=sys.stderr)
@@ -503,8 +505,8 @@ def main():
     group.add_argument("--case", choices=ASSERTIONS)
     group.add_argument("--negative", choices=NEGATIVES)
     args = parser.parse_args()
-    if not re.fullmatch(r":17[0-9]", args.display):
-        parser.error("--display must be :170 through :179")
+    if not CONTRACT_DISPLAY.fullmatch(args.display):
+        parser.error("--display must be a contract display, :120 through :199")
     if not args.build_dir.is_absolute():
         parser.error("--build-dir must be absolute")
 
@@ -536,8 +538,9 @@ def main():
                 case.record("ERROR", f"{type(exc).__name__}: {exc}")
     finally:
         (root / "manifest.json").write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
-    outcomes = [case.publish() for case in cases]
-    return int(not all(outcomes))
+    for case in cases:
+        case.publish()
+    return records.exit_status(result["status"] for case in cases for result in case.results)
 
 
 if __name__ == "__main__":

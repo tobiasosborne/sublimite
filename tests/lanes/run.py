@@ -86,6 +86,11 @@ def cases(baseline):
            lambda repo: append(repo, 'tools/README.md',
                                '\n| `absent.txt` | Fixture | Fixture | `check-lints` |\n'),
            (registry,), 'registered file is missing: tools/absent.txt')
+    # A row naming a path with a slash registers a repo-relative tool outside tools/.
+    yield ('registered but missing repo-relative tool',
+           lambda repo: append(repo, 'tools/README.md',
+                               '\n| `tests/absent/tool.py` | Fixture | Fixture | `check-lints` |\n'),
+           (registry,), 'registered file is missing: tests/absent/tool.py')
     yield ('variants directory',
            lambda repo: (repo / 'docs' / 'variants').mkdir(parents=True),
            (registry,), 'forbidden directory: docs/variants/')

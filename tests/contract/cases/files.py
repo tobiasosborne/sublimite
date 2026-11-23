@@ -5,8 +5,7 @@ NEXT after a named submit serial), an inotify event armed before the keys that
 cause it, or the editor's pidfd. The only timers are hang detectors; an expired
 one is ERROR, never FAIL.
 
-Exit status: 0 PASS, 3 FAIL, 4 ERROR, as in cases/recovery.py. Python reserves
-1 for an uncaught exception and argparse 2 for a usage error.
+Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
 """
 
 import argparse
@@ -28,9 +27,11 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
 from files_fixtures import BINARY_SEED, SEARCH_FILES, binary_bytes, search_results, search_tree
-from sandbox import Refused, RunTarget, Sandbox
+import records
+from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
 from test_oracle_inspector import GUARD, Inspector
 from xdriver import XDriver
@@ -50,7 +51,6 @@ CAPACITY = (2 * wire.WORD.size + wire.FRAME_SIZES.size + 3 * wire.RECT.size
             + wire.SCROLL.size + wire.FRAME_TAIL.size + wire.WORD.size
             + SCREEN[0] * (SCREEN[1] + 1) * (wire.CELL_HEADER.size + len("�".encode()))
             + SCREEN[0] * (wire.RECT.size + wire.WORD.size))
-EXIT = {"PASS": 0, "FAIL": 3, "ERROR": 4}
 ASSERTIONS = {
     "R3": ("results-between-a-and-b", "save-b-bytes", "save-a-bytes",
            "results-text-still-visible", "other-files-unchanged", "law2-count"),
@@ -311,10 +311,9 @@ class Case:
             "child_status": [{"pid": child.pid, "exit": child.poll()} for child in self.children],
             "artifacts": str(self.artifacts),
         }
-        line = json.dumps(record, default=describe)
         with self.records.open("a", encoding="utf-8") as file:
-            print(line, file=file)
-        print(line, flush=True)
+            print(json.dumps(record, default=describe), file=file)
+        records.emit(record, default=describe)
         if status != "PASS":
             print(f"{self.id}.{self.assertion}: {status} {record['predicate']}", file=sys.stderr)
         self.results.append(status)
@@ -653,8 +652,8 @@ def main():
     parser.add_argument("--display", required=True)
     parser.add_argument("--negative", choices=NEGATIVES)
     args = parser.parse_args()
-    if not re.fullmatch(r":16[0-9]", args.display):
-        parser.error("--display must be :160 through :169")
+    if not CONTRACT_DISPLAY.fullmatch(args.display):
+        parser.error("--display must be a contract display, :120 through :199")
     if not args.build_dir.is_absolute():
         parser.error("--build-dir must be absolute")
 
@@ -694,7 +693,7 @@ def main():
     finally:
         (artifacts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n",
                                                  encoding="utf-8")
-    return max(EXIT[case.status] for case in cases)
+    return records.exit_status(case.status for case in cases)
 
 
 if __name__ == "__main__":

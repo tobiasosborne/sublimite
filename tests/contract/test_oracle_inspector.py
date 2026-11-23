@@ -20,7 +20,8 @@ import time
 import unittest
 
 from build_oracle import EDITOR, FAULT, PATCH, STAMP, STOCK, manifest, sha256
-from sandbox import RunTarget, Sandbox
+import records
+from sandbox import CONTRACT_DISPLAY, RunTarget, Sandbox
 import snapwire as wire
 from test_xdriver import WATCHDOG, available, readable, stop
 from xdriver import XDriver, XDriverError
@@ -40,8 +41,8 @@ GUARD = re.compile(rb"oracle law2: active=(\d+) allocations=(\d+) scopes=(\d+)")
 
 @contextmanager
 def display(number, scratch):
-    if not re.fullmatch(r":13[0-9]", number) or not available(int(number[1:])):
-        raise ValueError("oracle requires a free display in :130 through :139")
+    if not CONTRACT_DISPLAY.fullmatch(number) or not available(int(number[1:])):
+        raise ValueError("oracle requires a free contract display, :120 through :199")
     auth = scratch / "authority"
     fields = (os.fsencode(socket.gethostname()), number[1:].encode(),
               b"MIT-MAGIC-COOKIE-1", secrets.token_bytes(16))
@@ -387,7 +388,7 @@ def main():
         tests = ARGS.tests or (["test_unpatched_refusal"] if ARGS.expect_unpatched else
                               unittest.defaultTestLoader.getTestCaseNames(OracleTests))
         suite = unittest.TestSuite(OracleTests(name) for name in tests)
-        return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
+        return records.run_suite(suite, "ADAPTER")
 
 
 if __name__ == "__main__":

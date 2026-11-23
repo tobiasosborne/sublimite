@@ -1,0 +1,408 @@
+{
+ "format": 1,
+ "comment": "Reviewed contract manifest. Format, exit statuses and derivations: docs/decisions/v2-he7.16.md. Future ledger rows (docs/decisions/wave0-contract-design.md) are not listed until their wave converts them.",
+ "targets": {
+  "harness": {
+   "role": "harness",
+   "identity": {},
+   "note": "Target-independent self-tests: no executable is hashed (make check)."
+  },
+  "v1-pin": {
+   "role": "v1",
+   "note": "v1 6fec2e8 + tests/contract/v1-inspector.patch built by build_oracle.py in /home/tobias/Projects/sublimite-v1-inspect; 'oracle' is the stock pinned binary /home/tobias/Projects/sublimite-v1-oracle/build/sublimite. A rebuild with other bits is an unreviewed identity (ERROR) until this binding is re-reviewed.",
+   "identity": {
+    "executables": {
+     "oracle": "64c27b03f20f51abbfc512fc0b5441883e2d2b8f1ca916b9061c6eb18ca71115"
+    },
+    "pin": "6fec2e8c41220e284066ae8479d8f1b573febdb2",
+    "patch_sha256": "54bcf05f3e1277190b418fc36cfa6da082f33e94cd0c5622e45f7bc1127fda1a",
+    "oracle_build": {
+     "sublimite": "ed75336ca0b31baf1c8726e940b4500eafe6f17db73a94bf0fe51ffb084f2195",
+     "sublimite-drop-submit": "5323f7ff81b9baf8192cd01cc211d6669ee9343f2502326e09fa75d9eb6fa6b2",
+     "sublimite-stock": "b8faeab55b20e8d4b36ef103b3820285944e4a372d234b79e4cece1be6060d69"
+    }
+   }
+  },
+  "v2": {
+   "role": "v2",
+   "identity": null,
+   "note": "Unbound until the W2 native inspector exists; a v2 run is an ERROR until then."
+  }
+ },
+ "invocations": {
+  "sandbox": {
+   "argv": [
+    "tests/contract/test_sandbox.py"
+   ],
+   "displays": 0,
+   "timeout_s": 300,
+   "timeout_derivation": "(E) 17 serial waits x 10 s WATCHDOG (P, test_sandbox.py) = 170 s, rounded up; green run 1.26 s (M) [AC]"
+  },
+  "wire": {
+   "argv": [
+    "tests/contract/test_inspect.py"
+   ],
+   "displays": 0,
+   "timeout_s": 60,
+   "timeout_derivation": "(E) no blocking wait (pure decode of the committed vectors); 300x the green run of 0.20 s (M) [AC]"
+  },
+  "xdriver": {
+   "argv": [
+    "tests/contract/test_xdriver.py"
+   ],
+   "displays": 1,
+   "timeout_s": 900,
+   "env": {
+    "XDRIVER_TEST_DISPLAY": "{display}"
+   },
+   "timeout_derivation": "(E) Xvfb start plus 8 tests of at most a few 15 s driver operations each (P, WATCHDOG in test_xdriver.py) stay below 60 x 15 s"
+  },
+  "x3-selftest": {
+   "argv": [
+    "tests/contract/test_large_undo.py",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 900,
+   "timeout_derivation": "(E) the stub run stops at its first control: Xvfb 15 + map 30 + journal 120 + save 400 + exit 60 s (P, large_undo.py hang detectors) = 625 s, rounded up"
+  },
+  "adapter": {
+   "argv": [
+    "tests/contract/test_oracle_inspector.py",
+    "--build-dir",
+    "{oracle_build}",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 1800,
+   "timeout_derivation": "(E) 9 tests x at most 10 serial 15 s operations (P, WATCHDOG) = 1350 s, rounded up"
+  },
+  "navigation": {
+   "argv": [
+    "tests/contract/cases/navigation.py",
+    "--build-dir",
+    "{oracle_build}",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 2400,
+   "timeout_derivation": "(E) about 60 serial 15 s snapshot/driver waits (P, WATCHDOG; R6 crosses 25 pages) = 900 s, plus generating the 1 GiB R6 log fixture"
+  },
+  "files": {
+   "argv": [
+    "tests/contract/cases/files.py",
+    "--build-dir",
+    "{oracle_build}",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 1800,
+   "timeout_derivation": "(E) about 60 serial 15 s waits (P, WATCHDOG) over R3 and R5 = 900 s, doubled"
+  },
+  "recovery": {
+   "argv": [
+    "tests/contract/cases/recovery.py",
+    "--oracle",
+    "{exe:oracle}",
+    "--build-dir",
+    "{oracle_build}",
+    "--display",
+    "{display}",
+    "--case",
+    "all"
+   ],
+   "displays": 1,
+   "timeout_s": 1800,
+   "timeout_derivation": "(E) 4 controls x about 15 serial 15 s waits (P, WATCHDOG) = 900 s, doubled"
+  },
+  "large-undo": {
+   "argv": [
+    "tests/contract/cases/large_undo.py",
+    "--target",
+    "{exe:oracle}",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 4500,
+   "timeout_derivation": "(P) sum of its serial hang detectors: 2 variants x (3 control saves + 1 scored save) x 400 s + 2 x 2 journal commits x 120 s + 4 maps x 30 s + 4 exits x 60 s + Xvfb 15 s = 4055 s; plus fixture writing (E)"
+  },
+  "capacity": {
+   "argv": [
+    "tests/contract/cases/capacity.py",
+    "--oracle",
+    "{exe:oracle}",
+    "--build-dir",
+    "{oracle_build}",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 3600,
+   "timeout_derivation": "(E) placeholder: bead v2-he7.17 (W0.6j, R4) derives it from its case's hang detectors; the script does not exist yet"
+  }
+ },
+ "cases": {
+  "SANDBOX": {
+   "invocation": "sandbox",
+   "evidence": "harness",
+   "first_required_wave": 0,
+   "expect": {
+    "harness": "PASS",
+    "v1-pin": "PASS"
+   },
+   "assertions": {
+    "SandboxTests.test_app_directory_nofollow_and_private_mode": {},
+    "SandboxTests.test_default_or_inherited_locations": {},
+    "SandboxTests.test_directory_owner_mode_and_unexpected_special_file": {},
+    "SandboxTests.test_display_refusals_and_headless": {},
+    "SandboxTests.test_foreign_socket_or_lock": {},
+    "SandboxTests.test_manifest_required_absolute_approved_executable": {},
+    "SandboxTests.test_orderly_restart": {},
+    "SandboxTests.test_private_files_and_allowlist_are_revalidated": {},
+    "SandboxTests.test_private_primary_relay_restart": {},
+    "SandboxTests.test_rechecks_before_connect_and_restart": {},
+    "SandboxTests.test_relative_unset_and_nonprivate_xdg": {},
+    "SandboxTests.test_restart_after_error_exit_that_removed_its_socket": {},
+    "SandboxTests.test_restart_refuses_replaced_executable_with_same_digest": {},
+    "SandboxTests.test_restart_refuses_still_listening_recorded_socket": {},
+    "SandboxTests.test_restart_requires_expected_process_and_socket_state": {},
+    "SandboxTests.test_root_and_runtime_replacement": {},
+    "SandboxTests.test_symlink_escape_and_hardlinked_fixture": {},
+    "SandboxTests.test_target_role_sets_namespace": {},
+    "SandboxTests.test_wrong_peer_pid": {},
+    "SandboxTests.test_wrong_recorded_inode_or_lock_on_restart": {},
+    "SandboxTests.test_wrong_recorded_pid_on_restart": {}
+   }
+  },
+  "WIRE": {
+   "invocation": "wire",
+   "evidence": "harness",
+   "first_required_wave": 0,
+   "expect": {
+    "harness": "PASS",
+    "v1-pin": "PASS"
+   },
+   "assertions": {
+    "WireTest.test_arm_reply_and_v1_rejection": {},
+    "WireTest.test_bad_frame_order_and_minimap_geometry": {},
+    "WireTest.test_bad_packet_header": {},
+    "WireTest.test_bad_payload_lengths_and_mapping_lifetime": {},
+    "WireTest.test_encoder_rejects_bad_records": {},
+    "WireTest.test_envelopes": {},
+    "WireTest.test_failed_decode_does_not_pin_the_mapping": {},
+    "WireTest.test_malformed_payload_fields": {},
+    "WireTest.test_missing_first_action": {},
+    "WireTest.test_next_reply": {},
+    "WireTest.test_old_or_mismatched_serial": {},
+    "WireTest.test_one_submit_can_supply_both_witnesses": {},
+    "WireTest.test_rejects_every_truncated_payload_prefix": {},
+    "WireTest.test_single_frame": {},
+    "WireTest.test_size_error": {},
+    "WireTest.test_titles_and_bottom_text_require_cells": {},
+    "WireTest.test_two_frames_with_signed_translation_and_minimap": {},
+    "WireTest.test_unprovided_sections": {},
+    "WireTest.test_unresolved_cells_fail_only_reads_that_cross_them": {}
+   }
+  },
+  "XDRIVER": {
+   "invocation": "xdriver",
+   "evidence": "harness",
+   "first_required_wave": 0,
+   "expect": {
+    "harness": "PASS"
+   },
+   "assertions": {
+    "DriverTests.test_incomplete_incr_is_rejected": {},
+    "DriverTests.test_incr_larger_than_server_maximum_both_directions": {},
+    "DriverTests.test_input_requires_verified_focus": {},
+    "DriverTests.test_keys_mouse_and_marker_arrive_in_order": {},
+    "DriverTests.test_receives_bytes_from_independent_owner": {},
+    "DriverTests.test_serves_exact_bytes_to_independent_reader": {},
+    "DriverTests.test_stale_owner_is_rejected": {},
+    "ProtocolTests.test_rejects_malformed_missing_and_extra_replies": {}
+   }
+  },
+  "X3-SELFTEST": {
+   "invocation": "x3-selftest",
+   "evidence": "harness",
+   "first_required_wave": 0,
+   "expect": {
+    "harness": "PASS"
+   },
+   "assertions": {
+    "ClassifyTests.test_changed_input_is_error": {},
+    "ClassifyTests.test_exact_failure_mode_carries_its_signature": {},
+    "ClassifyTests.test_neighbours_of_the_failure_mode_carry_no_signature": {},
+    "StubControlTest.test_failing_control_reports_error": {}
+   }
+  },
+  "ADAPTER": {
+   "invocation": "adapter",
+   "evidence": "harness",
+   "first_required_wave": 0,
+   "expect": {
+    "v1-pin": "PASS"
+   },
+   "assertions": {
+    "OracleTests.test_allocation_count_does_not_stop_the_editor": {},
+    "OracleTests.test_arm_invalid_and_small_mapping": {},
+    "OracleTests.test_clipped_tab": {},
+    "OracleTests.test_disconnect_and_stock_disk_clipboard": {},
+    "OracleTests.test_idle": {},
+    "OracleTests.test_noop_and_dropped_submit": {},
+    "OracleTests.test_paste_fenced": {},
+    "OracleTests.test_typed_snap_next_and_stale_serial": {},
+    "OracleTests.test_unpatched_refusal": {}
+   }
+  },
+  "R1": {
+   "invocation": "navigation",
+   "evidence": "B",
+   "first_required_wave": 2,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "bottom-setup": {},
+    "wrapped-return": {},
+    "return-caret": {},
+    "saved-bytes": {
+     "evidence": "A"
+    }
+   }
+  },
+  "R6": {
+   "invocation": "navigation",
+   "evidence": "B",
+   "first_required_wave": 2,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "first-viewport": {},
+    "tail-navigation": {},
+    "marker": {},
+    "occupied-navigation": {}
+   }
+  },
+  "R3": {
+   "invocation": "files",
+   "evidence": "A",
+   "first_required_wave": 3,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "results-between-a-and-b": {
+     "evidence": "B"
+    },
+    "save-b-bytes": {},
+    "save-a-bytes": {},
+    "results-text-still-visible": {
+     "evidence": "B"
+    },
+    "other-files-unchanged": {},
+    "law2-count": {
+     "evidence": "B"
+    }
+   }
+  },
+  "R5": {
+   "invocation": "files",
+   "evidence": "A",
+   "first_required_wave": 2,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "open-alive": {},
+    "header-painted": {
+     "evidence": "B"
+    },
+    "adjacent-text-and-sibling-save": {
+     "evidence": "A+B"
+    },
+    "open-exit": {},
+    "reopen-alive": {},
+    "settled-binary-tab-revisit": {
+     "evidence": "B"
+    },
+    "reopen-exit": {},
+    "bytes-unchanged": {},
+    "law2-count": {
+     "evidence": "B"
+    }
+   }
+  },
+  "R31": {
+   "invocation": "recovery",
+   "evidence": "A",
+   "first_required_wave": 2,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "pre-ack-file": {},
+    "pre-ack-untitled": {},
+    "post-ack-file": {
+     "evidence": "A+B"
+    },
+    "post-ack-untitled": {
+     "evidence": "A+B"
+    }
+   }
+  },
+  "X3": {
+   "invocation": "large-undo",
+   "evidence": "A",
+   "first_required_wave": 2,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "twin.ctl.load_save": {},
+    "twin.ctl.restore": {},
+    "twin.ctl.delete": {},
+    "twin.ctl.exit": {},
+    "twin.roundtrip": {},
+    "over.ctl.load_save": {},
+    "over.ctl.restore": {},
+    "over.ctl.delete": {},
+    "over.ctl.exit": {},
+    "over.roundtrip": {
+     "expect": {
+      "v1-pin": {
+       "status": "XFAIL",
+       "signature": "exit-1-error-105-destination-untouched",
+       "witness": "docs/decisions/v2-he7.15.md run 20261123T092647Z-144204 (red: exit 1 after Ctrl+Z, stderr error -105, destination identity unchanged, input intact; controls and twin green); amendment A8"
+      }
+     }
+    }
+   }
+  },
+  "R4": {
+   "invocation": "capacity",
+   "evidence": "A+B",
+   "first_required_wave": 3,
+   "expect": {
+    "v1-pin": "PASS",
+    "v2": "PASS"
+   },
+   "assertions": {
+    "restore-under-pressure": {}
+   },
+   "note": "Bead v2-he7.17 (W0.6j) replaces this single placeholder with the case's assertion inventory."
+  }
+ }
+}

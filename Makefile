@@ -5,7 +5,8 @@
 # vendor/ is imported). Register tests and fuzzers in tests/lanes.mk.
 #
 # Targets: all  check  check-lints  check-layers  check-san  check-law2
-#          check-tsan  fuzz  fuzz-smoke  clean
+#          check-contract  check-tsan  fuzz  fuzz-smoke  clean
+#          contract-gate (oracle-driven; not part of check)
 #
 # Independent objects use the available CPUs; an explicit make -j still wins.
 ifeq ($(MAKELEVEL)$(filter -j% --jobserver%,$(MAKEFLAGS)),0)
@@ -180,9 +181,35 @@ check:
 	@$(MAKE) --no-print-directory check-layers
 	@$(MAKE) --no-print-directory check-san
 	@$(MAKE) --no-print-directory check-law2
+	@$(MAKE) --no-print-directory check-contract
 	@echo "check: ok"
 
+# Contract self-tests that need no oracle (docs/decisions/v2-he7.16.md): the runner's own
+# self-test, then every harness-target case of tests/contract/expectations.json through the
+# runner, each invoked once. A missing display, mock or test is an ERROR, never a skip.
+# The runner hands out one free display per invocation from CONTRACT_CHECK_DISPLAYS.
+CONTRACT_CHECK_DISPLAYS ?= :120-:129
+.PHONY: check-contract
+check-contract: $(B)/xdriver $(B)/xdriver-test-client
+	python3 -B tests/contract/test_run.py
+	python3 -B tests/contract/run.py --role harness --displays "$(CONTRACT_CHECK_DISPLAYS)" \
+	    --out "$(B)/contract-check"
+
+# Wave 0 oracle gate: build or validate the inspected v1 tree, then run every v1-required
+# case once and write the gate record (gate.json + summary.txt) under $(B)/contract-gate/.
+# Usage: make contract-gate ORACLE_TREE=/abs/disposable/v1 ORACLE=/abs/stock/v1/build/sublimite
+GATE_DISPLAYS ?= :190-:199
+.PHONY: contract-gate
+contract-gate: $(B)/xdriver $(B)/xdriver-test-client
+	@test -n "$(ORACLE_TREE)" && test -n "$(ORACLE)" || { echo "Set ORACLE_TREE and ORACLE" >&2; exit 2; }
+	python3 -B tests/contract/build_oracle.py --jobs "$(ORACLE_JOBS)" "$(ORACLE_TREE)"
+	python3 -B tests/contract/run.py --role v1 --exe oracle="$(abspath $(ORACLE))" \
+	    --oracle-build "$(abspath $(ORACLE_TREE))/build/contract-oracle" \
+	    --displays "$(GATE_DISPLAYS)" --out "$(B)/contract-gate"
+
 # X3 large delete + undo on the stock v1 oracle; not part of `check` (docs/decisions/v2-he7.15.md).
+# Diagnostic: on the pin the case reports X3.over.roundtrip as FAIL with the A8 signature and
+# exits 3; only contract-gate turns that signature into the reviewed XFAIL.
 # Usage: make check-contract-large-undo ORACLE=/abs/v1/build/sublimite CONTRACT_DISPLAY=:140
 .PHONY: check-contract-large-undo
 check-contract-large-undo: $(B)/xdriver $(B)/xdriver-test-client
@@ -199,7 +226,7 @@ check-contract-inspect:
 
 .PHONY: check-contract-files
 check-contract-files: $(B)/xdriver
-	@PYTHONPATH=tests/contract python3 -B -m cases.files \
+	python3 -B tests/contract/cases/files.py \
 	    --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --display "$(CONTRACT_DISPLAY)"
 
 .PHONY: check-contract-navigation

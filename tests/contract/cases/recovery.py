@@ -1,7 +1,8 @@
 """R31 process-death recovery controls against the pinned v1 oracle.
 
-Exit status: 0 PASS, 3 FAIL, 4 ERROR. Python reserves 1 for an uncaught
-exception and argparse 2 for a usage error, so neither names a case result.
+One record per control: case R31, the control as its assertion, and the step that
+was running when it failed in "step". Records and exit statuses (PASS 0, FAIL 3,
+ERROR 4) follow tests/contract/records.py.
 """
 
 import argparse
@@ -9,7 +10,6 @@ from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import selectors
 import signal
@@ -23,7 +23,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
 from cases.navigation import SnapshotClient, document_text, stop, wait_exit
-from sandbox import Refused, RunTarget, Sandbox
+import records
+from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
 from test_oracle_inspector import DEPTH, GUARD, HEIGHT, WIDTH
 from xdriver import XDriver, XDriverError
@@ -39,7 +40,6 @@ CLIPBOARD = "CLIPBOARD"
 # Match the operation and pipe watchdogs in the X driver conformance fixture.
 WATCHDOG = 15
 X_TIMEOUT_MS = WATCHDOG * 1000
-EXIT = {"PASS": 0, "FAIL": 3, "ERROR": 4}
 CASES = {"pre-ack": ("pre-ack-file", "pre-ack-untitled"),
          "post-ack": ("post-ack-file", "post-ack-untitled")}
 
@@ -77,8 +77,8 @@ def wait_readable(fd, timeout=WATCHDOG):
 
 @contextmanager
 def private_xvfb(display, artifacts, screen=()):
-    if not re.fullmatch(r":15[0-9]", display):
-        raise Refused("recovery requires an explicit display from :150 to :159")
+    if not CONTRACT_DISPLAY.fullmatch(display):
+        raise Refused("recovery requires an explicit contract display, :120 through :199")
     number = display[1:]
     endpoint = f"/tmp/.X11-unix/X{number}"
     if os.path.lexists(endpoint) or os.path.lexists(f"/tmp/.X{number}-lock"):
@@ -258,10 +258,10 @@ def acknowledged(inspector, request, packet, marker, copies, record, key):
 
 
 def recovery(options, artifacts, record):
-    record["assertion_id"] = "private-oracle"
-    post = record["case_id"].startswith("R31.post-ack")
+    record["step"] = "private-oracle"
+    post = record["assertion_id"].startswith("post-ack")
     target = oracle_target(options, post)
-    untitled = record["case_id"].endswith("-untitled")
+    untitled = record["assertion_id"].endswith("-untitled")
     before = UNTITLED_TEXT if untitled else FILE_TEXT
     # mkdtemp's random suffix makes the marker unique; it fits one document row.
     marker = f" [{record['run_id'].removeprefix('recovery-')}]".encode("ascii")
@@ -277,22 +277,22 @@ def recovery(options, artifacts, record):
         sandbox = stack.enter_context(Sandbox(artifacts, target, display=options.display))
         Path(sandbox.env["XAUTHORITY"]).write_bytes(cookie)
         source = sandbox.fixtures / "source.txt"
-        record["assertion_id"] = "durable-source"
+        record["step"] = "durable-source"
         initial = durable_source(source)
         (artifacts / "source.initial").write_bytes(initial)
         expect_exact(initial, FILE_TEXT)
 
         driver = stack.enter_context(XDriver(BUILD / "xdriver", options.display, env=sandbox.env,
                                              timeout=2 * WATCHDOG))
-        record["assertion_id"] = "initial-launch"
+        record["step"] = "initial-launch"
         phase = "setup" if untitled else "original"
         child, window, inspector = launch(artifacts, phase, sandbox.start, (str(source),),
                                           sandbox, driver, record, inspected)
-        record["assertion_id"] = "initial-file-tab"
+        record["step"] = "initial-file-tab"
         expect_exact(copied_text(driver, window), FILE_TEXT)
 
         if untitled:
-            record["assertion_id"] = "untitled-durable-seed"
+            record["step"] = "untitled-durable-seed"
             driver.chord("Control_L", "n")
             for char in UNTITLED_TEXT.decode("ascii"):
                 driver.key(char)
@@ -309,7 +309,7 @@ def recovery(options, artifacts, record):
                                               sandbox, driver, record, inspected)
             expect_exact(copied_text(driver, window), before)
 
-        record["assertion_id"] = "paste-and-sigkill"
+        record["step"] = "paste-and-sigkill"
         with os.fdopen(os.pidfd_open(child.pid), "rb") as pidfd:
             request = paste(driver, inspector, b" [decoy]" if options.decoy_paste else marker)
             if post:
@@ -328,13 +328,13 @@ def recovery(options, artifacts, record):
         if not signaled or term_signal != signal.SIGKILL:
             raise Refused(f"expected WIFSIGNALED/SIGKILL, got wait status {status}")
         if post:
-            record["assertion_id"] = "submitted-action-frame"
+            record["step"] = "submitted-action-frame"
             acknowledged(inspector, request, packet, marker, 1, record, "witness")
 
-        record["assertion_id"] = "source-after-crash"
+        record["step"] = "source-after-crash"
         expect_exact(source_bytes(source, artifacts / "source.after-crash"), FILE_TEXT)
 
-        record["assertion_id"] = "same-root-restart"
+        record["step"] = "same-root-restart"
         # Opening by path activates an existing recovered file buffer.
         # It also handles a clean tab omitted from the crashed session.
         args = () if untitled else (str(source),)
@@ -342,7 +342,7 @@ def recovery(options, artifacts, record):
                                       sandbox, driver, record, inspected)
         if restarted.pid == child.pid:
             raise Refused("restarted editor reused the killed editor's PID")
-        record["assertion_id"] = "recovered-buffer"
+        record["step"] = "recovered-buffer"
         observed = copied_text(driver, window)
         (artifacts / "recovered.txt").write_bytes(observed)
         if options.wrong_expectation:
@@ -354,7 +354,7 @@ def recovery(options, artifacts, record):
         else:
             record["outcome"] = compare_recovery(observed, before, whole)
 
-        record["assertion_id"] = "source-after-restart"
+        record["step"] = "source-after-restart"
         expect_exact(source_bytes(source, artifacts / "source.after-restart"), FILE_TEXT)
         if restarted.poll() is not None:
             record["children"]["restarted"]["returncode"] = restarted.returncode
@@ -362,7 +362,7 @@ def recovery(options, artifacts, record):
         if post:
             # SIGKILL discards the scored window's count. Repeat the same paste in the
             # restarted editor and count that window at a clean close (count rule).
-            record["assertion_id"] = "law2-paste-twin"
+            record["step"] = "law2-paste-twin"
             request = paste(driver, inspector, marker)
             acknowledged(inspector, request, inspector.packet(), marker, 2, record, "twin")
             # v1's signalfd turns SIGTERM into an ordinary close, which prints the count.
@@ -375,9 +375,11 @@ def recovery(options, artifacts, record):
 
 def run_case(case, options):
     artifacts = Path(tempfile.mkdtemp(prefix="recovery-", dir=BUILD))
-    record = {"case_id": f"R31.{case}", "assertion_id": "setup", "run_id": artifacts.name,
-              "evidence_kind": "synthetic" if case == "torn-prefix" else "behavioral",
-              "first_required_wave": "W0", "artifacts": str(artifacts), "display": options.display,
+    # Tier A: disk and clipboard after a relaunch; post-ACK adds the submitted-frame witness (B).
+    evidence = {"torn-prefix": "C", "pre-ack-file": "A", "pre-ack-untitled": "A"}.get(case, "A+B")
+    record = {"case_id": "R31", "assertion_id": case, "step": "setup", "run_id": artifacts.name,
+              "evidence": evidence, "first_required_wave": 2,
+              "artifacts": str(artifacts), "display": options.display,
               "children": {}, "law2": {}, "wrong_expectation": options.wrong_expectation,
               "decoy_paste": options.decoy_paste}
     try:
@@ -385,27 +387,27 @@ def run_case(case, options):
         record["power"] = battery.read_text().strip() if battery.exists() else "BAT0 unavailable"
         record["loadavg"] = Path("/proc/loadavg").read_text().strip()
         if case == "torn-prefix":
-            record["assertion_id"] = "recovered-buffer"
+            record["step"] = "recovered-buffer"
             marker = b" [whole paste]"
             compare_recovery(FILE_TEXT + marker[:len(marker) // 2], FILE_TEXT, FILE_TEXT + marker)
         else:
             recovery(options, artifacts, record)
     except Mismatch as exc:
-        record.update(result="FAIL", detail=str(exc),
+        record.update(status="FAIL", predicate=f"{record['step']}: {exc}",
                       observed_hex=hexed(exc.observed),
                       expected_hex=[hexed(value) for value in exc.expected])
     except (OSError, Refused, XDriverError, wire.ProtocolError, subprocess.SubprocessError) as exc:
-        record.update(result="ERROR", detail=f"{type(exc).__name__}: {exc}")
+        record.update(status="ERROR", predicate=f"{record['step']}: {type(exc).__name__}: {exc}")
     else:
-        record.update(result="PASS", assertion_id="all")
+        record.update(status="PASS", step="all",
+                      predicate=f"recovered buffer is {record.get('outcome', 'exact')}; disk intact")
 
-    receipt = json.dumps(record, sort_keys=True)
-    (artifacts / "result.json").write_text(receipt + "\n", encoding="utf-8")
-    print(receipt, flush=True)
-    if record["result"] != "PASS":
-        print(f"{record['case_id']} {record['result']} {record['assertion_id']} "
-              f"{record['detail']}", file=sys.stderr, flush=True)
-    return EXIT[record["result"]]
+    (artifacts / "result.json").write_text(json.dumps(record, sort_keys=True) + "\n",
+                                           encoding="utf-8")
+    records.emit(record)
+    if record["status"] != "PASS":
+        print(f"R31.{case} {record['status']} {record['predicate']}", file=sys.stderr, flush=True)
+    return records.EXIT[record["status"]]
 
 
 def main():

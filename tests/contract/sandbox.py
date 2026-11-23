@@ -18,6 +18,13 @@ class Refused(RuntimeError):
     """The case could not establish containment."""
 
 
+# Private contract X servers live on :120 through :199 only (P: the decades the Wave 0 beads
+# reserve: driver 12x, adapter 13x, X3 14x, recovery 15x, files 16x, navigation 17x, gate
+# 19x). The runner hands each invocation one free number; the owner re-probes it (lock file,
+# socket and abstract name) before starting Xvfb, so a collision is an ERROR, never a share.
+CONTRACT_DISPLAY = re.compile(r":(1[2-9][0-9])")
+
+
 @dataclass(frozen=True)
 class RunTarget:
     """Target fields from the trusted run manifest."""

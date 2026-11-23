@@ -11,6 +11,7 @@ from dataclasses import replace
 from mmap import mmap
 from struct import calcsize, pack, pack_into
 
+from contract import records
 from contract import snapwire as wire
 
 
@@ -248,4 +249,4 @@ class WireTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(records.unittest_main("WIRE"))

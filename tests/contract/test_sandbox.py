@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import records
 from sandbox import Refused, RunTarget, Sandbox
 
 
@@ -469,4 +470,4 @@ class SandboxTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(records.unittest_main("SANDBOX"))

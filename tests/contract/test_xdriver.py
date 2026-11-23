@@ -3,14 +3,18 @@
 import contextlib
 import os
 from pathlib import Path
-import re
 import secrets
 import selectors
 import socket
 import struct
 import subprocess
 import tempfile
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import records  # noqa: E402
+from sandbox import CONTRACT_DISPLAY  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / "build"
@@ -54,10 +58,10 @@ def stop(child):
 
 def setUpModule():
     global DISPLAY, ENV
-    # The bead reserves inclusive displays 120 through 129 for these runs.
+    # Without a request, probe the decade the driver bead reserves; the runner passes one.
     requested = os.environ.get("XDRIVER_TEST_DISPLAY")
-    if requested is not None and not re.fullmatch(r":12[0-9]", requested):
-        raise AssertionError("XDRIVER_TEST_DISPLAY must be :120 through :129")
+    if requested is not None and not CONTRACT_DISPLAY.fullmatch(requested):
+        raise AssertionError("XDRIVER_TEST_DISPLAY must be a contract display, :120 through :199")
     candidates = [int(requested[1:])] if requested else range(120, 130)
     number = next((candidate for candidate in candidates if available(candidate)), None)
     if number is None:
@@ -229,4 +233,4 @@ class ProtocolTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(records.unittest_main("XDRIVER"))

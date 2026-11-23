@@ -23,13 +23,13 @@ Per variant (twin first, then over), each session in a fresh sandbox with a fres
   scored   roundtrip       Ctrl+A, Delete, Ctrl+Z, load fence, Ctrl+S: bytes == fixture
 A control or harness failure is final: it records ERROR and the run stops.
 
-Scored outcomes (classify): PASS (saved, bytes equal, Ctrl+Q exits 0); FAIL (saved, bytes
-differ, including a 0 B save); XFAIL only for the reviewed signature bound to the target's
-SHA-256 (EXPECTATIONS, amendment A8): the editor exits with status 1, stderr contains
-"error -105", and the destination's bytes and inode metadata are unchanged; XPASS (bytes
-round-trip where XFAIL is expected; fails the run); ERROR for every other editor exit, a
-changed input fixture or an expired hang detector.
-Exit status: 0 all PASS/XFAIL, 1 a FAIL or XPASS, 2 an ERROR.
+Scored outcomes (classify), the same on every target: PASS (saved, bytes equal, Ctrl+Q exits
+0); FAIL (saved, bytes differ, including a 0 B save); FAIL with signature SIGNATURE_EXIT_105
+when the editor exits with status 1, stderr contains "error -105", and the destination's
+bytes and inode metadata are unchanged (amendment A8); ERROR for every other editor exit, a
+changed input fixture or an expired hang detector. Whether that signature is the reviewed
+expected failure of a target is decided by the runner against tests/contract/expectations.json,
+never here. Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
 Derivations: docs/decisions/v2-he7.15.md.
 """
 
@@ -41,7 +41,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import selectors
 import shutil
@@ -54,7 +53,8 @@ import time
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from sandbox import RunTarget, Sandbox  # noqa: E402
+import records  # noqa: E402
+from sandbox import CONTRACT_DISPLAY, RunTarget, Sandbox  # noqa: E402
 from xdriver import XDriver, XDriverError  # noqa: E402
 import large_undo_fixture as fixture  # noqa: E402
 
@@ -63,18 +63,14 @@ BUILD = ROOT / "build"
 DRIVER = BUILD / "xdriver"
 CASE = "X3"
 
-# Pinned oracle: v1 6fec2e8, /home/tobias/Projects/sublimite-v1-oracle/build/sublimite.
-# Reviewed expectation, docs/decisions/wave0-plan-amendments.md A8.
-V1_PIN_SHA256 = "64c27b03f20f51abbfc512fc0b5441883e2d2b8f1ca916b9061c6eb18ca71115"
-XFAIL_EXIT_105 = "exit-1-error-105-destination-untouched"
-EXPECTATIONS = {
-    "X3.twin.roundtrip": {},
-    "X3.over.roundtrip": {V1_PIN_SHA256: XFAIL_EXIT_105},
-}
+# The A8 failure mode, observed on pinned v1 (docs/decisions/wave0-plan-amendments.md A8).
+SIGNATURE_EXIT_105 = "exit-1-error-105-destination-untouched"
+EVIDENCE = "A"  # Tier A: file bytes and exit status only.
+FIRST_REQUIRED_WAVE = 2  # The public GUI case; W1 owns the headless index-limit test.
 V1_CAPACITY_ERROR = "error -105"  # v1 main.c:342 prints EDITOR_ERR_CAPACITY (editor.h:27)
 
 # One deadline per class of wait. These are a hang detector, not a gate: expiry is ERROR
-# (run invalid), never PASS, FAIL or XFAIL. All are (E): at least 2x the slowest step
+# (run invalid), never PASS or FAIL. All are (E): at least 2x the slowest step
 # measured (M) on 2026-11-23, ThinkPad, BAT0 Discharging [bat], 12 CPUs. The measurements
 # and their loads are in docs/decisions/v2-he7.15.md "Deadlines".
 XVFB_READY_S = 15         # (M) 0.18-0.26 s, load 1-17
@@ -210,9 +206,10 @@ def display_free(number):
 @contextlib.contextmanager
 def private_xvfb(display, run_dir):
     """Start Xvfb on exactly `display` with a fresh MIT cookie; stop it by its own pid."""
-    match = re.fullmatch(r":(14[0-9])", display)
+    match = CONTRACT_DISPLAY.fullmatch(display)
     if match is None:
-        raise HarnessError("X3.harness.display", "display must be :140 through :149", display, ":140..:149")
+        raise HarnessError("X3.harness.display", "display must be a contract display",
+                           display, ":120..:199")
     number = int(match[1])
     if not display_free(number):
         raise HarnessError("X3.harness.display", "display is in use", display, "free")
@@ -304,10 +301,12 @@ class Run:
                 session.finish_artifacts()
 
     def record(self, assertion, status, predicate, observed, expected, **extra):
-        entry = {"case": CASE, "assertion": assertion, "status": status, "predicate": predicate,
-                 "observed": observed, "expected": expected, **extra}
+        entry = {"case_id": CASE, "assertion_id": assertion.removeprefix(f"{CASE}."),
+                 "status": status, "evidence": EVIDENCE, "first_required_wave": FIRST_REQUIRED_WAVE,
+                 "predicate": predicate, "observed": observed, "expected": expected,
+                 "run_id": self.dir.name, "artifacts": str(self.dir), **extra}
+        records.emit(entry)
         self.records.append(entry)
-        print("RESULT " + json.dumps(entry, default=str), flush=True)
         return entry
 
 
@@ -438,32 +437,27 @@ def digest_of(*parts):
     return length, digest.hexdigest()
 
 
-def classify(assertion, target_sha, original, outcome, input_after):
-    """Return (status, predicate, expected) for a scored assertion.
+def classify(original, outcome, input_after):
+    """Return (status, predicate, expected, signature) for a scored assertion, on any target.
 
     outcome is {"kind": "saved", "output": describe(), "quit_exit": int} or
     {"kind": "exited", "exit": int, "stderr": str, "before": identity(), "after": identity()}.
+    signature is SIGNATURE_EXIT_105 for exactly the A8 failure mode, otherwise None.
     """
     want = {"bytes": original["bytes"], "sha256": original["sha256"]}
-    signature = EXPECTATIONS[assertion].get(target_sha)
     if {k: input_after.get(k) for k in want} != want:
-        return "ERROR", "input fixture changed during the run", {"input": want}
-    if signature is not None and signature != XFAIL_EXIT_105:
-        return "ERROR", f"unknown expectation signature {signature}", want
-    xfail = {"exit": 1, "stderr_contains": V1_CAPACITY_ERROR, "destination": "bytes and inode metadata unchanged"}
+        return "ERROR", "input fixture changed during the run", {"input": want}, None
     if outcome["kind"] == "exited":
-        matched = (outcome["exit"] == 1 and V1_CAPACITY_ERROR in outcome["stderr"]
-                   and outcome["after"] == outcome["before"])
-        if signature is not None and matched:
-            return "XFAIL", "editor exited 1 with error -105, destination untouched (pinned v1, A8)", xfail
-        return "ERROR", "editor exited during the scored run", xfail if signature else want
+        if (outcome["exit"] == 1 and V1_CAPACITY_ERROR in outcome["stderr"]
+                and outcome["after"] == outcome["before"]):
+            return ("FAIL", "editor exited 1 with error -105 before saving, destination untouched",
+                    want, SIGNATURE_EXIT_105)
+        return "ERROR", "editor exited during the scored run", want, None
     if outcome["quit_exit"] != 0:
-        return "ERROR", "editor did not exit 0 after Ctrl+Q", {"exit": 0}
+        return "ERROR", "editor did not exit 0 after Ctrl+Q", {"exit": 0}, None
     if outcome["output"] == want:
-        if signature is not None:
-            return "XPASS", "bytes round-tripped where the pinned binary is expected to exit", xfail
-        return "PASS", "saved bytes equal the original", want
-    return "FAIL", "saved bytes differ from the original", want
+        return "PASS", "saved bytes equal the original", want, None
+    return "FAIL", "saved bytes differ from the original", want, None
 
 
 def variant_run(run, x, variant):
@@ -499,18 +493,19 @@ def variant_run(run, x, variant):
             outcome = {"kind": "exited", "exit": s.exit_status,
                        "stderr": s.stderr(), "before": s.before, "after": identity(s.path)}
     input_after = describe(source["path"])
-    status, predicate, expected = classify(assertion, run.target.sha256, source, outcome, input_after)
+    status, predicate, expected, signature = classify(source, outcome, input_after)
     if outcome["kind"] == "exited":
         outcome["stderr"] = outcome["stderr"][-400:]
     run.record(assertion, status, predicate, {**outcome, "input_after": input_after}, expected,
-               kind="scored", save_s=None if took is None else round(took, 3))
+               kind="scored", save_s=None if took is None else round(took, 3),
+               **({"signature": signature} if signature else {}))
     return status
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="X3 large delete + undo contract case")
     parser.add_argument("--target", required=True, help="absolute v1 editor executable")
-    parser.add_argument("--display", required=True, help="explicit :140 .. :149")
+    parser.add_argument("--display", required=True, help="explicit contract display, :120 .. :199")
     parser.add_argument("--fixtures", default=str(BUILD / "large-undo" / "fixtures"))
     parser.add_argument("--runs", default=str(BUILD / "large-undo" / "runs"))
     args = parser.parse_args(argv)
@@ -523,7 +518,6 @@ def main(argv=None):
               "display": args.display, "argv": sys.argv, "power_start": power_stamp()}
     print("RUN " + json.dumps(header), flush=True)
     run = Run(None, args.display, run_dir, {})
-    exit_code = 2
     try:
         if not executable.is_absolute():
             raise HarnessError("X3.harness.target", "target must be absolute", str(executable), "absolute")
@@ -531,16 +525,15 @@ def main(argv=None):
         header["fixtures"] = {v: fixture.write(args.fixtures, v) for v in ("twin", "over")}
         run.target = RunTarget("v1", executable, executable.parent, header["target_sha256"])
         run.fixtures = header["fixtures"]
-        statuses = []
         with private_xvfb(args.display, run_dir) as x:
             run.step("xvfb", pid=x["pid"], display=args.display)
             for variant in ("twin", "over"):
-                statuses.append(variant_run(run, x, variant))
-        exit_code = 2 if "ERROR" in statuses else 1 if {"FAIL", "XPASS"} & set(statuses) else 0
+                variant_run(run, x, variant)
     except HarnessError as exc:
         run.record(exc.assertion, "ERROR", exc.predicate, exc.observed, exc.expected, kind="harness")
     except Exception as exc:  # any other runner failure is an ERROR, never a pass
         run.record("X3.harness", "ERROR", f"{type(exc).__name__}: {exc}", None, None, kind="harness")
+    exit_code = records.exit_status(entry["status"] for entry in run.records)
     header["power_end"] = power_stamp()
     header["exit"] = exit_code
     summary = {**header, "records": run.records, "steps": run.steps, "artifacts": str(run_dir)}
