@@ -13,6 +13,7 @@
 # Rationale and borderline cases: docs/decisions/v2-he7.22.md.
 
 # Any module: pure byte and string functions.
+__memcpy_chk           * # fortified memcpy: bounded byte copy
 memchr                 * # locate a byte in a bounded span
 memcmp                 * # compare bytes
 memcpy                 * # copy bytes
@@ -22,6 +23,8 @@ strchr                 * # locate a character in a C string
 strcmp                 * # compare strings
 strlen                 * # string length
 strncmp                * # bounded string comparison
+strnlen                * # bounded string length
+strrchr                * # locate last character in a C string
 # Any module: character classes. They read the C locale; setlocale, uselocale
 # and newlocale are granted to no module, so the result depends on the argument only.
 __ctype_b_loc          * # glibc narrow character-class table
@@ -136,3 +139,35 @@ __libc_malloc base # glibc allocation beneath the Law-2 interposer
 __libc_realloc base # glibc allocation beneath the Law-2 interposer
 __cpu_indicator_init base # compiler runtime CPU capability initialization (process-global)
 __cpu_model base # compiler runtime CPU feature bits (process-global)
+# ipc: Unix-socket server/client. os offers no socket, epoll, timerfd or uid
+# API; these grants are the reported exception (docs/decisions/v2-0fv.6.md).
+# What os does offer (cwd, canonical, stat, clock, sleep, env) goes via os.
+__errno_location       ipc # native result of the socket and epoll calls below
+__isoc23_strtoul       ipc # parse the EDIT_IPC_TEST_PEER_UID test hook
+__snprintf_chk         ipc # fortified snprintf: endpoint name building
+accept4                ipc # accept a client on the Unix listener
+bind                   ipc # bind the Unix socket endpoint
+chmod                  ipc # owner-only mode on the verified socket inode
+close                  ipc # release socket, epoll and timer descriptors
+connect                ipc # client connect and stale-socket probe
+epoll_create1          ipc # server readiness set
+epoll_ctl              ipc # register listener, deadline timer and peers
+epoll_wait             ipc # drain one readiness batch
+fcntl                  ipc # set O_NONBLOCK on an adopted wait channel
+flock                  ipc # endpoint lifecycle lock
+fstat                  ipc # verify runtime directory and lock file identity
+fstatat                ipc # identity-checked socket stat in the pinned dir
+getsockopt             ipc # SO_PEERCRED peer check and SO_ERROR after connect
+getuid                 ipc # endpoint names and ownership checks
+listen                 ipc # listen on the bound endpoint
+open                   ipc # open and pin the runtime directory
+openat                 ipc # lock leaf and socket pin inside the pinned dir
+poll                   ipc # client transfer deadlines
+read                   ipc # drain the deadline timerfd
+recv                   ipc # receive request bytes
+send                   ipc # send request and reply bytes
+socket                 ipc # Unix stream endpoints
+socketpair             ipc # launcher wait channel pair
+timerfd_create         ipc # request-deadline timer
+timerfd_settime        ipc # arm the earliest request deadline
+unlinkat               ipc # identity-checked socket unlink on teardown

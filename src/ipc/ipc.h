@@ -1,0 +1,150 @@
+#ifndef EDIT_IPC_H
+#define EDIT_IPC_H
+#include "base/base.h"
+#include "os/os.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define IPC_MAX_PATHS 128u
+#define IPC_PATH_CAP 4096u
+#define IPC_MAX_WIRE (1024u * 1024u)
+#define IPC_MAX_CLIENTS 32u
+/* edit-b6ai.8: one activation string (XDG_ACTIVATION_TOKEN / DESKTOP_STARTUP_ID)
+ * is at most this many bytes with its NUL: both are short opaque ids
+ * (compositors issue tokens of a few dozen characters; the startup-notification
+ * spec's id is host;pid;program;_TIMEn), 512 leaves an order of magnitude
+ * of room while bounding the block at 4 + 2 x 512 bytes. */
+#define IPC_ACTIVATION_CAP 512u
+/* edit-457.21: bounded UI work per drain call (§10), request deadlines and
+ * pressure eviction (§11), lifecycle lock deadline (§12), receive pool (§14). */
+#define IPC_DRAIN_BYTES (256u * 1024u)
+#define IPC_DRAIN_CALLBACKS 8u
+#define IPC_DRAIN_ACCEPTS 8u
+#define IPC_REQUEST_DEADLINE_MS 5000u
+#define IPC_EVICT_IDLE_MS 500u
+#define IPC_LOCK_TIMEOUT_MS 1000u
+#define IPC_RX_SMALL_SIZE (64u * 1024u)
+#define IPC_RX_SMALL_COUNT 16u
+#define IPC_RX_BIG_COUNT 2u
+
+typedef enum ipc_result {
+    IPC_OK = 0, IPC_EXISTS, IPC_INVALID, IPC_LIMIT, IPC_IO,
+    IPC_PROTOCOL, IPC_TIMEOUT, IPC_BUSY, IPC_REJECTED
+} ipc_result;
+/* Static descriptive text for command-line diagnostics; no allocation. */
+const char *ipc_result_string(ipc_result result);
+typedef struct ipc_path { const char *path; uint32_t line, col; } ipc_path;
+typedef struct ipc_request {
+    ipc_path paths[IPC_MAX_PATHS];
+    size_t count;
+    const char *cwd;
+    const uint8_t *stdin_data;
+    size_t stdin_size;
+    bool wait, has_stdin, new_instance;
+    /* edit-b6ai.8: the launcher's XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID
+     * (NULL = absent). The running instance uses them to raise its window;
+     * see docs/decisions/edit-b6ai.8.md for the wire format and compatibility. */
+    const char *activation_token, *startup_id;
+} ipc_request;
+typedef struct ipc_args {
+    ipc_request request;
+    base_arena arena;
+    /* Launch-local CLI settings, owned by arena, never serialized to a peer. */
+    const char *font_family, *font_file;
+    const char *font_fallbacks; /* edit-6e2: comma-separated chain, verbatim */
+} ipc_args;
+/* Parse argv[1..], snapshot cwd; owns output until fini. Zero-init out.
+ * An existing whole filename wins over suffix parsing. Coordinates are 1-based.
+ * Failing parse frees output. '-' is unique; '--' ends option recognition.
+ * --font-family / --font-file accept a following value or =VALUE; repeats
+ * keep the last value of each flag. Empty values request the embedded face.
+ * --font-fallbacks (edit-6e2) takes a comma-separated chain the same way;
+ * empty explicitly requests an empty chain. */
+ipc_result ipc_parse_args(int argc, char *const argv[], ipc_args *out);
+ipc_result ipc_args_read_stdin(ipc_args *args, int fd);
+/* edit-b6ai.8: copy the launcher's activation environment into the request.
+ * NULL, empty and unusable values (control characters, spaces, longer than
+ * IPC_ACTIVATION_CAP) leave the field absent: a bad environment never fails
+ * the handoff. Returns IPC_IO only if the argument arena is exhausted. */
+ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char *startup_id);
+void ipc_args_fini(ipc_args *args);
+/* Decoder borrows wire storage. Strings include a checked trailing NUL.
+ * On any failure out is zeroed. Encoder never serializes new_instance.
+ * Activation strings are serialized in a trailing block flagged by bit 2 of
+ * the flags byte, its size in header bytes 6-7; a request without them is
+ * byte-identical to the previous format, and the client resends in that form
+ * when a server of an earlier release answers IPC_PROTOCOL. */
+ipc_result ipc_wire_encode(const ipc_request *request, uint8_t *wire,
+                           size_t capacity, size_t *size);
+ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out);
+
+typedef uint64_t ipc_token;
+struct ipc_peer;
+struct ipc_rx;
+typedef struct ipc_server {
+    int fd, listener, lock_fd;
+    base_arena arena;
+    struct ipc_peer *peers;
+    uint64_t next_token;
+    char socket_path[108]; /* leaf name inside dir_fd (edit-457.21); abstract: empty */
+    uint64_t socket_device, socket_inode;
+    bool owns_path;
+    /* edit-457.21 additions. Init sets the defaults; tests may lower them. */
+    int dir_fd, timer_fd;
+    uint32_t request_deadline_ms, evict_idle_ms;
+    uint64_t wait_drops;  /* wait clients that vanished before their closed reply */
+    uint64_t drain_bytes; /* bytes received by the most recent drain call */
+    struct ipc_rx *rx;
+} ipc_server;
+typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
+/* Caller-owned, zero-init before init; runtime NULL uses XDG_RUNTIME_DIR,
+ * or a Linux abstract socket if unset. IPC_EXISTS means another server won.
+ * Endpoint names are built from the build identity EDIT_APP_ID: the
+ * filesystem leaf is <app-id>-<uid><display-suffix>.sock inside the verified
+ * runtime directory (lock leaf: same stem, .lock), the abstract name is
+ * <app-id>-<uid><display-suffix>. Test hook: when EDIT_IPC_NAMESPACE is set,
+ * the abstract name on both server and client gains a -<namespace> segment.
+ * Use a unique namespace per test process, inherited by its forked clients.
+ * Empty namespaces return IPC_INVALID; names too long return IPC_LIMIT.
+ * Filesystem endpoints ignore this hook. Set it before IPC calls, and keep
+ * it stable for the endpoint lifetime; do not change it from another thread.
+ * (v1's Windows named-pipe endpoint is not carried over; see v1 ipc_win.c
+ * at 6fec2e8.)
+ * All server calls belong to the loop thread; fini only after successful init. */
+ipc_result ipc_server_init(ipc_server *server, const char *runtime);
+/* CLI endpoints include a lossless, bounded encoding of the selected DISPLAY.
+ * Different display strings never share a primary. NULL preserves the general
+ * IPC endpoint; overlong display names return IPC_LIMIT before binding/sending.
+ * Pass the same display to server and client, including fallback endpoints. */
+ipc_result ipc_server_init_display(ipc_server *server, const char *runtime, const char *display);
+ipc_result ipc_client_send_display(const char *runtime, const char *display,
+                                   const ipc_request *request, int timeout_ms);
+int ipc_server_fd(const ipc_server *server);
+/* Nonblocking; borrowed request is valid only inside callback. Callback OK
+ * queues ACK; other result rejects. Retain token for wait; copy desired data.
+ * Call drain on epoll readability, and after report_closed. */
+ipc_result ipc_server_drain(ipc_server *server, ipc_open_callback callback, void *ctx);
+ipc_result ipc_server_report_closed(ipc_server *server, ipc_token token);
+void ipc_server_fini(ipc_server *server);
+/* edit-457.21 additions. True while the wait client behind token is still
+ * connected and unanswered. The loop MUST sweep its token associations after
+ * any drain that raised server->wait_drops and drop entries that are not live
+ * (a client that gave up). Live tokens never exceed IPC_MAX_CLIENTS. */
+bool ipc_server_token_live(const ipc_server *server, ipc_token token);
+/* Server with no endpoint: for --new-instance. It never binds, locks or
+ * connects to the shared socket; only adopted wait channels live in it. */
+ipc_result ipc_server_init_isolated(ipc_server *server);
+/* --wait for a launch that is the UI process (primary or isolated). Before
+ * the UI starts, main creates a pair with ipc_launcher_pair and fork()s. The
+ * child (UI) adopts adopt_fd and associates the returned token with the
+ * initial request; the parent calls ipc_launcher_wait(launcher_fd) and exits
+ * with its result once the closed reply arrives (IPC_IO if the UI exits first). */
+ipc_result ipc_launcher_pair(int fds[2]);
+ipc_result ipc_server_adopt_wait(ipc_server *server, int adopt_fd, ipc_token *token);
+ipc_result ipc_launcher_wait(int launcher_fd);
+/* Startup-only blocking handoff. timeout_ms bounds connect/send/ACK;
+ * -1 means infinite. After ACK, --wait always waits without a deadline.
+ * IPC_EXISTS/new_instance selection is the caller's startup policy. */
+ipc_result ipc_client_send(const char *runtime, const ipc_request *request, int timeout_ms);
+#endif

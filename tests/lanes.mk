@@ -2,7 +2,7 @@
 # Register each new *_test.c or *_fuzz.c in the lane(s) that must run it.
 LAYER_SUITES := tests/layer_L0_test.c tests/layer_L1_test.c tests/layer_L2_test.c \
                 tests/layer_L3_test.c tests/layer_L4_test.c
-SAN_SUITES := $(LAYER_SUITES) tests/isolation_test.c tests/os_test.c tests/base_test.c
+SAN_SUITES := $(LAYER_SUITES) tests/isolation_test.c tests/os_test.c tests/base_test.c tests/ipc_test.c
 
 LAW2_SUITES := tests/law2_base_test.c
 TSAN_SUITES := tests/os_test.c tests/base_test.c
@@ -19,3 +19,7 @@ SAN_SUITES += tests/work_test.c
 LAW2_SUITES += tests/law2_work_test.c
 TSAN_SUITES += tests/work_test.c
 FUZZ_SUITES += fuzz/work_fuzz.c
+
+# ipc (v2-0fv.6)
+TSAN_SUITES += tests/ipc_test.c
+FUZZ_SUITES += fuzz/ipc_fuzz.c
