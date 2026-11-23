@@ -12,7 +12,7 @@ isolation lint (10cec71). `make check` green.
 
 ### Wave 0 exit, second half: contract suite (epic v2-he7, design docs/decisions/wave0-contract-design.md + "Advisor review" trims T1–T5)
 Landed: W0.6a sandbox (7dfb7bb) · W0.6b X driver (28976cf) · W0.6c wire client `snapwire.py` (5a8f29f) ·
-W0.6g pre-ACK recovery controls (996f3da; bead stays open for post-ACK) · W0.6f R3 + R5 Tier A, 8 PASS (0.30; bead open for 5 screen assertions) · W0.6d v1 inspector patch +383/−6 (d653383; tree /home/tobias/Projects/sublimite-v1-inspect) · W0.6h X3 case, XFAIL pinned per A8 (0.45).
+W0.6g recovery controls pre- and post-ACK (996f3da, 4d20f22) · W0.6f R3 + R5 Tier A, 8 PASS (0.30; bead open for 5 screen assertions) · W0.6d v1 inspector patch +383/−6 (d653383; tree /home/tobias/Projects/sublimite-v1-inspect) · W0.6h X3 case, XFAIL pinned per A8 (0.45).
 In flight at the time of this commit (worktrees under ~/.t3/worktrees/sublimite-v2/, one branch each):
 - Wave 1 prep: piece pool derivation revised through advisor challenges 1–6 (2ac1c97, one 400 B node class, process reserve); sign-off pending.
 Dispatched: v2-he7.12 W0.6e navigation R1 + R6 (Sol). Open, not started: W0.6g post-ACK and W0.6f's 5 screen assertions (adapter now landed) ·
@@ -20,7 +20,7 @@ v2-he7.16 W0.6i runner + gate (wire all contract self-tests into make check; reg
 v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
 
 ### Wave 1 started (amendment A10)
-Epic v2-0fv; L0 beads v2-0fv.1 os LANDED (1.1, 8974fee, 1,224 lines), .2 fault ids (signed spec), .3 base (Law-2 guard; dispatched, Sol), .4 trace (dispatched, Sol),
+Epic v2-0fv; L0 beads v2-0fv.1 os LANDED (1.1), .3 base LANDED (1.2, Law-2 lane live), .4 trace LANDED (1.3), .2 fault ids (Opus, in flight), .5 work (Sol, in flight), .6 ipc (Muse, in flight),
 .5 work, .6 ipc. L2/L5 wait for the Wave 0 gate.
 
 L1 piece and undo beads filed from the signed pool spec (docs/decisions/wave1-piece-pool.md; A13/A14); dispatch after
