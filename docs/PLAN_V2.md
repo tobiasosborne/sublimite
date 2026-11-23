@@ -34,9 +34,9 @@ L1  libtext.a      scan, utf8 (+ fix ©/® UCD_EXT_PICT), indent,
                    piece (harvested piece_snapshot + piece_checkpoint + boundary-privatization-safe
                           shared add-dir + L0 fault-id token hook + root grow/collapse regression test),
                    undo (burst coalescing, cap eviction, sliced replay, shared add-dir boundary),
-                   lineidx (resumable query continuations + degraded off-path regrowth protocol),
+                   [lineidx removed by A19: line counts live in piece, counted off path per 64 KiB chunk]
                    find (unified streaming visit + native ASCII fold & whole-word in one literal engine)
-                   [Internal order: scan/utf8 < piece < undo/lineidx/indent/find]
+                   [Internal order: scan/utf8 < piece < undo/indent/find]
         │
 L2  libpersist.a   file (NOREPLACE absent targets, unified L0 fault-registered reload mappings,
                          existing file_id with ctime_ns + ino_hi),
@@ -63,7 +63,7 @@ L4  libui.a        viewport (persistent byte anchor + full certified visual-row 
                    layout (opaque struct, unified clip+wrap emitter, incremental wrap_edit/relayout,
                            long-line checkpoints, local upward row-start cache, const views over prepaid storage),
                    tabs (buffer_id + viewport state; zero borrowed tree*/undo* pointers),
-                   minimap (windowed-only + explicit bind generation, reading piece/lineidx directly),
+                   minimap (windowed-only + explicit bind generation, reading piece (and its line queries) directly),
                    find_session + find_panel + replace_txn (explicit FSM, os_temp_file),
                    fif (harvested 748-LOC demand-committed arena + O(1) hash inode dedup + shared find meter),
                    hl (opaque hl_session, budgeted hl_query_run, pinned query predicates, enum lang IDs),
@@ -110,7 +110,7 @@ L5  src/app/       app_loop (straight-line ordered app_step, single app_work_pen
   4. Never roll back the tree after journal RAM acceptance (`journal.h:255`); on unrecoverable journal I/O failure, latch visibly suspended recovery status without rewinding or duplicating the edit.
 - **`SIGKILL` oracle (`dataloss_test.c:436`):** Before command/frame acknowledgment, restart must recover either **pre-edit** or **whole-edit** (never torn); after acknowledgment, restart must recover **whole-edit**. Failed fsync/dirsync and suspended recovery carry distinct expected outcomes.
 
-### 4.3 Non-Vetoing `lineidx` Degraded Mode & Off-Path Regrowth
+### 4.3 Non-Vetoing `lineidx` Degraded Mode & Off-Path Regrowth — SUPERSEDED by A19 (line counts in the piece tree; docs/decisions/wave1-piece-lines.md)
 - When an edit or undo exceeds `LINEIDX_EDIT_MAX_CHUNKS` (`512` chunks × `64 KiB` = `32 MiB` `(P)` incremental cap, `lineidx.h:37`) or total reserved index capacity (`lineidx.c:858`):
   1. `lineidx` transitions immediately to `LINEIDX_DEGRADED` and stops returning exact geometry from the stale table, falling back to v1's existing `{value, exact=false}` estimate contract (`lineidx.h:57`) for gutter, minimap, and byte-proportional scrollbar, and budgeted resumable seek for goto-line.
   2. An async rebuild runs on `WORK_BULK` against a post-edit `piece_snapshot`, **allocating a replacement table sized to post-edit file length off the typing path** (still zero typing-path `malloc`, Law 2!), and swaps it in only if `(doc_revision, fault_epoch)` still match.

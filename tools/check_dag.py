@@ -21,7 +21,7 @@ INTRA_RULES = [
     "os < base < trace < work",
     "base < ipc",  # amended: docs/decisions/wave0-plan-amendments.md
     # L1 text
-    "scan,utf8 < piece < undo,lineidx,indent,find",
+    "scan,utf8 < piece < undo,indent,find",
     # L2 persist
     "file < journal < savectl",
     "journal < edit",

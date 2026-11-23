@@ -213,3 +213,11 @@ under Astra review until frozen). Consequences:
   input-visible gain. The test counts bytes read against 131,072. The text length is held at or below a named maximum 2^60 by an ASSERT at every edit
   (the 2^47-byte address-space argument holds only on 4-level paging). Undo literal threshold stays 16 × spans > length;
   the in-memory inverse entry is 24 B.
+- At the Lines freeze (advisor, 1.18): `lineidx` has nothing left to own and is removed from L1 (mk/layers.mk, the DAG
+  rules, PLAN §2/§3); v2-0fv.18 closed as superseded. Its two remaining duties go to their callers: scheduling the
+  piece_lines_count job is an acceptance line of the L5 buffers bead (after the Wave 0 gate); the estimate shown while a
+  prefix is unknown belongs to the layout bead, with one line: one rank per frame for the first visible row, never one
+  per row. v2-0fv.9 is held until L5 buffers lands the counting job. Post-submit maintenance (resolve, replenish,
+  reclaim, in that order, from one function that is their only caller) is an acceptance line of v2-0fv.15.
+- The fault-read rule is one closing poll after the last dependent load (epoch 0, generation match); the opening poll
+  was cut at the freeze (wave1-os-fault-lease.md "Read bytes", amended).

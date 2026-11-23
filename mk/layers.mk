@@ -6,7 +6,7 @@
 # Included by the Makefile after WARN/INC/B/CFGS and mk/grammars.mk.
 
 L0_MODS := os base trace work ipc
-L1_MODS := scan utf8 indent piece undo lineidx find
+L1_MODS := scan utf8 indent piece undo find
 L2_MODS := file journal savectl edit
 L3_MODS := plat x11 wayland render raster gl font
 L4_MODS := viewport layout tabs minimap findui fif hl cmd config dnd
