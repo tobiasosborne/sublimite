@@ -105,3 +105,25 @@ From v1 finding 8 (W0.9, docs/decisions/v2-he7.23.md): in backend submit, v1's c
 Present packet on the raster connection. v2 rule, owned by the L3 X11 present bead: between ingress and submit the UI
 thread performs **no libxcb call that can read from a connection (flush included)** — stated as "no read", and tested
 with the live allocation guard, not by inspection. The v1 adapter patch is not changed; on v1 the count stays recorded.
+
+## A13. §6 Wave 1 exit: bounded-copy delete/undo gate replaces ">32 MiB delete+undo"
+
+Signed piece-pool spec (docs/decisions/wave1-piece-pool.md, 10(b)): delete and undo of a mapped range of any length
+copy at most min(length, 16 × spans) ORIGINAL bytes and complete with O(spans) inverse storage, with a one-byte
+literal and a one-span large range as discriminating fixtures; the 513-chunk `lineidx` degraded/regrowth regression is
+kept. Advisor addition: for a one-span delete and its undo on a mapped range, the UI thread reads at most the two
+partial boundary chunks of ORIGINAL, ≤ 2 × 65,536 = 131,072 B (P, one partial chunk at each end; interior chunks take
+newline counts from the index or the inexact geometry of §4.3), tested by counting mapped bytes read — otherwise an
+implementation could copy nothing and still fault in 10 GiB (v1's delete_part scans newlines before history capture).
+
+## A14. Consequences of the span-sequence inverse outside L1 (acceptance lines for the owning L2 beads)
+
+(a) journal: a versioned record for a BASE-range restore plus the durable generation declaration; the v2 journal is
+never offered to a v1 parser. (b) savectl/edit: generation retention across saves — an undo naming a pre-save
+generation needs that generation durable before it is acknowledged, which can cost a file-sized on-disk copy off the
+typing path. Option for the owning bead to evaluate (not a requirement): before the save's rename replaces the path,
+hard-link the old inode into a retention directory on the same filesystem (O(1), no copy); fall back to reflink, then
+copy, across filesystems; the bead states which and why. (c) checkpoint-diff consumers can no longer assume ORIGINAL
+spans appear once in increasing order. (d) the L1 dossier's piece and undo sections are superseded where the spec
+says so. Each becomes an acceptance line of the L2 bead that owns it (journal, savectl or edit), written when those
+beads are prepared after the Wave 0 gate.

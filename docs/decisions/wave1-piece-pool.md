@@ -336,3 +336,15 @@ and completes with O(spans) inverse storage. Last round on this document; the ch
 The checked height-limit section now identifies reopening the saved document as the recovery path. Sections (i)–(iv) give the source guarantee, like-for-like costs, changed piece/undo/journal contracts and the replacement PLAN gate. The coordinator clarified that the size comparison applies even to a one-byte ORIGINAL deletion. The gate and acceptance cases above use that rule without exceptions.
 
 VERDICT: Adopt span-sequence undo with literal bytes exactly when 16 × coalesced spans exceeds the deleted length. Keep spans on equality. A literal survives an in-place rewrite; an ORIGINAL span shares live-text conflict detection. Journal ORIGINAL by validated durable BASE generation and ADD or literal bytes by value. Keep the signed node pool, synchronous admission, height check and bulk batch design. Replace the PLAN exit case with the bounded-copy gate in (iv) and retain independent line-index regrowth coverage.
+
+## Sign-off (advisor, 2026-11-23)
+
+SIGNED in full as of the round-3 answer ("Deleted ranges and undo" read in full). This file is the acceptance
+specification for the Wave 1 L1 piece and undo beads and for the L2 journal changes it names. 10(b) as signed: one
+inverse representation with one size rule (literal exactly when 16 × coalesced spans > length, spans on equality),
+payload min(L, 16s); inline up to eight pairs, a history-owned append-only span store beyond; ORIGINAL spans share the
+live text's validation and conflict path; literals captured once into immutable storage; undo replays through the
+signed batch planner; history owns zero tree roots; no split/join, no unconditional materialisation, no ninth-span
+whole-range copy. Cost argument: 1,078,067,200 B of private chunks and over 1 GiB of journal at 1 GiB under the old
+design, against 16 B and a 64 B record. Tobias informed of the v1 property given up (long deleted ranges surviving an
+in-place rewrite of a mapped file); no objection. If he objects, only the size rule's threshold changes.

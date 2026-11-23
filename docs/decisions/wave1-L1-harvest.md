@@ -1593,3 +1593,6 @@ VERDICT: L1 is harvestable at pin 6fec2e8 with zero post-c95b6eb drift (§8), st
   reference (amendment A5, docs/decisions/wave1-os-fault-lease.md).
 - §4.5(c) places the add-dir walk "per snapshot retain"; at the pin it happens in `piece_checkpoint_begin`
   (`add_store_prefix`), see amendment A7.
+- (2026-11-23) The piece and undo sections are superseded where docs/decisions/wave1-piece-pool.md (signed) says so:
+  400 B single node class, 24/16 fanouts, extent-owned pool, synchronous admission, height check at 31, exact batch
+  claim, span-sequence undo inverse (amendments A13, A14).
