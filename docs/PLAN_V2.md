@@ -68,7 +68,7 @@ L4  libui.a        viewport (persistent byte anchor + full certified visual-row 
                    fif (harvested 748-LOC demand-committed arena + O(1) hash inode dedup + shared find meter),
                    hl (opaque hl_session, budgeted hl_query_run, pinned query predicates, enum lang IDs),
                    cmd (actions.inc moved under cmd/; unified keys/menu/palette + sortedness check; no x11/plat.h),
-                   config (harvested transactional TOML parser + private pool; settings glue rewritten on cmd/layout),
+                   config (harvested transactional TOML parser, no pool of its own (A21); settings glue rewritten on cmd/layout),
                    dnd (harvested verbatim)
                    [Internal order: cmd < config; viewport < layout < tabs; find_session < find_panel]
         │

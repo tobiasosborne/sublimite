@@ -235,3 +235,14 @@ fanouts; one leaf-to-root path of 4 slots and one header per held version); exte
 comparison (v2 is 0.47 % above it: the 96 B per page a 400 B slot leaves). Re-deriving the slot geometry to win that
 50 KB, or charging requested bytes instead of mappings, were both rejected.
 
+## A21. Later-wave leaves may start early; the TOML parser owns no pool (advisor, 2026-11-23, after the Wave 0 gate)
+
+- Extension of A10: a later-wave leaf module may start when everything it includes has landed on v2 and its dossier
+  section exists (docs/decisions/wave1-L2-L5-harvest.md §8). Its wave's exit gate still gates integration, and it is in
+  that wave's whole-wave Astra read like the rest. Nothing that touches a display, and nothing whose design the gate or
+  the piece implementation could still change. First uses: LF-1 `dnd` (L4) and LF-2 the config TOML parser.
+- PLAN §2's "transactional TOML parser + private pool" was written before anyone read the parser. If v1's parser
+  allocates nothing (it reports into caller storage or through callbacks), it is harvested that way with no pool; if it
+  needs memory for the parsed result, the caller passes a base arena and the parser owns nothing. In neither case does
+  the parser own a pool (a pool it does not need is state). PLAN §2 corrected.
+
