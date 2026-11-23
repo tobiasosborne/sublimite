@@ -56,7 +56,7 @@ X3's only XFAIL row is `X3.over.roundtrip` on `v1-pin`, witness run `20261123T09
 3. Reconcile each invocation:
    - A malformed RECORD line is an ERROR.
    - A duplicate record is an ERROR.
-   - A record for an ID the invocation does not own is accepted only as status ERROR (a harness step such as `setup`); a non-ERROR one is malformed.
+   - A record for an ID the invocation does not own, or owns but does not require of the selected target, is a problem either way: an ERROR one is reported as a harness error, any other status as foreign (W0.7-B1).
    - Evidence or wave differing from the manifest is an ERROR.
    - Zero records, an exit outside 0/3/4, or an exit that differs from `records.exit_status` of its records is an ERROR.
 4. Outcome per required assertion:
@@ -69,7 +69,7 @@ X3's only XFAIL row is `X3.over.roundtrip` on `v1-pin`, witness run `20261123T09
    | XFAIL | PASS | XPASS |
    | any | ERROR | ERROR |
 
-   With no record, the outcome is NOT-RUN if the same invocation recorded a FAIL or ERROR (its first failure is final, so the later steps never ran and the run already fails), otherwise MISSING (ERROR).
+   With no record, the outcome is NOT-RUN only after an earlier stopping failure of the same case, otherwise MISSING (ERROR); the rule is under W0.7-B1 below.
 5. No rerun, retry or FLAKY category exists. Each run writes into a new directory `<role>-<UTC>-<pid>`, so a manual diagnostic run keeps its own receipt beside the first.
 
 ## Gate record
@@ -81,7 +81,8 @@ X3's only XFAIL row is `X3.over.roundtrip` on `v1-pin`, witness run `20261123T09
 - manifest path and SHA-256, SHA-256 of `run.py` and `records.py`
 - the computed identity and the selected target
 - run-level problems
-- per invocation: command, display, invocation count (0 or 1), exit, wall seconds, transcript paths, every parsed record and its problems
+- the selected target's digest binding (`digests`, W0.7-B1)
+- per invocation: command, display, invocation count (0 or 1, derived from the attempted launch), exit, wall seconds, transcript paths, every parsed record and its problems
 - per required assertion: invocation, evidence, wave, expected, outcome, observed status, predicate, signature and the case's artifact path
 
 `summary.txt` is the short human form, also printed. `make check` writes its harness record under `build/contract-check/`, and `make contract-gate` under `build/contract-gate/`.
@@ -151,3 +152,53 @@ The run was `v1-20261123T120606Z-231818`, record `build/contract-gate/v1-2026112
 Totals: 85 PASS, 1 XFAIL, 1 MISSING. The gate fails, as intended, only because R4 (bead v2-he7.17) has not landed. Every other required assertion is at its expected outcome. Afterwards no Xvfb was left on `:190`–`:199`.
 
 The measured wall times sit far below the `timeout_s` backstops, which are derived from the cases' own hang detectors (table above). A quiet, uncontended box is the condition the X3 decision showed matters: `ctl.delete` ran 0.6–49 s depending on contention.
+
+## W0.7-B1 · 2026-11-23 · false-PASS fixes (bead v2-he7.27; review `docs/reviews/wave0-code-astra.md` findings 1, 2 runner half, 16, 26)
+
+**Invariant, now enforced in `aggregate()`.** A run is PASS only if every assertion the manifest requires of the selected target has an outcome and each outcome is PASS or XFAIL with its reviewed signature. The check is positive: an outcome the runner does not know, a NOT-RUN without a failure, or a required ID without an entry is ERROR. It used to be "no ERROR, FAIL or XPASS kind present", which let NOT-RUN through.
+
+**Outcomes (finding 1).** Observed records are judged first, then the missing IDs are classified. The manifest's assertion order is each fail-fast case's execution order. It is checked against `ASSERTIONS` in `navigation.py` and `files.py` and the X3 control sequence in `large_undo.py`. A record is *stopping* when its verdict is FAIL, ERROR or WRONG-SIGNATURE. A required ID without a record is NOT-RUN only when a stopping record **of its own case** comes earlier in that order. An unlisted harness ERROR (a `setup` or `assertion-inventory` step) stops its case at the point it was printed: after the case's records that precede it on stdout. Everything else without a record is MISSING (ERROR). Consequences:
+
+- An accepted outcome (PASS, a matched XFAIL, XPASS) never excuses absent evidence. A case that stops on a reviewed XFAIL must therefore have that XFAIL as its last assertion. X3's `over.roundtrip` is.
+- A missed control before the failure is MISSING, not NOT-RUN. A failure in R1 does not excuse missing R6 records: `files.py` and `navigation.py` run both cases of an invocation independently.
+- Unittest self-tests do not stop at a failure. For them a missing ID after a FAIL is classified NOT-RUN (exit 3) where MISSING (exit 4) would be truer. Both are red. Only the exit code differs, never PASS.
+- A record for an owned assertion that is not required of the selected target is rejected like an unowned one. Its ERROR is reported, never ignored.
+
+Simplest alternative, rejected: drop NOT-RUN and make every missing ID MISSING. Counter-example: the fail-fast fixture (`test_fail_once_is_final`, `test_not_run_after_a_failure_keeps_the_failure`) and a real R1 FAIL would report exit 4. A genuine behavioural FAIL would then be indistinguishable from a broken harness.
+
+**Parsing (finding 16).** `records.unique_object` is the one `object_pairs_hook`. It rejects a repeated key on every JSON stream the runner reads: the manifest, each RECORD line (`records.parse`) and the oracle build stamp. Records reconcile by the `(case_id, assertion_id)` pair. The joined `case.assertion` survives only as the gate record's display key, which the manifest already keeps unique. Problems spell the pair as `case / assertion`, and each gate entry carries both IDs. Dotted assertion IDs (`over.ctl.delete`, `Class.method`) stay legal. `case_id "A.x"` + `assertion_id "y"` no longer claims `A / x.y`.
+
+**Digest interface (finding 2, runner half).** Each invocation's environment carries `CONTRACT_DIGESTS` (`records.DIGESTS_ENV`). It holds a JSON object `{absolute path: sha256 hex}` with one entry per executable in the **selected manifest target's identity**: each `executables.NAME` under the `--exe NAME=` path, and each `oracle_build.NAME` under `str(<--oracle-build>/NAME)`. Keys use exactly the spelling of the corresponding placeholder value (`{exe:NAME}`, or `{oracle_build}` joined with the stamp name). A case looks up the path it will execute: `records.expected_digests()[str(path)]`. That covers the adapter's `sublimite-stock` and `sublimite-drop-submit` too.
+
+- The environment was chosen over an argument because it needs no manifest or case argv change and reaches every invocation the same way.
+- The harness target binds `{}`.
+- An outer value of the variable is always replaced, and a manifest `env` may not set it (or the dropped display variables).
+- Outside the runner the variable is absent and `expected_digests()` raises KeyError. Phase 2 decides how a stand-alone diagnostic run, such as the X3 stub, identifies itself.
+- The map is also written to `gate.json` as `digests`.
+
+Before each launch the runner re-hashes every path in the map and refuses to launch if any differs (`executable changed since target selection`). That is ERROR, invocation count 0, and the case's IDs MISSING. A new matching stamp does not help, because the stamp is no longer consulted after selection. Identical replacement bytes still launch. This narrows the window to the launch and does not close it. Closing it stays case-side (phase 2): the sandbox checks the fd it executes against `CONTRACT_DIGESTS` instead of re-reading the stamp.
+
+**Invocation count (finding 26).** `count` is no longer a counter. The run loop sets it as `int("command" in receipt)`, and `command` is set immediately before `Popen`. Rerun detection stays with the fixture's external counter.
+
+**Red and green.** Both runs are on the same test file; the red one used the pre-bead `run.py` in a copy under `build/b1-old/`. Logs are under `build/receipts/` as `b1-red.log`, `b1-green.log` and `b1-mutant-rerun.log`.
+
+| Finding | Test (`test_run.py`) | Red against the old runner | Green |
+|---|---|---|---|
+| 1 | `test_xfail_does_not_excuse_a_missing_control` (proof: XFAIL only, required control absent) | gate PASS exit 0, `A.ctl` NOT-RUN | exit 4, `A.ctl` MISSING |
+| 1 | `test_complete_xfail_evidence_passes` | PASS (unchanged behaviour) | exit 0 |
+| 1 | `test_a_failure_explains_only_later_work_of_its_case` | exit 3 | exit 4: MISSING before the FAIL, NOT-RUN after, other case MISSING |
+| 1 | `test_record_of_an_assertion_not_required_of_the_target` (PASS and ERROR) | exit 0 | exit 4 |
+| 1 | `test_green_needs_every_required_id_pass_or_matched_xfail` | TypeError (no `required`); with the old rule NOT-RUN alone was PASS | ERROR for NOT-RUN, unknown outcome, absent ID |
+| 1 | `test_fail_once_is_final`, `test_not_run_after_a_failure_keeps_the_failure` | exit 3 kept | exit 3 |
+| 16 | `test_duplicate_key_inside_a_record` (FAIL then PASS) | exit 0 | exit 4, `A.a` MISSING |
+| 16 | `test_ids_reconcile_as_a_pair` | exit 0 | exit 4, `A.x / y` foreign |
+| 16 | `test_dotted_assertion_ids_stay_legal` | no pair in the entry | exit 0 |
+| 16 | `test_duplicate_key_in_the_build_stamp` (repeated equal `pin`) | exit 0 | exit 4, zero invocations |
+| 2 | `test_expected_digests_reach_every_invocation` (two invocations, outer value replaced) | no binding | exit 0, both carry the selected map |
+| 2 | `test_replaced_executable_is_an_error_before_launch` (proof: replaced by B with a matching stamp; identical bytes) | exit 0, second launched | exit 4, second not launched, count 0; identical bytes: exit 0 |
+| 2 | `test_reserved_environment_in_the_manifest` | accepted | exit 4, zero invocations |
+| 26 | `test_fail_once_is_final` against a mutant runner that relaunches a failing invocation once (`build/b1-mutant/`) | FAIL `4 != 3` | PASS on the real runner; receipt count 1 = external counter |
+
+Old runner: 19 of 32 PASS, exit 4. Two of the red rows are only the new pair spelling in two existing tests' expected text. New runner: 32 of 32 PASS, exit 0. Battery `Charging` [AC], load 8.6. Timing was not measured here.
+
+**Not done here (outside this bead's files):** case-side phase 2 of finding 2, meaning `large_undo.py`, `navigation.py`, `files.py`, `recovery.py` and the adapter stop re-reading stamps and check `CONTRACT_DIGESTS`. Records are also not required to appear in manifest order; the order is assumed from the case sources, not enforced.

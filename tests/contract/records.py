@@ -7,6 +7,12 @@ harness self-tests) and predicate (string). A FAIL may carry "signature", a stri
 names the observed failure mode exactly; the runner's manifest decides whether that mode is
 a reviewed expected failure. Cases never write XFAIL or XPASS: those are verdicts of the
 runner against expectations.json, never observations. Every other key is case evidence.
+A JSON object with a repeated key is malformed on every stream (records, manifest, stamp).
+
+The runner binds each invocation to the reviewed executables: DIGESTS_ENV holds a JSON
+object {absolute path: sha256 hex} for every executable of the selected target, keyed by
+the path spelling of its placeholder ({exe:NAME}, or {oracle_build} joined with the stamp
+name). expected_digests() reads it; a case hashes the fd it will execute against it.
 
 Exit statuses, one each, the same for every case script, self-test and the runner
 (docs/decisions/v2-he7.16.md): PASS 0, FAIL 3, ERROR 4; the runner alone adds XPASS 5.
@@ -15,6 +21,7 @@ can be read as a result.
 """
 
 import json
+import os
 import sys
 import unittest
 
@@ -50,6 +57,29 @@ def problems(record):
                                   or not record["signature"]):
         found.append("signature is a non-empty string on a FAIL record only")
     return found
+
+
+def unique_object(pairs):
+    """json object_pairs_hook: a repeated key is a ValueError, never last-wins."""
+    found = {}
+    for key, value in pairs:
+        if key in found:
+            raise ValueError(f"duplicate key {key!r}")
+        found[key] = value
+    return found
+
+
+def parse(line):
+    """The record object of one RECORD line (ValueError when it is not one JSON object)."""
+    return json.loads(line[len(PREFIX):], object_pairs_hook=unique_object)
+
+
+DIGESTS_ENV = "CONTRACT_DIGESTS"
+
+
+def expected_digests(environ=os.environ):
+    """The runner's {absolute path: sha256} binding for this invocation; KeyError outside it."""
+    return json.loads(environ[DIGESTS_ENV], object_pairs_hook=unique_object)
 
 
 def emit(record, default=str):

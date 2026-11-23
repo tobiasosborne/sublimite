@@ -2,8 +2,10 @@
 
 --plan names a JSON file {"counter": PATH, "steps": [STEP, ...]}. Every invocation appends
 one line to the counter file first, then plays step min(n, len - 1), where n counts earlier
-invocations: STEP = {"records": [...], "lines": [...], "exit": N, "hang": bool}. A fail-once
-plan is therefore two steps, FAIL then PASS: a rerun would pass.
+invocations: STEP = {"records": [...], "lines": [...], "exit": N, "hang": bool, "write": {PATH:
+TEXT}, "digests": bool}. "write" replaces files before any output (a rebuild between two
+launches); "digests" adds the runner's records.expected_digests() map to every record. A
+fail-once plan is therefore two steps, FAIL then PASS: a rerun would pass.
 """
 
 import argparse
@@ -29,11 +31,16 @@ def main():
         print(args.display or "-", file=log)
     count = len(counter.read_text(encoding="ascii").splitlines())
     step = plan["steps"][min(count - 1, len(plan["steps"]) - 1)]
+    for path, text in step.get("write", {}).items():
+        replacement = Path(path + ".new")
+        replacement.write_text(text, encoding="utf-8")
+        replacement.replace(path)  # atomic, as a rebuild installs its output
+    digests = {"digests": records.expected_digests()} if step.get("digests") else {}
     for line in step.get("lines", ()):
         print(line, flush=True)
     for record in step.get("records", ()):
         # Bypass records.emit's validation: the runner must catch malformed records itself.
-        print(records.PREFIX + json.dumps(record), flush=True)
+        print(records.PREFIX + json.dumps({**record, **digests}), flush=True)
     if step.get("hang"):
         time.sleep(HANG_S)
     return step["exit"]
