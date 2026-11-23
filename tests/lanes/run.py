@@ -314,6 +314,31 @@ def check_lane_runs_every_binary(repo):
     return False
 
 
+def check_archive_drops_removed_member(repo):
+    """A layer archive holds exactly its layer's current objects: when a module source is
+    removed, the next build of the archive must not still contain its member (a stale
+    member links a deleted module's code; advisor, after the Wave 0 gate)."""
+    probe = 'src/scan/archive_probe.c'
+    write(repo, probe, 'int scan_archive_probe(void);\nint scan_archive_probe(void) { return 1; }\n')
+    lib = 'build/case/rel/libtext.a'
+    built = run(repo, lib)
+    first = subprocess.run(['ar', 't', str(repo / lib)], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, check=False)
+    (repo / probe).unlink()
+    rebuilt = run(repo, lib)
+    second = subprocess.run(['ar', 't', str(repo / lib)], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, check=False)
+    if (built.returncode == 0 and 'archive_probe.o' in first.stdout.split()
+            and rebuilt.returncode == 0 and second.returncode == 0
+            and 'archive_probe.o' not in second.stdout.split()):
+        print('archive members: a removed module source leaves the rebuilt archive')
+        return True
+    print(f'archive members: FAIL exits {built.returncode}/{rebuilt.returncode}; '
+          f'members after removal: {second.stdout.split()}')
+    print(built.stdout + rebuilt.stdout, end='')
+    return False
+
+
 UB_SOURCE = """#include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -377,6 +402,7 @@ def main():
         verdicts.append(check_lint_objects(fresh('lint-objects')))
         verdicts.append(check_lane_runs_every_binary(fresh('lane-binaries')))
         verdicts.append(check_ubsan_fatal(fresh('ubsan-fatal')))
+        verdicts.append(check_archive_drops_removed_member(fresh('archive-members')))
     print(f'lane fixtures: {sum(verdicts)}/{len(verdicts)} passed')
     return int(not all(verdicts))
 

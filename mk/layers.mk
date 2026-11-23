@@ -50,12 +50,21 @@ libs_desc = $(foreach l,$(LAYERS_DESC),$(B)/$(1)/$($(l)_LIB))
 lib_of    = $(B)/$(1)/$($(2)_LIB)
 libs_of   = $(foreach l,$(2),$(B)/$(1)/$($(l)_LIB))
 
-# One archive rule per (configuration, layer).
+# One archive rule per (configuration, layer). The archive is rebuilt from
+# scratch whenever its member list changes, not only when a member is newer:
+# a removed module source must leave the archive (else its stale object links
+# into every binary). <archive>.members holds the list and is replaced only
+# when the list differs (tests/lanes/run.py archive-members fixture).
 define LAYER_ARCHIVE
-$(B)/$(1)/$($(2)_LIB): $($(2)_OBJ_$(1))
+$(B)/$(1)/$($(2)_LIB).members: FORCE
+	@mkdir -p $$(@D); printf '%s\n' $($(2)_OBJ_$(1)) > $$@.next; \
+	cmp -s $$@.next $$@ || mv -f $$@.next $$@
+$(B)/$(1)/$($(2)_LIB): $($(2)_OBJ_$(1)) $(B)/$(1)/$($(2)_LIB).members
 	@mkdir -p $$(@D)
-	rm -f $$@; $$(AR) rcs $$@ $$^
+	rm -f $$@; $$(AR) rcs $$@ $$(filter %.o,$$^)
 endef
+.PHONY: FORCE
+FORCE:
 $(foreach c,$(CFGS),$(foreach l,$(LAYERS),$(eval $(call LAYER_ARCHIVE,$(c),$(l)))))
 
 # check-layers: for layers 0-4 an isolated executable pulls EVERY object of the
