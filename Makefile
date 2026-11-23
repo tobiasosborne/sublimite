@@ -156,6 +156,11 @@ check-contract-sandbox:
 check-contract-inspect:
 	python3 -B tests/contract/test_inspect.py
 
+.PHONY: check-contract-files
+check-contract-files: $(B)/xdriver
+	@PYTHONPATH=tests/contract python3 -B -m cases.files \
+	    --oracle "$(ORACLE)" --display "$(CONTRACT_DISPLAY)"
+
 check-lints: check-layout check-includes
 	python3 tools/check_isolation.py
 	python3 -B tests/isolation/run.py --build-dir "$(B)"

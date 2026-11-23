@@ -14,6 +14,7 @@
 | `check_symbols.py` | Audits release archive imports and exports against the module DAG and validates per-module `LDLIBS`. | `make check-symbols` | `check-lints`, `check-module-ldlibs` |
 | `system-symbols.txt` | Exact, reviewed libc and release toolchain imports with a reason for each entry. | Read by `tools/check_symbols.py` | `check-lints` |
 | `tests/contract/xdriver.c` and `xdriver.py` | Persistent XCB/XTest input, selection transfers and ordered inspection markers for the behavioral contract. | `build/xdriver --display :NUMBER` on the runner's authenticated display, or import `XDriver` from `tests/contract/xdriver.py`. | `xdriver`, `check-xdriver` |
+| `tests/contract/cases/files.py` | Stock v1 file contracts for save with Find Results open and binary open/reopen. | `make check-contract-files ORACLE=/absolute/oracle/build/sublimite CONTRACT_DISPLAY=:160` | `check-contract-files` |
 | `check_layout.py` | Validates suite registration, checks the tools registry and forbidden directories, and checks real test/fuzzer dependencies for C implementation includes. | `make check-layout` and `make check-includes` | `check-lints`, suite lanes |
 
 `make check-lints` runs `tests/lint/run.py` for compiler-dependency fixtures and `tests/lanes/run.py` for suite, registry and lint inventory fixtures.
