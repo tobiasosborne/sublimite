@@ -244,3 +244,33 @@ NOT SIGNED (counter-example by symbol, or cut):
 10. **Bulk operations.** Adopt the contiguous batch claim and stable ADD-span undo. In the largest comparison 8,378 slots suffice for the batch versus the discarded claim of 5,734,400 at the old height cap (P, counted shapes above). A detached ORIGINAL subtree cannot meet byte-exact undo after truncation. Remove per-segment path prepayment, split/join and subtree-history tests. Retain the explicitly budgeted whole-range ADD fallback and the Wave 1 line-index regrowth gate.
 
 VERDICT: Adopt the 400 B node/header slot with 24-entry leaves and 16-child branches, synchronous command admission from core-owned page extents, and a checked height limit of 31. Size contiguous bulk edits from actual path copies and splits. Fund stable inverse bytes and the private checkpoint boundary separately. Keep the >32 MiB delete-and-undo exit test. Ready for advisor re-review.
+
+## Advisor review, round 3 (2026-11-23, of 5dd1f61)
+
+SIGNED: 7 (height: checked limit 31, atomic PIECE_ERR_RANGE in both builds, no repacker, reduced-limit fixture plus
+the build/delete counter-example; add: a document refused at the limit is repacked by reopening it, since the open
+builder packs, so the refusal is recoverable without new code); 8 (synchronous admission as a function, no stored
+pool state); 9 (core-owned page extents, 4,096 B per empty tab, process reserve of whole extents); 10(a) (exact
+contiguous batch claim simulated before mutation, 8,378 vs 5,734,400 slots).
+
+NOT SIGNED: 10(b), on one argument. "No split/join in Wave 1" is accepted. "Materialise deleted ORIGINAL bytes into
+ADD at delete time" is not: the truncate-then-undo example proves too much — an in-place truncation also destroys the
+live document's undeleted mapped bytes, for which the guarantee is detection (fault id, identity, PLAN §4.4
+conflict), not preservation. Only in-place modification of a mapped file is at issue (rename-replacements and our own
+saves keep the old inode; small files read at open have an immutable ORIGINAL). Answer, by symbol where v1 is cited:
+(i) what v1 at the pin and PLAN_V2 guarantee for live mapped text after in-place truncation/overwrite; if detection,
+why deleted text deserves more — or name the path that settles it (editor rewriting BASE in place; recovery reading
+deleted bytes after the mapping is gone);
+(ii) cost table for Select All + Delete on a mapped 33,619,968 B / 1 GiB / 10 GiB file under materialisation: bytes
+copied, private memory held and for how long, where the copy runs relative to the input-to-submit guard and G1,
+journal bytes at delete and at undo;
+(iii) the same table for the span-sequence inverse: ORIGINAL (offset, length) and ADD (offset, length) spans; inline
+cap 8 as a small-vector optimisation, longer sequences in a history-owned append-only span store (16 B/span); bytes
+instead of spans exactly when 16 × spans > length; backing change handled uniformly by the same fault id/identity and
+conflict path; journal: forward delete (offset, length), undo as the span sequence with ORIGINAL by BASE reference and
+ADD by value. State what it breaks (piece.h's "deleted bytes preserved in ADD", checkpoint-diff source order, history
+eviction, wire format);
+(iv) recommend from invariants and both tables. A real reason from (i) keeps materialisation with (ii) as acceptance
+(copy off the typing path, stated bound); otherwise the span-sequence inverse is the Wave 1 design and PLAN_V2's
+">32 MiB delete and undo" exit case becomes: delete and undo of a mapped range of any length copies no ORIGINAL byte
+and completes with O(spans) inverse storage. Last round on this document; the choice also goes to Tobias.
