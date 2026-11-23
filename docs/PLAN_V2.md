@@ -194,3 +194,10 @@ Model the four independent axes explicitly under `-Wswitch-enum`:
 - A/B measurements vs v1 (`(M)` stamped with power/load): G1 p50/p99, RSS, binary size, cold start, `make check` duration.
 - **One-way v1→v2 journal import & rollback drill** on a copy of Tobias's live profile (verifying unsaved tabs survive and v1 backup stays untouched).
 - Switch `~/.local/bin/sublimite` to v2 only on Tobias's explicit sign-off after live trial use.
+
+## Product contract: external replacement during an unsaved session (A23)
+
+For a file above the self-contained size, if another program replaces the file and the editor is killed before it has
+written its conflict checkpoint, the unsaved difference can be lost; the conflict is always detected and reported, never
+silently applied to the wrong file.
+

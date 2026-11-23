@@ -267,3 +267,42 @@ comparison (v2 is 0.47 % above it: the 96 B per page a 400 B slot leaves). Re-de
 - The other ten (Q1, Q5, Q7, Q8, Q9, Q10, Q13, Q14, Q15, Q16) accepted as one-liners; each is read again in its
   bead's brief.
 
+## A23. The save protocol: no retention; rules 1–7; T5 is a stated product contract (advisor, 2026-11-23)
+
+Astra's two crash-consistency passes (docs/decisions/wave1-L2-q2-crash-consistency.md, wave1-L2-q2-protocol.md).
+Rules, decided:
+1. No retention of a replaced file: no clone, no retention artifacts, no startup retirement scan of them. os_file_clone
+   goes on v2-0fv.21's deletion list; os_link_at is not built.
+2. The saving buffer: one synced SAVE(PREPARED) record before the rename carries the synced temporary's identity (fd
+   witness) and the journal position of the save snapshot S; recovery picks old replay or replay from S by the target's
+   actual binding.
+3. From the capture of S for a save of generation G, and ever after, a restore by reference from G is journaled by value.
+4. Before a rename replaces G, every other journal-recorded buffer state whose BASE is G, live or closed-but-kept, has a
+   durable self-contained checkpoint (CHECKPOINT_BY_VALUE, synced). Worst case file-sized, paid only when such a state
+   exists.
+5. The same self-contained checkpoint is what a buffer writes when the file owner detects a foreign replacement of its
+   BASE: one mechanism, two triggers.
+6. One buffer per file identity (device and inode) for open, Save As, restore and reopen, through one index; recovery may
+   still produce two drafts of one target (v1 at the pin deliberately does), and those are peers under rule 4.
+7. In-place rewrite of a mapped inode: detected, conflicted, reload into a fresh tree and history; zero bytes copied at
+   detection.
+T1–T4 hold (Astra). T5 (a foreign rename after our rename, then our death before the conflict checkpoint) breaks; ruled
+(b), a stated product contract, with a shrinking rule:
+- Self-contained size: a buffer whose text is at or below a stated size is made self-contained in the journal
+  (CHECKPOINT_BY_VALUE of its text) once it has an acknowledged edit, written off the typing path by the worker; from then
+  on nothing it needs can be replaced by anyone. Only larger buffers stay BASE-relative and carry T5's exposure and the
+  ordinary external-replacement one. The size is derived (measured journal append rate and what a worker may write per
+  checkpoint without delaying other journal work; v1's whole-text versus delta split at the pin cited as evidence), in
+  L2-2's brief. Until that checkpoint is durable the first edits are BASE-relative as designed; the typing path does not
+  change.
+- Contract sentence (PLAN and Tobias): "For a file above the self-contained size, if another program replaces the file
+  and the editor is killed before it has written its conflict checkpoint, the unsaved difference can be lost; the
+  conflict is always detected and reported, never silently applied to the wrong file."
+- Recovery refuses to replay BASE-relative records onto a file whose identity does not match, in every path; L2-2
+  acceptance line with T5 as its test (expect a reported unresolved BASE and the literal bytes the journal does hold
+  offered to the user).
+Consequences: Q2 (retention) answered by rules 1–5; Q4 (ack across a save) by rule 3 (acknowledge an undo from G once its
+by-value group is accepted); Q11 (buffers sharing a path) by rules 4 and 6. L2-3 is ordered preparation, peer
+checkpointing, finish and cancel. L2-2's record set: SJNL preamble + PAD, GENERATION, BASE, TARGET, INSERT, DELETE,
+RESTORE_BASE_RANGE, GROUP_BEGIN/COMMIT, CHECKPOINT_BY_VALUE, SAVE(PREPARED/FINISHED/CANCELLED), VIEW, TABS.
+
