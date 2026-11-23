@@ -235,6 +235,14 @@ $(B)/fuzz/undo_fuzz: $(B)/fuzz/tests/piece_model.o
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
+# Watch and metadata-copy faults are injected beneath os (L2-0a).
+OS_PERSIST_TEST_WRAPS := inotify_init1 inotify_add_watch inotify_rm_watch read fchown fstat \
+                         flistxattr fgetxattr fsetxattr fremovexattr
+LDFLAGS_os_persist_test := $(foreach s,$(OS_PERSIST_TEST_WRAPS),-Wl,--wrap=$(s))
+# The watch fuzzer forges kernel records beneath os (L2-0a): read(2) of the
+# watch descriptor is the input; add and rm_watch are observed, not faked.
+OS_WATCH_FUZZ_WRAPS := read inotify_add_watch inotify_rm_watch
+$(B)/fuzz/os_watch_fuzz: private LDLIBS += $(foreach s,$(OS_WATCH_FUZZ_WRAPS),-Wl,--wrap=$(s))
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	@mkdir -p $(@D)
 	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -pthread $< $(filter %_model.o,$^) $(call libs_desc,fuzz) $(LDLIBS) -o $@

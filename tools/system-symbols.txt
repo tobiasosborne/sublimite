@@ -56,11 +56,16 @@ epoll_ctl              os # add, modify and remove wait set members
 epoll_wait             os # wait set readiness with a deadline
 eventfd                os # Linux event counter descriptor
 fchmod                 os # set file permission bits by descriptor
+fchown                 os # give a replacement file the original owner (os_file_copy_metadata)
 fcntl                  os # query descriptor flags or duplicate with close-on-exec
 fdatasync              os # flush file data and required metadata
 fdopen                 os # stdio transfer of an owned descriptor
 fdopendir              os # open an iterator over a directory descriptor
+fgetxattr              os # read an extended attribute value (os_file_copy_metadata)
+flistxattr             os # list extended attribute names (os_file_copy_metadata)
 flock                  os # advisory file or directory lock
+fremovexattr           os # remove an inherited extended attribute (os_file_copy_metadata)
+fsetxattr              os # set an extended attribute, ACL or label (os_file_copy_metadata)
 fstat                  os # metadata by descriptor
 fstatat                os # directory-relative metadata
 fsync                  os # flush file or directory data and metadata
@@ -73,6 +78,9 @@ getrandom              os # Linux kernel random bytes
 getrlimit              os # current process resource limits
 getsockopt             os # SO_PEERCRED peer user ID of a local stream
 getuid                 os # real user ID for endpoint names and ownership checks
+inotify_add_watch      os # watch a directory for changes (os_watch_add)
+inotify_init1          os # directory-change watch queue, nonblocking and close-on-exec (os_watch_init)
+inotify_rm_watch       os # end a directory watch at its last hold (os_watch_remove)
 ioctl                  os # Linux FICLONE reflink request
 listen                 os # listen on a bound local stream endpoint
 lstat                  os # path metadata without following the final symlink

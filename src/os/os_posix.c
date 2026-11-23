@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
@@ -24,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,7 +48,7 @@ _Static_assert(OS_PATH_MAX == PATH_MAX && OS_NAME_MAX == NAME_MAX + 1u,
 static os_err map_errno(int e)
 {
     switch (e) {
-    case ENOENT: return OS_E_NOENT;
+    case ENOENT: case ENODATA: return OS_E_NOENT;
     case EEXIST: case ENOTEMPTY: case EADDRINUSE: return OS_E_EXIST;
     case EACCES: case EPERM: case EROFS: return OS_E_ACCESS;
     case EBUSY: case ETXTBSY: return OS_E_BUSY;
@@ -61,7 +63,7 @@ static os_err map_errno(int e)
     case EAGAIN: return OS_E_AGAIN;
     case ETIMEDOUT: return OS_E_TIMEDOUT;
     case ENOMEM: return OS_E_NOMEM;
-    case ERANGE: return OS_E_RANGE;
+    case ERANGE: case E2BIG: return OS_E_RANGE;
     case EINTR: return OS_E_INTR;
     case ECONNREFUSED: return OS_E_REFUSED;
     default: return OS_E_IO;
@@ -78,7 +80,7 @@ const char *os_err_name(os_err e)
         "OS_OK", "OS_E_NOENT", "OS_E_EXIST", "OS_E_ACCESS", "OS_E_BUSY", "OS_E_LOOP",
         "OS_E_NOTDIR", "OS_E_ISDIR", "OS_E_XDEV", "OS_E_NOSPC", "OS_E_NAMETOOLONG",
         "OS_E_INVAL", "OS_E_NOTSUP", "OS_E_AGAIN", "OS_E_TIMEDOUT", "OS_E_NOMEM",
-        "OS_E_RANGE", "OS_E_IO", "OS_E_INTR", "OS_E_REFUSED"};
+        "OS_E_RANGE", "OS_E_IO", "OS_E_INTR", "OS_E_REFUSED", "OS_E_OVERFLOW"};
     unsigned i = (unsigned)e;
     return i < sizeof names / sizeof names[0] ? names[i] : "OS_E_?";
 }
@@ -1538,3 +1540,211 @@ os_err os_waitset_wait(os_waitset *ws, uint64_t deadline_ns, os_wait_event *ev,
     }
 }
 int os_waitset_fd(const os_waitset *ws) { return ws->fd; }
+
+/* ---- directory-change watch (L2-0a, docs/decisions/L2-0a.md) ----------- */
+/* v1's mask (v1 file_posix.c:64-65): an entry's contents, metadata and name,
+ * and the directory's own end. A writer's close counts as a modification
+ * because a write through a shared mapping raises no IN_MODIFY. */
+#define WATCH_MASK (IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | \
+                    IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF)
+_Static_assert(OS_WATCH_BUF >= sizeof(struct inotify_event) + NAME_MAX + 1,
+               "the read buffer must hold one maximal record (inotify(7))");
+_Static_assert(OS_WATCH_BUF <= UINT32_MAX, "the cursor is 32-bit");
+
+os_err os_watch_init(os_watch *w, os_watch_slot *slots, uint32_t cap)
+{
+    ASSERT(slots && cap > 0);
+    w->fd = -1;
+    w->slots = slots;
+    w->cap = cap;
+    w->at = w->len = 0;
+    for (uint32_t i = 0; i < cap; i++) {
+        slots[i].wd = -1;
+        slots[i].holds = 0;
+    }
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd < 0) return fail();
+    w->fd = fd;
+    return OS_OK;
+}
+void os_watch_close(os_watch *w)
+{
+    /* Closing the queue ends every kernel watch on it. */
+    if (w->fd >= 0) close_quiet(w->fd);
+    w->fd = -1;
+    w->at = w->len = 0;
+}
+int os_watch_fd(const os_watch *w) { return w->fd; }
+
+/* The held slot whose live kernel watch is wd, or cap. An ended slot's -1
+ * is no wd: a record carrying -1 is no live watch's (found by
+ * fuzz/os_watch_fuzz.c, seed ended_then_wd_minus_one). */
+static uint32_t watch_slot(const os_watch *w, int wd)
+{
+    if (wd < 0) return w->cap;
+    for (uint32_t i = 0; i < w->cap; i++)
+        if (w->slots[i].holds && w->slots[i].wd == wd) return i;
+    return w->cap;
+}
+os_err os_watch_add(os_watch *w, const char *path, os_watch_id *id)
+{
+    ASSERT(w->fd >= 0 && path && id);
+    int wd;
+    RETRY(wd, inotify_add_watch(w->fd, path, WATCH_MASK | IN_ONLYDIR));
+    if (wd < 0) return fail();
+    /* (P) The kernel returns the existing wd for an inode already watched
+     * on this queue (inotify_update_existing_watch), so a match is one more
+     * hold on the same kernel watch. */
+    uint32_t held = watch_slot(w, wd);
+    if (held < w->cap) {
+        if (w->slots[held].holds == UINT32_MAX) return fail_with(OS_E_NOSPC);
+        w->slots[held].holds++;
+        *id = held;
+        return OS_OK;
+    }
+    for (uint32_t i = 0; i < w->cap; i++)
+        if (!w->slots[i].holds) {
+            w->slots[i].wd = wd;
+            w->slots[i].holds = 1;
+            *id = i;
+            return OS_OK;
+        }
+    /* No slot: withdraw the watch just made. Its end record matches no
+     * slot and is discarded by the read. */
+    (void)inotify_rm_watch(w->fd, wd);
+    return fail_with(OS_E_NOSPC);
+}
+void os_watch_remove(os_watch *w, os_watch_id id)
+{
+    ASSERT(id < w->cap && w->slots[id].holds > 0);
+    if (--w->slots[id].holds) return;
+    int wd = w->slots[id].wd;
+    w->slots[id].wd = -1;
+    /* An ended watch (wd -1) is already gone from the kernel. A failed
+     * removal leaves the holder nothing to do: the slot is free and late
+     * records match no slot. */
+    if (wd >= 0 && w->fd >= 0) {
+        int e = errno;
+        (void)inotify_rm_watch(w->fd, wd);
+        errno = e;
+    }
+}
+/* (P) Every record carries one event bit, plus the IN_ISDIR, IN_UNMOUNT,
+ * IN_IGNORED and IN_Q_OVERFLOW flags (inotify(7)). False: no bit we asked for. */
+static bool watch_what(uint32_t mask, os_watch_what *what)
+{
+    if (mask & (IN_UNMOUNT | IN_DELETE | IN_DELETE_SELF)) *what = OS_WATCH_DELETE;
+    else if (mask & IN_CREATE) *what = OS_WATCH_CREATE;
+    else if (mask & (IN_MOVED_FROM | IN_MOVE_SELF)) *what = OS_WATCH_MOVED_OUT;
+    else if (mask & IN_MOVED_TO) *what = OS_WATCH_MOVED_IN;
+    else if (mask & (IN_MODIFY | IN_CLOSE_WRITE)) *what = OS_WATCH_MODIFY;
+    else if (mask & IN_ATTRIB) *what = OS_WATCH_ATTRIB;
+    else return false;
+    return true;
+}
+os_err os_watch_read(os_watch *w, os_watch_event *ev, size_t cap, size_t *n)
+{
+    ASSERT(w->fd >= 0 && ev && cap > 0 && n);
+    *n = 0;
+    if (w->at == w->len) {
+        w->at = w->len = 0;
+        ssize_t r;
+        RETRY(r, read(w->fd, w->buf, sizeof w->buf));
+        if (r < 0) return fail();
+        /* (P) A nonblocking inotify read returns records or EAGAIN, never 0. */
+        if (r == 0) return fail_with(OS_E_IO);
+        w->len = (uint32_t)r;
+    }
+    while (w->at < w->len && *n < cap) {
+        struct inotify_event h;
+        size_t left = w->len - w->at;
+        if (left < sizeof h) break;
+        memcpy(&h, w->buf + w->at, sizeof h);
+        const char *name = (const char *)w->buf + w->at + sizeof h;
+        /* The kernel NUL-pads a nonempty name (inotify(7)). */
+        if (h.len > left - sizeof h || (h.len && strnlen(name, h.len) == h.len)) {
+            w->at = w->len = 0;
+            return fail_with(OS_E_IO);
+        }
+        w->at += (uint32_t)(sizeof h + h.len);
+        if (h.mask & IN_Q_OVERFLOW) return fail_with(OS_E_OVERFLOW);
+        uint32_t i = watch_slot(w, h.wd);
+        os_watch_what what = OS_WATCH_ENDED;
+        if (i == w->cap) continue; /* a removed watch's late record */
+        if (h.mask & IN_IGNORED) w->slots[i].wd = -1; /* holds stay until removed */
+        else if (!watch_what(h.mask, &what)) continue;
+        ev[*n].id = i;
+        ev[*n].what = what;
+        ev[*n].name = h.len && !(h.mask & IN_UNMOUNT) ? name : "";
+        (*n)++;
+    }
+    if (w->at < w->len && *n < cap) {
+        /* A partial header is a malformed read. */
+        w->at = w->len = 0;
+        return fail_with(OS_E_IO);
+    }
+    return OS_OK;
+}
+
+/* ---- metadata copy (L2-0a, docs/decisions/L2-0a.md) ----------------------- */
+_Static_assert(OS_XATTR_MAX == XATTR_LIST_MAX && OS_XATTR_MAX == XATTR_SIZE_MAX,
+               "the scratch buffers are the kernel's xattr list and value limits");
+_Static_assert(sizeof(os_xattr_scratch) == 3u * OS_XATTR_MAX, "three buffers, no padding");
+/* fd's xattr names into buf. An unsupported descriptor has the empty set. */
+static os_err xattr_names(int fd, char *buf, size_t *len)
+{
+    ssize_t r;
+    *len = 0;
+    RETRY(r, flistxattr(fd, buf, OS_XATTR_MAX));
+    if (r < 0) return errno == EOPNOTSUPP ? OS_OK : fail();
+    /* (P) The kernel never returns more than the buffer it was given. */
+    if (r > 0 && buf[r - 1] != '\0') return fail_with(OS_E_IO);
+    *len = (size_t)r;
+    return OS_OK;
+}
+static bool xattr_listed(const char *list, size_t len, const char *name)
+{
+    for (size_t at = 0; at < len; at += strlen(list + at) + 1)
+        if (strcmp(list + at, name) == 0) return true;
+    return false;
+}
+os_err os_file_copy_metadata(os_file *dst, const os_file *src, os_xattr_scratch *x)
+{
+    ASSERT(dst && src && x && dst->fd >= 0 && src->fd >= 0);
+    struct stat s, d;
+    int rc;
+    RETRY(rc, fstat(src->fd, &s));
+    if (rc != 0) return fail();
+    RETRY(rc, fstat(dst->fd, &d));
+    if (rc != 0) return fail();
+    if (s.st_uid != d.st_uid || s.st_gid != d.st_gid) {
+        RETRY(rc, fchown(dst->fd, s.st_uid, s.st_gid));
+        if (rc != 0) return fail();
+    }
+    size_t sn, dn;
+    os_err e = xattr_names(src->fd, x->names, &sn);
+    if (e == OS_OK) e = xattr_names(dst->fd, x->a, &dn);
+    if (e != OS_OK) return e;
+    for (size_t at = 0; at < dn; at += strlen(x->a + at) + 1) {
+        if (xattr_listed(x->names, sn, x->a + at)) continue;
+        RETRY(rc, fremovexattr(dst->fd, x->a + at));
+        if (rc != 0) return fail();
+    }
+    /* x->a is free from here: it holds each source value. */
+    for (size_t at = 0; at < sn; at += strlen(x->names + at) + 1) {
+        const char *name = x->names + at;
+        ssize_t vn, cn;
+        RETRY(vn, fgetxattr(src->fd, name, x->a, OS_XATTR_MAX));
+        if (vn < 0) return fail();
+        RETRY(rc, fsetxattr(dst->fd, name, x->a, (size_t)vn, 0));
+        if (rc == 0) continue;
+        /* A label this process may not set but dst already holds exactly
+         * (v1 file_posix.c:244-252): copied without a write. */
+        int set_errno = errno;
+        RETRY(cn, fgetxattr(dst->fd, name, x->b, OS_XATTR_MAX));
+        if (cn == vn && memcmp(x->a, x->b, (size_t)vn) == 0) continue;
+        errno = set_errno;
+        return fail();
+    }
+    return OS_OK;
+}

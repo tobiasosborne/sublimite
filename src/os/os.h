@@ -47,7 +47,8 @@ typedef enum os_err {
     OS_E_RANGE,
     OS_E_IO,
     OS_E_INTR,
-    OS_E_REFUSED /* A local stream name exists with no listener (stale socket). */
+    OS_E_REFUSED, /* A local stream name exists with no listener (stale socket). */
+    OS_E_OVERFLOW /* A kernel event queue overflowed and events were lost (os_watch_read). */
 } os_err;
 
 const char *os_err_name(os_err e);
@@ -482,6 +483,109 @@ os_err os_waitset_alarm(os_waitset *ws, uint64_t deadline_ns);
 os_err os_waitset_wait(os_waitset *ws, uint64_t deadline_ns, os_wait_event *ev,
                        size_t cap, size_t *n);
 int os_waitset_fd(const os_waitset *ws); /* Borrowed: nest in an outer set. */
+
+/* ---- directory-change watch (L2-0a, docs/decisions/L2-0a.md) ----
+ * One kernel watch queue, owned by its caller (no global). A watched
+ * directory reports changes to its entries and to itself, so watching a
+ * file's parent covers the file and the parent. Event names are entry names;
+ * an empty name is the directory itself. The watch reports, it does not
+ * filter: a holder compares names. One thread owns a watch. Its descriptor is
+ * nonblocking and close-on-exec. No call allocates.
+ *
+ * Holds are counted: adding a directory that is already watched (the same
+ * inode, by any path) returns the same id and one more hold, and the kernel
+ * watch ends only when the last hold is removed, so one holder's removal
+ * never silences another's. The hold table is caller storage given at init;
+ * its size is the caller's derivation. */
+typedef uint32_t os_watch_id;
+typedef struct os_watch_slot { int wd; uint32_t holds; } os_watch_slot; /* Private. */
+/* (P) A queued kernel record is a 16-byte header plus a NUL-padded name of
+ * at most NAME_MAX + 1 bytes (inotify(7)), so 272 bytes hold any one record.
+ * (G) 4096 bytes is v1's read buffer (v1 file_posix.c:96), inherited: it
+ * bounds the records one read takes, not correctness. */
+#define OS_WATCH_BUF 4096u
+typedef struct os_watch {
+    int fd;
+    os_watch_slot *slots;
+    uint32_t cap, at, len;
+    _Alignas(8) unsigned char buf[OS_WATCH_BUF];
+} os_watch;
+#define OS_WATCH_INIT { .fd = -1 }
+
+typedef enum os_watch_what {
+    OS_WATCH_CREATE = 1, /* A name was created in the directory. */
+    OS_WATCH_DELETE,     /* A name was removed; "": the directory was removed or unmounted. */
+    OS_WATCH_MOVED_OUT,  /* A name was renamed away; "": the directory itself moved. */
+    OS_WATCH_MOVED_IN,   /* A name was renamed into the directory, maybe over another. */
+    OS_WATCH_MODIFY,     /* An entry's contents changed, or a writer closed it. */
+    OS_WATCH_ATTRIB,     /* Metadata of an entry, or with "" of the directory, changed. */
+    OS_WATCH_ENDED       /* The kernel dropped this watch: it reports nothing more.
+                          * The holds stay until removed; add the path again to resume. */
+} os_watch_what;
+/* name is borrowed until the next os_watch_read or os_watch_close. */
+typedef struct os_watch_event {
+    os_watch_id id;
+    os_watch_what what;
+    const char *name;
+} os_watch_event;
+
+/* slots[0, cap) is borrowed until close; cap > 0. */
+os_err os_watch_init(os_watch *w, os_watch_slot *slots, uint32_t cap);
+void os_watch_close(os_watch *w); /* Idempotent for an initialized handle. */
+int os_watch_fd(const os_watch *w); /* Borrowed: os_waitset_add with OS_WAIT_IN. */
+/* Watches the directory at path (symlinks followed). OS_E_NOTDIR: not a
+ * directory. OS_E_NOSPC: the kernel's per-user watch limit, or no free slot
+ * for a directory not yet held (the new kernel watch is then withdrawn). */
+os_err os_watch_add(os_watch *w, const char *path, os_watch_id *id);
+/* Drops one hold of a held id; the last one ends the kernel watch, and
+ * events still queued for it are discarded. */
+void os_watch_remove(os_watch *w, os_watch_id id);
+/* Fills up to cap events, making at most one read(2), and never waits.
+ *   OS_OK with *n < cap: nothing undelivered is left in the object; the
+ *     descriptor's readiness covers what the kernel still queues.
+ *   OS_OK with *n == cap: more may be held here: call again before waiting.
+ *   OS_E_AGAIN: nothing pending (*n == 0).
+ *   OS_E_OVERFLOW: the kernel queue overflowed, so changes after the *n
+ *     delivered events were lost: recheck every watched name, and call again
+ *     before waiting, as events after the overflow may follow.
+ *   OS_E_IO: a malformed record (native error 0), or the read's own error;
+ *     the *n events before it stand, and the object is drained. */
+os_err os_watch_read(os_watch *w, os_watch_event *ev, size_t cap, size_t *n);
+
+/* ---- metadata copy (L2-0a, docs/decisions/L2-0a.md) ----
+ * Gives dst src's owner and src's whole extended-attribute set: every name
+ * the process can list, ACLs (system.posix_acl_*) and security labels
+ * included, with no namespace allowlist. In order:
+ *   1. Owner: fchown dst to src's uid and gid, only when they differ (an
+ *      unchanged owner needs no privilege). It precedes the xattrs because a
+ *      change of owner clears security.capability.
+ *   2. Names on dst absent on src are removed (inherited ones, e.g. from a
+ *      default ACL).
+ *   3. Each src name is set on dst. A set that fails where dst already holds
+ *      the identical value counts as copied (an immutable label that already
+ *      matches); a different value returns the set's error.
+ * When neither descriptor supports xattrs there is no state to copy; when
+ * only one does, OS_E_NOTSUP. Every refusal is the failing call's error
+ * (OS_E_ACCESS, OS_E_NOTSUP, OS_E_RANGE for a list or value past the kernel
+ * limit, OS_E_NOENT for a name removed from src meanwhile, OS_E_NOSPC, ...);
+ * a malformed name list is OS_E_IO with native error 0. On failure dst's
+ * metadata is partly copied: the caller discards dst. Never allocates: the
+ * caller lends the scratch, which holds no state between calls. */
+/* (P) The kernel caps a name list at XATTR_LIST_MAX and a value at
+ * XATTR_SIZE_MAX, both 65536 bytes (include/uapi/linux/limits.h; E2BIG past
+ * them, fs/xattr.c listxattr/getxattr); os_posix.c asserts both equal
+ * OS_XATTR_MAX at compile time. A buffer of that size takes any list or value
+ * in one call, with no size probe. The copy needs three at once: src's list
+ * for the whole call, dst's list (then each src value, once the removals are
+ * done), and dst's value for the matching-label comparison. So the scratch is
+ * (P) 3 x 65536 B = 196608 B = 192 KiB. */
+#define OS_XATTR_MAX 65536u
+typedef struct os_xattr_scratch {
+    char names[OS_XATTR_MAX];          /* src's name list */
+    char a[OS_XATTR_MAX];              /* dst's name list, then src's value */
+    char b[OS_XATTR_MAX];              /* dst's current value */
+} os_xattr_scratch;
+os_err os_file_copy_metadata(os_file *dst, const os_file *src, os_xattr_scratch *scratch);
 
 /* Startup only. Raise the soft RLIMIT_NOFILE to the hard limit. Never lowers
  * it. If getrlimit succeeded, *soft (optional) receives the limit in force. */
