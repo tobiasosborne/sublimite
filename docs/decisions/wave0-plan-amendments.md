@@ -79,3 +79,12 @@ Observed in W0.6h's red run on the pinned build: while a file is still opening, 
 back and the save silently does nothing (`editor.c:1064–1086`, `session.c:591`). v2 contract: input events are
 applied in the order sent, including across an in-progress open. The contract navigation bead (v2-he7.12) carries
 the case once the snapshot adapter exists; no case is added now.
+
+## A10. §6 wave order: L0/L1 harvest starts once the scaffold blockers are closed
+
+Advisor, 2026-11-23 10:10 (Tobias: "so are we working on v2 at all or what?"). The Wave 0 gate exists so behaviour
+is specified before it is built. L0 (os, base, trace, work, ipc) and L1 have no behaviour the contract suite
+specifies; their acceptance is their own unit suites, the linters and the lanes, and every scaffold finding that
+blocked Wave 1 is closed (W0.3a/b/c, W0.4). New order: **L0 and L1 harvest beads may start once the scaffold
+blockers are closed; L2 and minimal-L5 beads, and the Wave 1 exit, wait for the Wave 0 gate.** Wave 0 continues
+in parallel and is still declared passed only by its gate.

@@ -168,6 +168,7 @@ Model the four independent axes explicitly under `-Wswitch-enum`:
   - Records explicit expected-failure specs for known v1 bugs that v2 must pass (post-rename save conflict, `LINEIDX_EDIT_MAX_CHUNKS` >32 MiB delete+undo). Wayland clipboard copy is green on v1 since `73beeb4` (mock-verified; real check in Wave 2); the 17-leaf `piece` root collapse is not reproduced (docs/decisions/wave0-plan-amendments.md).
 
 ### Wave 1 — Walking Skeleton Vertical Slice #1 (Headless Crash-Safe Editor)
+- **Order (amended A10):** `L0`/`L1` harvest beads start once the Wave 0 scaffold blockers are closed; `L2`, minimal `L5` and the Wave 1 exit wait for the Wave 0 gate (docs/decisions/wave0-plan-amendments.md A10).
 - Land `L0 libcore.a` (including generation-validated `os_fault` ids & namespaced `ipc`), `L1 libtext.a` (`scan`, `utf8`, `indent`, `piece`, `undo`, `lineidx`), `L2 libpersist.a` (`file`, `journal`, orthogonal `savectl`, and the real **`edit`** kernel), and minimal non-reentrant `L5 src/app/` (`app_loop`, `app_buffers`, `app_save`, `app_session`).
 - **Wave 1 Exit Gate (real running headless editor!):**
   - Open file → edit via production `L2 edit` under **live release malloc guard** (`active && count == 0`) → save while typing continues → post-rename foreign-file conflict test → `SIGKILL` at every save step + failed fsync/dirsync → restart and verify exact pre-ack/post-ack recovery oracle.
