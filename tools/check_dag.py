@@ -36,10 +36,8 @@ INTRA_RULES = [
     "app < main",
 ]
 MAIN_LAYER = 5
-FORBIDDEN = {            # includer module -> modules it must never include
-    'app': ('x11', 'wayland', 'gl', 'raster'),
-    'main': ('x11', 'wayland', 'gl', 'raster'),
-}
+# The modules L5 (app and main) may never reach; check_symbols.py shares it.
+L5_BACKENDS = ('x11', 'wayland', 'gl', 'raster')
 EXTS = ('.c', '.h', '.inc')
 MAKE_WORD = re.compile(r'(?:\\[ \t#]|[^\s])+')
 MAKE_ESCAPE = re.compile(r'\\([ \t#])|\$\$')
@@ -60,50 +58,56 @@ def read_layers(root, assignments):
         except OSError as err:
             fail_config(str(err))
         assignments = result.stdout.split()
+    try:
+        return parse_layers(assignments)
+    except ValueError as err:
+        fail_config(err)
 
+
+def parse_layers(assignments):
+    """{module: layer} from L<n>:<module> words, plus the implicit main in L5.
+
+    The one module map for check_dag.py and check_symbols.py."""
     layer_of = {}
     for assignment in assignments:
         m = re.fullmatch(r'L([0-5]):([^:\s]+)', assignment)
         if not m:
-            fail_config('invalid layer assignment %r' % assignment)
+            raise ValueError('invalid layer assignment %r' % assignment)
         n, mod = m.groups()
         if mod in layer_of:
-            fail_config('module %s listed in two layers' % mod)
+            raise ValueError('module %s listed in two layers' % mod)
         layer_of[mod] = int(n)
     if not layer_of:
-        fail_config('no module assignments from mk/layers.mk')
+        raise ValueError('no module assignments from mk/layers.mk')
     if 'main' in layer_of:
-        fail_config('"main" is implicit (src/main.c); do not list it in layers.mk')
+        raise ValueError('"main" is implicit (src/main.c); do not list it in layers.mk')
     layer_of['main'] = MAIN_LAYER
     return layer_of
 
 
-def build_order(layer_of):
-    """Transitive closure of INTRA_RULES: set of (lower, upper)."""
+def build_order(layer_of, rules=INTRA_RULES):
+    """Transitive closure of the intra-layer rules: set of (lower, upper)."""
     lt = set()
-    for rule in INTRA_RULES:
+    for rule in rules:
         groups = [[x.strip() for x in g.split(',')] for g in rule.split('<')]
         for lo, hi in zip(groups, groups[1:]):
             for a in lo:
                 for b in hi:
                     for x in (a, b):
                         if x not in layer_of:
-                            fail_config('rule "%s": unknown module %s' % (rule, x))
+                            raise ValueError('rule "%s": unknown module %s' % (rule, x))
                     if layer_of[a] != layer_of[b]:
-                        fail_config('rule "%s": %s (L%d) and %s (L%d) are in different layers'
-                                    % (rule, a, layer_of[a], b, layer_of[b]))
+                        raise ValueError('rule "%s": %s (L%d) and %s (L%d) are in different layers'
+                                         % (rule, a, layer_of[a], b, layer_of[b]))
                     lt.add((a, b))
-    changed = True
-    while changed:
-        changed = False
-        for a, b in list(lt):
-            for c, d in list(lt):
-                if b == c and (a, d) not in lt:
-                    lt.add((a, d))
-                    changed = True
+    while True:
+        closure = lt | {(a, d) for a, b in lt for c, d in lt if b == c}
+        if closure == lt:
+            break
+        lt = closure
     for a, b in lt:
         if a == b:
-            fail_config('cycle through %s in INTRA_RULES' % a)
+            raise ValueError('cycle through %s in the intra-layer rules' % a)
     return lt
 
 
@@ -163,7 +167,10 @@ def main():
     root = args.root.resolve()
     src = root / 'src'
     layer_of = read_layers(root, args.layers)
-    lt = build_order(layer_of)
+    try:
+        lt = build_order(layer_of)
+    except ValueError as err:
+        fail_config(err)
 
     errors = []
     nfiles = nedges = 0
@@ -199,7 +206,7 @@ def main():
                 continue
             nedges += 1
             who = f'{me} (L{layer_of[me]}) reaches "src/{inc}" ({other}, L{layer_of[other]})'
-            if other in FORBIDDEN.get(me, ()):
+            if layer_of[me] == MAIN_LAYER and other in L5_BACKENDS:
                 errors.append(f'{where} [forbidden] {who}: L5 may not reach backend headers')
             elif layer_of[other] > layer_of[me]:
                 errors.append(f'{where} [inter-layer] {who}: upward include')

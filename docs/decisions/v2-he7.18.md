@@ -51,3 +51,14 @@ other compiler configurations remain outside its scope. The archive
 manifest relies on Make and `ar` preserving member order. The LDLIBS rule
 assumes Make's compiler and system library search environment and a stable
 checkout during the build.
+
+## W0.7-B7 (2026-11-23): one module map and closure
+
+Finding 22 of `docs/reviews/wave0-code-astra.md`. `check_symbols.py` now imports
+`parse_layers` (the `L<n>:<module>` map with the implicit `main` in L5),
+`build_order` (the transitive intra-layer closure, given `vendor_ts < hl` as one
+extra rule) and `L5_BACKENDS` from `check_dag.py`. It no longer keeps its own
+copies. Make passes `$(LAYER_MODULES)` from `mk/layers.mk` and has no second
+`symbol_modules` expansion. Include evidence (`.d` files) and link evidence (`nm`)
+stay separate checks. The symbol fixture `ldlibs` still requires the complete
+`[inter-layer]` line for an upward call with no header.

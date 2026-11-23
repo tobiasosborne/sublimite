@@ -213,3 +213,16 @@ build/rel/tests/symbols/restricted/layer1.a(src/piece/piece.o): error: [restrict
 build/rel/tests/symbols/restricted/layer5.a(src/app/app.o): error: [restricted] app imports malloc, granted only to hl
 error: [input] tests/symbols/config/unknown_module.txt:2: read is granted to unknown module 'nosuchmod'
 ```
+
+## W0.7-B7 (2026-11-23): fixture verdicts are complete lines
+
+Finding 18 of `docs/reviews/wave0-code-astra.md`. Each rejected case in
+`tests/symbols/run.py` lists every error line that the checker must print,
+including the object, tag and token. Both weak kinds and each LDLIBS token are
+checked as separate lines. An accepted case names the imports each object must
+make. The previous union over all objects accepted `calloc` as a `lib.o` import
+in `vendor`, although it is made only by `scanner.o`. It also kept `granted` green
+after the vendor object stopped importing `fdopen`. `tests/isolation/run.py`
+binds each spelling to its line and reason and pairs it with a legal near neighbour.
+The previous filename-only match passed 23/23 against a checker that rejected
+every nonempty source.

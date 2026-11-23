@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import IntEnum, IntFlag
-from struct import Struct, error as StructError
+from struct import Struct
 from typing import Optional
 
 
@@ -330,24 +330,6 @@ class _Reader:
         return value
 
 
-class _Writer:
-    def __init__(self):
-        self.data = bytearray()
-
-    def write(self, data):
-        _require(len(data) <= U32_MAX - len(self.data), "payload length exceeds a wire word")
-        self.data.extend(data)
-
-    def fields(self, layout, *values):
-        try:
-            self.write(layout.pack(*values))
-        except StructError as exc:
-            raise ProtocolError("field does not fit its wire type") from exc
-
-    def rect(self, rect):
-        self.fields(RECT, rect.x, rect.y, rect.width, rect.height)
-
-
 def _validate_rect(rect, bounds, name):
     _require(all(_u32(value) for value in (rect.x, rect.y, rect.width, rect.height))
              and bounds.contains(rect), f"{name} rectangle outside its bounds")
@@ -496,51 +478,6 @@ def decode_payload(data):
         _validate_snapshot(snapshot)
         _require(reader.offset == len(view), "trailing bytes after the snapshot")
     return snapshot
-
-
-def _write_frame(writer, frame):
-    _validate_geometry(frame)
-    _validate_sections(frame)
-    writer.fields(FRAME_SIZES, frame.witness, frame.submit_serial, frame.window_width,
-                  frame.window_height, frame.columns, frame.rows, frame.cell_width, frame.cell_height)
-    writer.rect(frame.document)
-    writer.fields(SCROLL, frame.scroll_q8)
-    writer.rect(frame.scroll_rect)
-    sections = frame.provided_sections
-    writer.fields(FRAME_TAIL, frame.extra_rows, sections)
-    if sections & Section.CELLS:
-        writer.fields(WORD, len(frame.cells))
-        for cell in frame.cells:
-            try:
-                text = cell.text.encode("utf-8")
-            except UnicodeError as exc:
-                raise ProtocolError("invalid UTF-8 in cell string") from exc
-            writer.fields(CELL_HEADER, cell.kind, cell.attributes, cell.foreground, cell.background, len(text))
-            writer.write(text)
-    if sections & Section.TABS:
-        writer.fields(WORD, len(frame.tabs))
-        for tab in frame.tabs:
-            writer.rect(tab.rect)
-            writer.fields(WORD, tab.active)
-    if sections & Section.BOTTOM_ROW:
-        writer.rect(frame.bottom_row)
-    if sections & Section.MINIMAP:
-        minimap = frame.minimap
-        writer.rect(minimap.region)
-        writer.rect(minimap.box)
-        writer.fields(WORD, len(minimap.ink_intervals))
-        for interval in minimap.ink_intervals:
-            writer.fields(INTERVAL, *interval)
-
-
-def encode_payload(snapshot):
-    """Encode an observation for protocol conformance tests."""
-    _validate_snapshot(snapshot)
-    writer = _Writer()
-    writer.fields(WORD, len(snapshot.frames))
-    for frame in snapshot.frames:
-        _write_frame(writer, frame)
-    return bytes(writer.data)
 
 
 def decode_reply(packet, mapping, request, *, after_serial=0, require_first_action=False):

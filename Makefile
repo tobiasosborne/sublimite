@@ -294,26 +294,23 @@ check-suites:
 # The include lints use the .d files emitted when compiling these objects.
 check-includes: $(LINT_OBJS)
 	python3 tools/check_dag.py --build-dir "$(B)" --layers $(LAYER_MODULES)
-	python3 tools/check_layout.py includes --build-dir "$(B)" --tests $(LINT_TEST_SRCS) --fuzz $(LINT_FUZZ_SRCS)
+	python3 tools/check_no_c_includes.py --build-dir "$(B)" --tests $(LINT_TEST_SRCS) --fuzz $(LINT_FUZZ_SRCS)
 
-run_test_binaries = for t in $(1); do echo "== $$t"; $(RUN)"$$t"; n=$$((n+1)); done
-assert_suite_count = if [ "$$n" -ne "$(words $(1))" ]; then \
-	echo "$@: FAIL ran $$n of $(words $(1)) declared suites"; exit 1; fi
+# set -e: the first failing binary fails the lane; check-suites is the inventory.
+run_test_binaries = set -e; for t in $(1); do echo "== $$t"; $(RUN)"$$t"; done
 
 # Isolated --whole-archive link per layer against lower archives only, then run.
 check-layers: check-suites $(LAYER_TEST_BINS) $(LAYER_L5_BIN)
-	@set -e; n=0; $(call run_test_binaries,$(LAYER_TEST_BINS) $(LAYER_L5_BIN)); \
-	$(call assert_suite_count,$(LAYER_SUITES) src/main.c); \
-	echo "check-layers: $$n isolated layer links passed (L0-L4 tests, L5 via main.o)"
+	@$(call run_test_binaries,$(LAYER_TEST_BINS) $(LAYER_L5_BIN)); \
+	echo "check-layers: $(words $(LAYER_TEST_BINS) $(LAYER_L5_BIN)) isolated layer links passed (L0-L4 tests, L5 via main.o)"
 
 # Link-level module DAG. Use the same member order as the archive recipes.
-symbol_modules := $(foreach l,$(LAYERS),$(foreach m,$($(l)_MODS),$(l):$(m)))
 symbol_layer_libs := $(foreach l,$(LAYERS),$($(l)_LIB))
 
 .PHONY: check-symbols check-module-ldlibs
 check-lints: check-symbols
 check-symbols: $(call libs_desc,rel) $(B)/rel/src/main.o
-	python3 tools/check_symbols.py --nm '$(or $(NM),nm)' --module-map $(symbol_modules) \
+	python3 tools/check_symbols.py --nm '$(or $(NM),nm)' --module-map $(LAYER_MODULES) \
 	    --layer-libs $(symbol_layer_libs) --main $(B)/rel/src/main.o \
 	    $(foreach l,$(LAYERS),--archive $(patsubst L%,%,$(l)) $(call lib_of,rel,$(l)) \
 	        $(patsubst $(B)/rel/%,%,$($(l)_OBJ_rel)))
@@ -325,30 +322,27 @@ check-module-ldlibs:
 
 # ASan + UBSan over the registered sanitizer suites (layer tests included).
 check-san: check-suites $(TEST_SAN)
-	@set -e; n=0; $(call run_test_binaries,$(TEST_SAN)); \
-	$(call assert_suite_count,$(SAN_SUITES)); echo "$@: $$n test binaries passed"
+	@$(call run_test_binaries,$(TEST_SAN)); echo "$@: $(words $(TEST_SAN)) test binaries passed"
 
 # The release base suite proves interposition with a deliberate allocation
 # and requires a live guard with a zero count for every Law-2 window.
 check-law2: check-suites $(TEST_LAW2)
-	@set -e; n=0; $(call run_test_binaries,$(TEST_LAW2)); \
-	$(call assert_suite_count,$(LAW2_SUITES)); echo "$@: $$n release suites passed"
+	@$(call run_test_binaries,$(TEST_LAW2)); echo "$@: $(words $(TEST_LAW2)) release suites passed"
 
 # TSan is a wave-end / per-touched-module gate.
 check-tsan: check-suites $(TEST_TSAN)
-	@set -e; n=0; $(call run_test_binaries,$(TEST_TSAN)); \
-	$(call assert_suite_count,$(TSAN_SUITES)); echo "$@: $$n threaded suites passed"
+	@$(call run_test_binaries,$(TEST_TSAN)); echo "$@: $(words $(TEST_TSAN)) threaded suites passed"
 
 fuzz: check-suites $(FUZZ_BIN)
 	@echo "$@: $(words $(FUZZ_BIN)) fuzzers built"
 
 # Replay each fuzzer over its committed seed corpus fuzz/corpus/<name>/ only
-# (-runs=0: no generated inputs, so no invented iteration budget).
+# (-runs=0: no generated inputs, so no invented iteration budget). check-suites
+# requires a readable seed in each corpus.
 fuzz-smoke: check-suites $(FUZZ_BIN)
-	@set -e; n=0; for f in $(FUZZ_BIN); do m=$${f#$(B)/fuzz/}; corpus=fuzz/corpus/$${m%_fuzz}; \
-	  if [ ! -d "$$corpus" ]; then echo "$@: FAIL $$corpus missing (commit minimal seeds)"; exit 1; fi; \
-	  echo "== $$f $$corpus"; $(RUN)"$$f" -runs=0 "$$corpus"; n=$$((n+1)); done; \
-	$(call assert_suite_count,$(FUZZ_SUITES)); echo "$@: $$n fuzzers replayed their seeds"
+	@set -e; for f in $(FUZZ_BIN); do m=$${f#$(B)/fuzz/}; corpus=fuzz/corpus/$${m%_fuzz}; \
+	  echo "== $$f $$corpus"; $(RUN)"$$f" -runs=0 "$$corpus"; done; \
+	echo "$@: $(words $(FUZZ_BIN)) fuzzers replayed their seeds"
 
 clean:
 	rm -rf $(B)

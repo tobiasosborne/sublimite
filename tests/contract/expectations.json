@@ -190,7 +190,6 @@
     "WireTest.test_bad_frame_order_and_minimap_geometry": {},
     "WireTest.test_bad_packet_header": {},
     "WireTest.test_bad_payload_lengths_and_mapping_lifetime": {},
-    "WireTest.test_encoder_rejects_bad_records": {},
     "WireTest.test_envelopes": {},
     "WireTest.test_failed_decode_does_not_pin_the_mapping": {},
     "WireTest.test_malformed_payload_fields": {},

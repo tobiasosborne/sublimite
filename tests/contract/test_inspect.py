@@ -21,6 +21,10 @@ MAGIC_SIZE = len(b"SCEL")
 FRAME_HEADER_WORDS = 2 + 6 + 4 + 1 + 4 + 2  # witness/serial, sizes, rects, Q8, counts/flags
 CELLS = 1 + FRAME_HEADER_WORDS  # skip the payload frame count and frame header
 FIRST_CELL = CELLS + 1  # skip the cell count
+TAB = 4 * WORD + WORD  # rectangle and active flag
+# single-payload.hex ends with two tabs after their count, then the bottom-row rectangle.
+BOTTOM_ROW_TAIL = 4 * WORD
+TABS_TAIL = WORD + 2 * TAB + BOTTOM_ROW_TAIL
 
 
 def vector(name):
@@ -46,9 +50,11 @@ class WireTest(unittest.TestCase):
                          (1, 2, 42, 6, 0))
         self.assertEqual(wire.encode_request(wire.Request(wire.Operation.ARM, 41)),
                          (1, 0, 41, 0, 0))
-        for request in (replace(self.snap, ticket=0), replace(self.snap, ticket=1 << (WORD * 8)),
-                        replace(self.snap, previous_serial=6), replace(self.snap, operation=3)):
-            with self.subTest(request=request), self.assertRaises(wire.ProtocolError):
+        for reason, request in (("invalid request ticket", replace(self.snap, ticket=0)),
+                                ("invalid request ticket", replace(self.snap, ticket=1 << (WORD * 8))),
+                                ("only used by NEXT", replace(self.snap, previous_serial=6)),
+                                ("unknown operation 3", replace(self.snap, operation=3))):
+            with self.subTest(request=request), self.assertRaisesRegex(wire.ProtocolError, reason):
                 wire.encode_request(request)
 
     def test_single_frame(self):
@@ -63,7 +69,6 @@ class WireTest(unittest.TestCase):
         self.assertEqual(frame.visible_tab_titles(), ("L", "R…"))
         self.assertEqual(frame.active_tab, wire.Tab(wire.Rect(3, 0, 2, 1), True))
         self.assertEqual(frame.bottom_row_text(), "ready")
-        self.assertEqual(wire.encode_payload(reply.snapshot), self.payload)
 
     def test_unresolved_cells_fail_only_reads_that_cross_them(self):
         frame = wire.decode_payload(self.payload).settled
@@ -85,7 +90,6 @@ class WireTest(unittest.TestCase):
         self.assertEqual(snap.first_action.bottom_row_text(), "")
         self.assertEqual(snap.first_action.minimap_box, wire.Rect(6, 1, 4, 4))
         self.assertEqual(snap.first_action.minimap_ink_intervals, ((1, 3), (5, 6)))
-        self.assertEqual(wire.encode_payload(snap), payload)
 
     def test_missing_first_action(self):
         with self.assertRaises(wire.MissingWitnessError):
@@ -101,7 +105,6 @@ class WireTest(unittest.TestCase):
         packet = word_at(self.packet, MAGIC_SIZE + 4 * WORD, len(payload))
         snap = wire.decode_reply(packet, payload, self.snap, require_first_action=True).snapshot
         self.assertEqual(snap.first_action.submit_serial, snap.settled.submit_serial)
-        self.assertEqual(wire.encode_payload(snap), payload)
 
     def test_unprovided_sections(self):
         frame = wire.decode_payload(self.payload).settled
@@ -116,12 +119,13 @@ class WireTest(unittest.TestCase):
                          lambda: frame.active_tab, lambda: frame.bottom_row, frame.bottom_row_text):
             with self.subTest(accessor=accessor), self.assertRaises(wire.UnprovidedSectionError):
                 accessor()
-        self.assertEqual(wire.encode_payload(wire.decode_payload(header)), header)
 
     def test_titles_and_bottom_text_require_cells(self):
         frame = wire.decode_payload(self.payload).settled
-        no_cells = replace(frame, _cells=None)
-        no_cells = wire.decode_payload(wire.encode_payload(wire.Snapshot((no_cells,)))).settled
+        # Clear the cells bit and drop the cells section; keep tabs and the bottom row.
+        sections = wire.Section.TABS | wire.Section.BOTTOM_ROW
+        header = word_at(self.payload[:CELLS * WORD], (CELLS - 1) * WORD, sections)
+        no_cells = wire.decode_payload(header + self.payload[-TABS_TAIL:]).settled
         self.assertEqual(no_cells.active_tab, frame.active_tab)
         for accessor in (no_cells.visible_tab_titles, no_cells.bottom_row_text):
             with self.assertRaises(wire.UnprovidedSectionError):
@@ -169,10 +173,13 @@ class WireTest(unittest.TestCase):
 
     def test_bad_payload_lengths_and_mapping_lifetime(self):
         length_offset = MAGIC_SIZE + 4 * WORD
-        for length, mapped in ((len(self.payload), self.payload[:-1]),
-                               (len(self.payload) - 1, self.payload),
-                               (len(self.payload) + 1, self.payload + b"\0"), (0, self.payload)):
-            with self.subTest(length=length), self.assertRaises(wire.ProtocolError):
+        for reason, length, mapped in (
+            ("length for mapping", len(self.payload), self.payload[:-1]),
+            ("truncated bottom row rectangle", len(self.payload) - 1, self.payload),
+            ("trailing bytes", len(self.payload) + 1, self.payload + b"\0"),
+            ("length for mapping", 0, self.payload),
+        ):
+            with self.subTest(length=length), self.assertRaisesRegex(wire.ProtocolError, reason):
                 wire.decode_reply(word_at(self.packet, length_offset, length), mapped, self.snap)
         mapping = bytearray(self.payload + b"unused mapping tail")
         reply = wire.decode_reply(self.packet, mapping, self.snap)
@@ -209,10 +216,18 @@ class WireTest(unittest.TestCase):
         ):
             with self.subTest(reason=reason), self.assertRaisesRegex(wire.ProtocolError, reason):
                 wire.decode_payload(word_at(self.payload, offset, value))
+        size = len(self.payload)
+        for reason, offset, value in (
+            ("several visible tabs are active", size - TABS_TAIL + WORD + 4 * WORD, 1),  # first tab
+            ("bottom row rectangle outside", size - BOTTOM_ROW_TAIL + WORD, 3),  # y = rows
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(wire.ProtocolError, reason):
+                wire.decode_payload(word_at(self.payload, offset, value))
         offset = (FIRST_CELL + 5) * WORD  # kind, flags, colors and string count precede UTF-8
-        corrupt = self.payload[:offset] + b"\xff" + self.payload[offset + 1:]
-        with self.assertRaisesRegex(wire.ProtocolError, "UTF-8"):
-            wire.decode_payload(corrupt)
+        for reason, byte in (("UTF-8", b"\xff"), ("invalid text for cell kind", b"\0")):
+            corrupt = self.payload[:offset] + byte + self.payload[offset + 1:]
+            with self.subTest(reason=reason), self.assertRaisesRegex(wire.ProtocolError, reason):
+                wire.decode_payload(corrupt)
 
     def test_rejects_every_truncated_payload_prefix(self):
         for name in ("single-payload", "two-payload"):
@@ -232,20 +247,6 @@ class WireTest(unittest.TestCase):
         # Last interval in first frame becomes adjacent to [1, 3).
         with self.assertRaisesRegex(wire.ProtocolError, "ink interval"):
             wire.decode_payload(word_at(data, settled - 2 * WORD, 3))
-
-    def test_encoder_rejects_bad_records(self):
-        frame = wire.decode_payload(self.payload).settled
-        first = frame.cells[0]
-        for bad_frame in (
-            replace(frame, window_height=0), replace(frame, _cells=frame.cells[:-1]),
-            replace(frame, _cells=(replace(first, text="\ud800"),) + frame.cells[1:]),
-            replace(frame, _cells=(replace(first, text="\0"),) + frame.cells[1:]),
-            replace(frame, _cells=(replace(first, attributes=8),) + frame.cells[1:]),
-            replace(frame, _tabs=tuple(replace(tab, active=True) for tab in frame.tabs)),
-            replace(frame, _bottom_row=wire.Rect(0, frame.rows, 1, 1)),
-        ):
-            with self.subTest(frame=bad_frame), self.assertRaises(wire.ProtocolError):
-                wire.encode_payload(wire.Snapshot((bad_frame,)))
 
 
 if __name__ == "__main__":

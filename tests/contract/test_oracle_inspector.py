@@ -293,10 +293,11 @@ class OracleTests(unittest.TestCase):
             self.assertEqual(last.rect.x + last.rect.width, frame.columns - 1)
             titles = tuple(title.strip() for title in frame.visible_tab_titles())
             self.assertEqual(titles, files[:len(titles)])
-            # Restoring this edge tab to full width exposes out-of-grid cells.
+            # Restoring this edge tab to full width exposes out-of-grid cells: the
+            # decoder's section check (decode_payload's last step) rejects it.
             full = replace(last, rect=replace(last.rect, width=first.rect.width))
             with self.assertRaisesRegex(wire.ProtocolError, "tab rectangle"):
-                wire.encode_payload(wire.Snapshot((replace(frame, _tabs=(*frame.tabs[:-1], full)),)))
+                wire._validate_sections(replace(frame, _tabs=(*frame.tabs[:-1], full)))
             self.finish(child, guarded=True)
 
     def test_noop_and_dropped_submit(self):

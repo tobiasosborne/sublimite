@@ -10,13 +10,12 @@ import shlex
 import subprocess
 import sys
 
-from check_dag import INTRA_RULES
+from check_dag import INTRA_RULES, L5_BACKENDS, build_order, parse_layers
 
 
 ALLOWLIST = Path(__file__).resolve().with_name('system-symbols.txt')
 ANY_MODULE = '*'
 UNDEFINED = frozenset('Uwv')
-L5_FORBIDDEN = {'x11', 'wayland', 'gl', 'raster'}
 # The vendored tree-sitter runtime and grammars form one pseudo-module: no
 # src/ directory, linked into hl's archive, ordered below hl and above
 # nothing (docs/decisions/v2-he7.24.md). It is implicit, like main.
@@ -33,38 +32,15 @@ TEST_SYMBOL = re.compile(r'.*_test_.*')
 
 
 def read_module_map(entries):
-    layers = {}
-    for entry in entries:
-        layer, _, module = entry.partition(':')
-        if not re.fullmatch(r'L[0-9]+', layer) or not module or module in layers:
-            raise ValueError(f'invalid or duplicate module map entry {entry!r}')
-        layers[module] = int(layer[1:])
-    if 'app' not in layers or 'hl' not in layers or {'main', VENDOR_TS} & layers.keys():
+    layers = parse_layers(entries)
+    if 'app' not in layers or 'hl' not in layers or VENDOR_TS in layers:
         raise ValueError(f'module map must include app and hl and leave main and {VENDOR_TS} implicit')
-    layers['main'] = layers['app']
     layers[VENDOR_TS] = layers['hl']
     return layers
 
 
 def intra_order(layers):
-    order = set()
-    for rule in INTRA_RULES:
-        groups = [[module.strip() for module in group.split(',')] for group in rule.split('<')]
-        for lower, upper in zip(groups, groups[1:]):
-            for a in lower:
-                for b in upper:
-                    if a not in layers or b not in layers or layers[a] != layers[b]:
-                        raise ValueError(f'invalid intra-layer rule {rule!r}')
-                    order.add((a, b))
-    order.add((VENDOR_TS, 'hl'))
-    while True:
-        closure = order | {(a, d) for a, b in order for c, d in order if b == c}
-        if closure == order:
-            break
-        order = closure
-    if any(a == b for a, b in order):
-        raise ValueError('cycle in INTRA_RULES')
-    return order
+    return build_order(layers, (*INTRA_RULES, f'{VENDOR_TS} < hl'))
 
 
 def vendor_symbol(symbol):
@@ -213,7 +189,7 @@ def audit_object(rows, where, member, module, layers, order, allowlist):
             violation = f'[unknown] undefined symbol {symbol} has no known module prefix or system entry'
         else:
             edge = f'{module} (L{layer}) references {symbol} from {owner} (L{layers[owner]})'
-            if layer == layers['app'] and owner in L5_FORBIDDEN:
+            if layer == layers['app'] and owner in L5_BACKENDS:
                 violation = f'[forbidden] {edge}'
             elif layers[owner] > layer:
                 violation = f'[inter-layer] {edge}: upward dependency'

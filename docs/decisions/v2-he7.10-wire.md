@@ -35,3 +35,13 @@ The hex conformance vectors in `tests/contract/vectors/` label packet and payloa
 The client is `tests/contract/snapwire.py`, not `inspect.py` as the design table names it: a module called
 `inspect` in `tests/contract/` shadows the standard library's `inspect` for every script run from that directory
 (`dataclasses` imports it), which broke `test_sandbox.py` once both landed.
+
+## W0.7-B7 (2026-11-23): no Python frame encoder
+
+Finding 25 of `docs/reviews/wave0-code-astra.md`. `encode_payload` and its writer
+are deleted. Replies come from C, so the Python encoder only proved that decoding
+and then encoding returned the same bytes. The committed hex vectors and typed
+observation assertions remain. Decoder negatives are word or byte mutations of
+`single-payload.hex` with their field's reason: NUL text, two active tabs, and a
+bottom row outside the grid replace the encoder-only record test. The oracle's
+clipped-tab check calls the decoder's section validator.

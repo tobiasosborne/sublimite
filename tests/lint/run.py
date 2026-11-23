@@ -11,22 +11,34 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 LINTS = ('check_dag.py', 'check_no_c_includes.py')
-# Each failure must come from the relevant rule, with the other lint passing.
+UPWARD = '{0}: error: [inter-layer] {1} (L{2}) reaches "{3}" ({4}, L{5}): upward include'
+L5_X11 = ('src/app/probe.c: error: [forbidden] app (L5) reaches "src/x11/x11.h" (x11, L3): '
+          'L5 may not reach backend headers')
+C_FILE = ('{0}: error: reaches a .c file "{1}" '
+          '(link the layer archive and include the public header instead)')
+# Each failure is the complete diagnostic of its rule, naming the source and the
+# dependency it reaches, with the other lint passing; clean passes both.
 CASES = (
-    ('angle', (1, '[inter-layer]'), (0, '')),
-    ('macro', (1, '[forbidden]'), (0, '')),
-    ('continuation', (1, '[forbidden]'), (0, '')),
-    ('comment', (1, '[forbidden]'), (0, '')),
-    ('transitive', (1, '[inter-layer]'), (0, '')),
-    ('app-transitive', (1, '[forbidden]'), (0, '')),
-    ('intra-layer', (1, '[intra-layer]'), (0, '')),
-    ('c-shim', (0, ''), (1, 'reaches a .c file')),
-    ('fuzz-shim', (0, ''), (1, 'reaches a .c file')),
-    ('missing-dep', (1, 'missing dependency file'), (0, '')),
-    ('stale-dep', (0, ''), (1, 'stale dependency file')),
-    ('duplicate-layer', (2, 'module piece listed in two layers'), (0, '')),
-    ('clean', (0, ''), (0, '')),
+    ('angle', (1, UPWARD.format('src/os/probe.c', 'os', 0, 'src/piece/piece.h', 'piece', 1)), (0,)),
+    ('macro', (1, L5_X11), (0,)),
+    ('continuation', (1, L5_X11), (0,)),
+    ('comment', (1, L5_X11), (0,)),
+    ('transitive', (1, UPWARD.format('src/os/probe.c', 'os', 0, 'src/app/app.h', 'app', 5)), (0,)),
+    ('app-transitive', (1, L5_X11), (0,)),
+    ('intra-layer', (1, 'src/x11/probe.c: error: [intra-layer] x11 (L3) reaches "src/wayland/wayland.h" '
+                        '(wayland, L3): wayland is not below x11 in INTRA_RULES'), (0,)),
+    ('c-shim', (0,), (1, C_FILE.format('tests/probe_test.c', 'tests/../bench/../src/os/probe.c'))),
+    ('fuzz-shim', (0,), (1, C_FILE.format('fuzz/probe_fuzz.c', 'fuzz/../src/os/probe.c'))),
+    ('missing-dep', (1, 'src/os/probe.c: error: missing dependency file build/rel/src/os/probe.d'), (0,)),
+    ('stale-dep', (0,), (1, 'tests/probe_test.c: error: stale dependency file build/rel/tests/probe_test.d '
+                            '(older than tests/probe_test.c)')),
+    ('duplicate-layer', (2, 'check_dag: config error: module piece listed in two layers'), (0,)),
+    ('clean', (0,), (0,)),
 )
+
+
+def diagnostics(output):
+    return tuple(line for line in output.splitlines() if ' error: ' in line)
 
 
 def run_case(name, verdicts):
@@ -61,13 +73,17 @@ def run_case(name, verdicts):
             older = (root / 'tests/probe_test.c').stat().st_mtime_ns - 1
             os.utime(dep, ns=(older, older))
 
+        inventory = {directory: [str(path.relative_to(root)) for path in sorted((root / directory).rglob('*.c'))]
+                     for directory in ('tests', 'fuzz')}
+        arguments = {'check_dag.py': [],
+                     'check_no_c_includes.py': ['--tests', *inventory['tests'], '--fuzz', *inventory['fuzz']]}
         passed = True
-        for lint, (code, diagnostic) in zip(LINTS, verdicts):
-            result = subprocess.run([sys.executable, ROOT / 'tools' / lint, '--root', root],
+        for lint, (code, *expected) in zip(LINTS, verdicts):
+            result = subprocess.run([sys.executable, ROOT / 'tools' / lint, '--root', root, *arguments[lint]],
                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, check=False)
-            if result.returncode != code or diagnostic not in result.stdout:
-                print(f'{name}: FAIL {lint} expected exit {code} {diagnostic!r}, '
+            if result.returncode != code or diagnostics(result.stdout) != tuple(expected):
+                print(f'{name}: FAIL {lint} expected exit {code} {expected!r}, '
                       f'got exit {result.returncode}')
                 print(result.stdout, end='')
                 passed = False

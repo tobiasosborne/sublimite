@@ -24,3 +24,13 @@ same assignments through `make print-layer-map`.
 An include under an `#if` branch that is false in our single build
 configuration is not seen. This is acceptable because v2 has one
 configuration by rule.
+
+## W0.7-B7 (2026-11-23): one no-C checker
+
+Finding 22 of `docs/reviews/wave0-code-astra.md`. `tools/check_layout.py includes`
+duplicated `tools/check_no_c_includes.py`. Make ran the first and the fixtures ran
+the second. The standalone second also walked `tests/symbols/` fixtures and `fuzz/corpus/`
+seeds, which the build prunes. Only `check_no_c_includes.py` remains, and it
+has no inventory of its own. `make check-includes` passes it the real-source lists
+(`LINT_TEST_SRCS`, `LINT_FUZZ_SRCS`), and `tests/lint/run.py` passes each fixture's
+sources.

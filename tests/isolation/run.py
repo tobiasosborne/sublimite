@@ -16,40 +16,60 @@ const char *socket = "\\0" EDIT_APP_ID "-%lu";
 const char *words[] = {"sub", "limite"};
 '''
 
-# F9 and F10 in docs/reviews/wave0-scaffold-muse.md, plus controls.
+LITERAL = 'identity in string literal {!r}'
+REDEFINED = 'EDIT_APP_ID is defined by the build'
+# F9 and F10 in docs/reviews/wave0-scaffold-muse.md, plus controls. Each
+# spelling must print exactly its own diagnostic (line and reason), and its
+# near neighbour (the first NEAR substitution: one character or name away from
+# the identity) must pass.
 SOURCES = {
-    'P20a hex escape': r'const char *a = "sublim\x69te";',
-    'P20a2 escaped slash': r'const char *a2 = "\x2fsublimite";',
-    'P20b relative directory': 'const char *b = "sublimite/config.toml";',
-    'P20c abstract socket': r'const char *c = "\0sublimite";',
-    'P20d underscore suffix': 'const char *d = "sublimite_sock";',
-    'P20d2 dot prefix': 'const char *d2 = "org.sublimite";',
-    'P20h spliced adjacency': 'const char *h = "sublim" \\\n"ite";',
-    'P20e stringification': '#define STR_(x) #x\n#define STR(x) STR_(x)\n'
-                             'const char *e = STR(sublimite);',
-    'P20f character array': r"const char f[] = {'s','u','b','l','i','m','i','t','e','\0'};",
-    'P20g formatted pieces': '''#include <stdio.h>
-void assemble(char *buf, size_t n) { snprintf(buf, n, "%s%s", "sub", "limite"); }
-''',
-    'bare leaf': 'const char *path = "sublimite";',
-    'absolute path': 'const char *path = "/home/x/.config/sublimite/config.toml";',
-    'adjacent strings': 'const char *path = "sub" /* next piece */ "limite";',
-    'hardcoded v2 leaf': 'const char *path = "sublimite-v2";',
-    'octal escape': r'const char *path = "sublim\151te";',
-    'spliced literal': 'const char *path = "sublim\\\nite";',
-    'prefixed strings': 'const char *path = u8"sub" u8"limite";',
-    'local undefinition': '#undef /* identity is build-defined */ EDIT_APP_ID',
-    'local definition': '%:define EDIT_APP_ID "other-editor"',
+    'P20a hex escape': (r'const char *a = "sublim\x69te";', 1, LITERAL.format('sublimite')),
+    'P20a2 escaped slash': (r'const char *a2 = "\x2fsublimite";', 1, LITERAL.format('/sublimite')),
+    'P20b relative directory': ('const char *b = "sublimite/config.toml";', 1,
+                                LITERAL.format('sublimite/config.toml')),
+    'P20c abstract socket': (r'const char *c = "\0sublimite";', 1, LITERAL.format('\0sublimite')),
+    'P20d underscore suffix': ('const char *d = "sublimite_sock";', 1, LITERAL.format('sublimite_sock')),
+    'P20d2 dot prefix': ('const char *d2 = "org.sublimite";', 1, LITERAL.format('org.sublimite')),
+    'P20h spliced adjacency': ('const char *h = "sublim" \\\n"ite";', 1, LITERAL.format('sublimite')),
+    'P20e stringification': ('#define STR_(x) #x\n#define STR(x) STR_(x)\nconst char *e = STR(sublimite);',
+                             3, "identity identifier 'sublimite' can be stringified"),
+    'P20f character array': (r"const char f[] = {'s','u','b','l','i','m','i','t','e','\0'};", 1,
+                             'identity assembled from character literals'),
+    'P20g formatted pieces': ('#include <stdio.h>\nvoid assemble(char *buf, size_t n) '
+                              '{ snprintf(buf, n, "%s%s", "sub", "limite"); }',
+                              2, 'identity assembled from formatted string arguments'),
+    'bare leaf': ('const char *path = "sublimite";', 1, LITERAL.format('sublimite')),
+    'absolute path': ('const char *path = "/home/x/.config/sublimite/config.toml";', 1,
+                      LITERAL.format('/home/x/.config/sublimite/config.toml')),
+    'adjacent strings': ('const char *path = "sub" /* next piece */ "limite";', 1, LITERAL.format('sublimite')),
+    'hardcoded v2 leaf': ('const char *path = "sublimite-v2";', 1, LITERAL.format('sublimite-v2')),
+    'octal escape': (r'const char *path = "sublim\151te";', 1, LITERAL.format('sublimite')),
+    'spliced literal': ('const char *path = "sublim\\\nite";', 1, LITERAL.format('sublimite')),
+    'prefixed strings': ('const char *path = u8"sub" u8"limite";', 1, LITERAL.format('sublimite')),
+    'local undefinition': ('#undef /* identity is build-defined */ EDIT_APP_ID', 1, REDEFINED),
+    'local definition': ('%:define EDIT_APP_ID "other-editor"', 1, REDEFINED),
 }
+NEAR = (('limite', 'limate'), (r'\x69te', r'\x61te'), (r'\151te', r'\141te'), ('\\\nite', '\\\nate'),
+        ('"ite"', '"ate"'), ("'i','t','e'", "'a','t','e'"), ('EDIT_APP_ID', 'EDIT_APP_NAME'))
 
 
-def expect(name, command, code, diagnostic, **kwargs):
+def near_neighbour(snippet):
+    old, new = next(pair for pair in NEAR if pair[0] in snippet)
+    return snippet.replace(old, new)
+
+
+MAKEFILE_RULE = 'Makefile:1: error: expected exactly one literal APP_ID := sublimite-v2 assignment'
+CLEAN_RUN = 'check_isolation: ok (1 files under src/)'
+
+
+def expect(name, command, code, lines, **kwargs):
+    """Require the exit code and exactly these output lines."""
     result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, check=False, **kwargs)
-    if result.returncode == code and diagnostic in result.stdout:
+    if result.returncode == code and result.stdout.splitlines() == lines:
         print(f'{name}: ok')
         return True
-    print(f'{name}: FAIL expected exit {code} and {diagnostic!r}, got {result.returncode}')
+    print(f'{name}: FAIL expected exit {code} and {lines!r}, got {result.returncode}')
     print(result.stdout, end='')
     return False
 
@@ -69,21 +89,28 @@ def main():
         makefile = root / 'Makefile'
         makefile.write_text(IDENTITY, encoding='utf-8')
         lint = [sys.executable, '-B', ROOT / 'tools/check_isolation.py', '--root', root]
-        for name, snippet in SOURCES.items():
+        for name, (snippet, line, reason) in SOURCES.items():
             source.write_text(snippet + '\n', encoding='utf-8')
-            verdicts.append(expect(name, lint, 1, 'src/probe.c:'))
+            verdicts.append(expect(name, lint, 1, [
+                f'src/probe.c:{line}: error: {reason}; build app-identity paths from EDIT_APP_ID',
+                'check_isolation: FAIL: 1 violation(s)']))
+            source.write_text(near_neighbour(snippet) + '\n', encoding='utf-8')
+            verdicts.append(expect(f'{name} (near neighbour)', lint, 0, [CLEAN_RUN]))
         source.write_text(CLEAN, encoding='utf-8')
-        verdicts.append(expect('clean', lint, 0, 'check_isolation: ok'))
+        verdicts.append(expect('clean', lint, 0, [CLEAN_RUN]))
         makefile.write_text('APP_ID := sublimite\n', encoding='utf-8')
-        verdicts.append(expect('wrong Makefile APP_ID', lint, 1, 'Makefile:'))
+        verdicts.append(expect('wrong Makefile APP_ID', lint, 1, [MAKEFILE_RULE]))
         makefile.write_text('# APP_ID must be defined below\n', encoding='utf-8')
-        verdicts.append(expect('missing Makefile APP_ID', lint, 1, 'Makefile:'))
+        verdicts.append(expect('missing Makefile APP_ID', lint, 1, [MAKEFILE_RULE]))
 
     env = os.environ.copy()
     for var in ('MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES', 'MAKEFILES'):
         env.pop(var, None)
-    verdicts.append(expect('P28 command-line APP_ID', ['make', '-n', 'APP_ID=sublimite', 'all'],
-                           2, 'APP_ID must be sublimite-v2', env=env))
+    guard = (ROOT / 'Makefile').read_text(encoding='utf-8').splitlines().index(
+        '$(error APP_ID must be sublimite-v2)') + 1
+    make = ['make', '--no-print-directory', '-n', 'APP_ID=sublimite', 'all']
+    verdicts.append(expect('P28 command-line APP_ID', make, 2,
+                           [f'Makefile:{guard}: *** APP_ID must be sublimite-v2.  Stop.'], env=env))
     print(f'isolation fixtures: {sum(verdicts)}/{len(verdicts)} passed')
     return int(not all(verdicts))
 

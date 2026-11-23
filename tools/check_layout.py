@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Check the suite inventory, tools registry and real test/fuzzer includes."""
+"""Check the suite inventory and the tools registry."""
 
 import argparse
 from collections import Counter
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 
-from check_dag import ROOT, read_dependencies
+from check_dag import ROOT
 
 
 # Recognize the threaded suites named in docs/PLAN_V2.md §5 even when nested.
@@ -31,6 +31,9 @@ MANIFEST = 'tests/lanes.mk'
 # '+=', no continuation, no other variable.
 LANES = {'layers': 'check-layers', 'san': 'check-san', 'law2': 'check-law2',
          'tsan': 'check-tsan', 'fuzz': 'fuzz-smoke'}
+# Lane -> the lane that must also run each of its suites (Makefile, check-san):
+# an isolated layer link is no substitute for the sanitizers.
+REQUIRED_OVERLAP = {'layers': 'san'}
 LINE = re.compile(r'((?:tests/[\w./-]+_test|fuzz/[\w./-]+_fuzz)\.c)[ \t]+:=((?:[ \t]+\w+)+)[ \t]*')
 
 
@@ -86,6 +89,14 @@ def check_suites(args):
             elif suite not in on_disk:
                 errors.append(f'{target} lists a file outside its suite inventory: {suite}')
 
+    for lane, also in REQUIRED_OVERLAP.items():
+        for suite in sorted(s for s, lanes in table.items() if lane in lanes and also not in lanes):
+            errors.append(f'{LANES[also]} must also run {LANES[lane]} suite {suite}')
+    for suite in sorted(s for s, lanes in table.items() if 'fuzz' in lanes):
+        corpus = Path('fuzz/corpus', suite.removeprefix('fuzz/').removesuffix('_fuzz.c'))
+        if not readable_seed(ROOT / corpus):
+            errors.append(f'fuzz-smoke corpus has no readable seed: {corpus}/ (commit minimal seeds)')
+
     if {s for s, lanes in table.items() if 'layers' in lanes} != set(args.required_layers):
         errors.append('check-layers must register exactly the L0–L4 isolated link suites')
     if not (ROOT / 'src/main.c').is_file():
@@ -104,6 +115,19 @@ def check_suites(args):
     return finish('check-suites', errors)
 
 
+def readable_seed(corpus):
+    for directory, _, files in os.walk(corpus):
+        for name in files:
+            path = Path(directory, name)
+            try:
+                if not path.is_symlink() and path.is_file():
+                    with path.open('rb'):
+                        return True
+            except OSError:
+                pass
+    return False
+
+
 def raise_walk_error(error):
     raise error
 
@@ -112,8 +136,8 @@ def files_in_tools(tools):
     for directory, subdirs, files in os.walk(tools, onerror=raise_walk_error):
         subdirs[:] = [name for name in subdirs if name != '__pycache__']
         for name in files:
-            path = Path(directory, name).relative_to(tools).as_posix()
-            if path != 'README.md':
+            path = Path(directory, name).relative_to(ROOT).as_posix()
+            if path != REGISTRY:
                 yield path
 
 
@@ -126,45 +150,54 @@ def variants_dirs():
             subdirs.remove('variants')
 
 
+REGISTRY = 'tools/README.md'
+ROW = re.compile(r'\|\s*`([^`|]+)`\s*\|.*\|')
+SEPARATOR = re.compile(r'\|(?:\s*:?-+:?\s*\|)+')
+
+
+def registry_rows(text, errors):
+    """Yield (line, path) for each data row; every row's first cell is one `path`."""
+    table = [(number, line.strip()) for number, line in enumerate(text.splitlines(), 1)
+             if line.lstrip().startswith('|')]
+    if len(table) < 2 or not SEPARATOR.fullmatch(table[1][1]):
+        errors.append(f'{REGISTRY}: expected one table with a header and separator row')
+        return
+    for number, line in table[2:]:
+        match = ROW.fullmatch(line)
+        if match:
+            yield number, match[1]
+        else:
+            errors.append(f'{REGISTRY}:{number}: malformed row (first cell must be one `path`): {line}')
+
+
+def registry_error(path):
+    """Why a registered repo-relative path is not a canonical file in the checkout, or None."""
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or str(pure) != path or '..' in pure.parts:
+        return 'not a canonical repo-relative path'
+    full = ROOT / path
+    if full.resolve() != full:  # containment before existence: no symlink, no escape
+        return 'resolves through a symlink'
+    if not full.is_file():
+        return 'registered file is missing'
+    return None
+
+
 def check_registry():
-    tools = ROOT / 'tools'
-    registry = (tools / 'README.md').read_text(encoding='utf-8')
-    entries = Counter(re.findall(r'^\s*\|\s*`([^`\n]+)`\s*\|', registry, re.MULTILINE))
-    files = set(files_in_tools(tools))
     errors = []
-    for name in sorted(files - entries.keys()):
-        errors.append(f'unregistered file: tools/{name}')
-    for name, count in sorted(entries.items()):
-        # A row naming a path with a slash registers a repo-relative tool outside
-        # tools/ (e.g. tests/lint/run.py); a bare name is a file under tools/.
-        if '/' in name:
-            if not (ROOT / name).is_file():
-                errors.append(f'registered file is missing: {name}')
-        elif name not in files or not (tools / name).is_file():
-            errors.append(f'registered file is missing: tools/{name}')
-        if count > 1:
-            errors.append(f'duplicate registry entry: {name}')
+    rows = Counter()
+    for number, path in registry_rows((ROOT / REGISTRY).read_text(encoding='utf-8'), errors):
+        rows[path] += 1
+        problem = registry_error(path)
+        if problem:
+            errors.append(f'{REGISTRY}:{number}: {problem}: {path}')
+        elif rows[path] > 1:
+            errors.append(f'{REGISTRY}:{number}: duplicate registry entry: {path}')
+    for path in sorted(set(files_in_tools(ROOT / 'tools')) - rows.keys()):
+        errors.append(f'unregistered file: {path}')
     for path in sorted(variants_dirs()):
         errors.append(f'forbidden directory: {path}/')
     return finish('check-registry', errors)
-
-
-def check_includes(args):
-    errors = []
-    for cfg, sources in (('rel', args.tests), ('fuzz', args.fuzz)):
-        for source in sorted(map(Path, sources)):
-            obj = args.build_dir / cfg / source.with_suffix('.o')
-            try:
-                dependencies = read_dependencies(ROOT, obj, source)
-            except (OSError, ValueError) as error:
-                errors.append(f'{source}: {error}')
-                continue
-            actual_source = (ROOT / source).resolve()
-            for path, resolved in dependencies:
-                if resolved != actual_source and '.c' in (path.suffix.lower(), resolved.suffix.lower()):
-                    errors.append(f'{source}: reaches a .c file "{path}" '
-                                  '(link the layer archive and include the public header instead)')
-    return finish('check-no-c-includes', errors)
 
 
 def main():
@@ -175,18 +208,12 @@ def main():
                  'tests-on-disk', 'fuzz-on-disk'):
         suites.add_argument(f'--{name}', nargs='*', required=True)
     commands.add_parser('registry')
-    includes = commands.add_parser('includes')
-    includes.add_argument('--build-dir', type=Path, required=True)
-    includes.add_argument('--tests', nargs='*', required=True)
-    includes.add_argument('--fuzz', nargs='*', required=True)
     args = parser.parse_args()
 
     try:
         if args.command == 'suites':
             return check_suites(args)
-        if args.command == 'registry':
-            return check_registry()
-        return check_includes(args)
+        return check_registry()
     except (OSError, UnicodeError) as error:
         return finish('check-layout', [error])
 
