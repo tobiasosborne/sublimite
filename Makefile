@@ -180,6 +180,9 @@ $(B)/rel/bench/scan_bench: $(B)/rel/bench/scan_bench.o $(call libs_of,rel,L1 L0)
 $(B)/rel/bench/utf8_bench: $(B)/rel/bench/utf8_bench.o $(call libs_of,rel,L1 L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
 
+$(B)/rel/bench/indent_bench: $(B)/rel/bench/indent_bench.o $(call libs_of,rel,L1 L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
+
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.
 check:

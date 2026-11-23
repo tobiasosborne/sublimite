@@ -34,3 +34,7 @@ FUZZ_SUITES += fuzz/scan_fuzz.c
 # utf8 (v2-0fv.11)
 SAN_SUITES += tests/utf8_test.c tests/utf8_tables_test.c
 FUZZ_SUITES += fuzz/utf8_fuzz.c
+
+# indent (v2-0fv.12)
+SAN_SUITES += tests/indent_test.c
+FUZZ_SUITES += fuzz/indent_fuzz.c
