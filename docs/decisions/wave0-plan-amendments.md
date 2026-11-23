@@ -97,3 +97,11 @@ an emptied 33.6 MB buffer, 78 % of samples in the caret follow after Select All 
 which zeroes a whole layout per one-row query, wrap.c:548). v2 acceptance for the viewport and layout rewrite: the
 cost of a caret follow after Select All does not depend on document length — stated as a bound on the number of rows
 laid out, and tested by counting rows laid out, not by timing.
+
+## A12. Wave 2 acceptance line for L3 X11 present: no UI-thread read from a server connection between ingress and submit
+
+From v1 finding 8 (W0.9, docs/decisions/v2-he7.23.md): in backend submit, v1's cpu_paint_margins
+(src/raster/raster.c:411) calls xcb_flush on the UI thread; libxcb read_packet then mallocs 36 + 16 B per pending
+Present packet on the raster connection. v2 rule, owned by the L3 X11 present bead: between ingress and submit the UI
+thread performs **no libxcb call that can read from a connection (flush included)** — stated as "no read", and tested
+with the live allocation guard, not by inspection. The v1 adapter patch is not changed; on v1 the count stays recorded.
