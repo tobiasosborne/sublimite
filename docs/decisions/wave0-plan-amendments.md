@@ -88,3 +88,12 @@ specifies; their acceptance is their own unit suites, the linters and the lanes,
 blocked Wave 1 is closed (W0.3a/b/c, W0.4). New order: **L0 and L1 harvest beads may start once the scaffold
 blockers are closed; L2 and minimal-L5 beads, and the Wave 1 exit, wait for the Wave 0 gate.** Wave 0 continues
 in parallel and is still declared passed only by its gate.
+
+## A11. Wave 2 acceptance line for viewport/layout: caret follow after Select All is independent of document length
+
+From v1 finding 7 (W0.6h, docs/decisions/v2-he7.15.md): v1 spent 0.78 s quiet and 32.6 s under load before saving
+an emptied 33.6 MB buffer, 78 % of samples in the caret follow after Select All on a wrapped view
+(finish_move → fresh_follow → follow_rows → layout_wrap_follow_edit_anchored → layout_visual_row_fresh → scan_row,
+which zeroes a whole layout per one-row query, wrap.c:548). v2 acceptance for the viewport and layout rewrite: the
+cost of a caret follow after Select All does not depend on document length — stated as a bound on the number of rows
+laid out, and tested by counting rows laid out, not by timing.
