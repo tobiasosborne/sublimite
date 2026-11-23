@@ -402,8 +402,17 @@ class SandboxTests(unittest.TestCase):
                          "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR", "XAUTHORITY", "FONTCONFIG_FILE"):
                 self.assertTrue(Path(record["env"][name]).is_relative_to(box.root), name)
             box.record_server()
-            relay = box.relay(self.stub(box, "relay"), stdout=subprocess.PIPE)
-            forwarded = self.record(relay)
+            # A peer launch (v1 --new-instance) may carry the caller's named fds, and only those.
+            named, stray = os.pipe()
+            try:
+                os.set_inheritable(stray, True)
+                relay = box.relay(self.stub(box, "relay"), stdout=subprocess.PIPE, pass_fds=(named,))
+                forwarded = self.record(relay)
+            finally:
+                os.close(named)
+                os.close(stray)
+            self.assertIn(named, forwarded["fds"])
+            self.assertNotIn(stray, forwarded["fds"])
             self.assertEqual(relay.wait(timeout=WATCHDOG), 0)
             self.assertEqual(forwarded["env"], record["env"])
             self.assertEqual(forwarded["reply"], "primary")

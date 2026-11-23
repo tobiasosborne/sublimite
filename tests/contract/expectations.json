@@ -134,16 +134,14 @@
   "capacity": {
    "argv": [
     "tests/contract/cases/capacity.py",
-    "--oracle",
-    "{exe:oracle}",
     "--build-dir",
     "{oracle_build}",
     "--display",
     "{display}"
    ],
    "displays": 1,
-   "timeout_s": 3600,
-   "timeout_derivation": "(E) placeholder: bead v2-he7.17 (W0.6j, R4) derives it from its case's hang detectors; the script does not exist yet"
+   "timeout_s": 1900,
+   "timeout_derivation": "(M) green run 183 s on v1-pin (contract-capacity-v8wtgv9p) [AC, BAT0 Full, load 0.84] x 10 (E) headroom = 1830 s, rounded up. The sum of its serial 15 s hang detectors (P, WATCHDOG; about 2100 waits, two 1000-tab walks) bounds one hung wait each and is no run bound (docs/decisions/v2-he7.17.md)"
   }
  },
  "cases": {
@@ -400,9 +398,30 @@
     "v2": "PASS"
    },
    "assertions": {
-    "restore-under-pressure": {}
+    "capacity-measured": {
+     "evidence": "A"
+    },
+    "producers-admitted": {},
+    "partial-restore-triggered": {},
+    "notice-visible": {
+     "evidence": "B"
+    },
+    "dirty-restored": {},
+    "excess-clean-absent": {
+     "evidence": "B"
+    },
+    "omitted-state-recoverable": {
+     "evidence": "A"
+    },
+    "second-recovery": {},
+    "disk-intact": {
+     "evidence": "A"
+    },
+    "law2-count": {
+     "evidence": "B"
+    }
    },
-   "note": "Bead v2-he7.17 (W0.6j) replaces this single placeholder with the case's assertion inventory."
+   "note": "docs/decisions/v2-he7.17.md. Assumes a discoverable live-tab capacity refusal through a public open, which v2 must also provide."
   }
  }
 }

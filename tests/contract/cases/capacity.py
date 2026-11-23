@@ -1,0 +1,671 @@
+"""R4: restore under real live-tab pressure keeps every unsaved tab and drops excess clean ones.
+
+One run per invocation against the pinned, inspected v1 oracle
+(docs/decisions/v2-he7.17.md). Three phases on one private display:
+
+1. Capacity. A sacrificial fresh profile admits individually named clean files through
+   public handoffs (a second launch forwarding its paths) until a one-path handoff is
+   refused for capacity. The number of live tabs at that refusal is C.
+2. Producers. In the fixture profile the filler editor F (the IPC primary) starts first,
+   then the older editor O, a --new-instance peer sharing F's DATA. With both alive, O
+   holds c0 c1 m c2 plus an untitled marker, with m and the untitled tab dirty (U = 2),
+   and hot-exits. F then admits exactly C - U - 1 clean files and hot-exits last, so its
+   journal is the newer source.
+3. Restore. An argument-free relaunch restores F whole and O under pressure. The case
+   observes the notice, walks every live tab with Ctrl+PageDown, copies the dirty tabs,
+   SIGKILLs that editor, relaunches and walks again.
+
+Every wait is on an event: a snapshot reply on the inspector socket, or a pidfd. Timers
+are hang detectors only; an expired one is ERROR. Records and exit statuses (PASS 0,
+FAIL 3, ERROR 4) follow tests/contract/records.py.
+"""
+
+import argparse
+from contextlib import ExitStack
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
+from cases.files import (GEOMETRY, SCREEN, WATCHDOG, Snapshots, describe, document_rows,
+                         exited, private_display, tab_strip)
+from cases.navigation import stop
+import records
+from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
+from test_oracle_inspector import GUARD
+from xdriver import XDriver
+
+
+ROOT = Path(__file__).resolve().parents[3]
+BUILD = ROOT / "build"
+WAIT_MS = WATCHDOG * 1000
+CASE_ID = "R4"
+FIRST_WAVE = 3
+ASSERTIONS = ("capacity-measured", "producers-admitted", "partial-restore-triggered",
+              "notice-visible", "dirty-restored", "excess-clean-absent",
+              "omitted-state-recoverable", "second-recovery", "disk-intact", "law2-count")
+EVIDENCE = {"capacity-measured": "A", "producers-admitted": "A+B",
+            "partial-restore-triggered": "A+B", "notice-visible": "B", "dirty-restored": "A+B",
+            "excess-clean-absent": "B", "omitted-state-recoverable": "A",
+            "second-recovery": "A+B", "disk-intact": "A", "law2-count": "B"}
+# Red controls: a wrong expectation on one assertion, or a fixture without pressure.
+NEGATIVES = ("excess-clean-absent", "no-pressure")
+
+# Paths per handoff. (P) v1 src/ipc/ipc.h IPC_MAX_PATHS = 128 is the ceiling, but v1's
+# per-open cost grows with the live tab count and a forwarding launch gives up after
+# 2000 ms (P, src/main.c ipc_client_send_display). (M) [AC, load 0.7] 128-path handoffs took
+# 0.3, 0.6, 0.9, 1.2, 1.5, about 1.8 s at 1, 129, 257, 385, 513, 641 tabs and timed out at 769
+# (run contract-capacity-u9qozozn, log mtimes). (E) a batch of 32 stays near 0.6 s at 1000.
+# A handoff timeout leaves the request's admission unknown and is an ERROR.
+BATCH = 32
+# (P) v1 src/main.c: editor_main configures .tab_capacity = 1000u. The probe never relies on
+# it; it only bounds the search: past twice that, no capacity refusal is discoverable (ERROR).
+PROBE_BOUND = 2 * 1000
+# (P) v1 src/main.c: a forwarding launch exits 0 once the primary accepted the request and 2
+# with this line when the primary answered IPC_LIMIT (src/ipc/result.c). EDITOR_ERR_CAPACITY
+# is the only editor-side source of IPC_LIMIT (src/editor/buffers.c:open_request); a one-path
+# request cannot reach the client's wire bound (IPC_MAX_WIRE 1 MiB, IPC_PATH_CAP 4096).
+REFUSED = b"sublimite: handoff failed: request or editor capacity limit exceeded\n"
+# (P) v1 src/journal/journal.h JOURNAL_STARTUP_SCAN_BYTES: sources above it take the unrelated
+# large-session deferral instead of a restore; both producers must stay below it.
+STARTUP_SCAN_BYTES = 105_000_000
+JOURNAL_LINE = re.compile(rb"sublimite: unsaved session journal: (\S+)\n")
+
+# The older session: clean files before and after a dirty named file, then a dirty untitled
+# tab. Contents carry no newline so each tab's identity is its first document row.
+OLDER = (("c0.txt", b"c0-clean"), ("c1.txt", b"c1-clean"), ("m.txt", b"m-original"),
+         ("c2.txt", b"c2-clean"))
+DIRTY_FILE = "m.txt"
+OLDER_CLEAN = ("c0.txt", "c1.txt", "c2.txt")
+UNSAVED = 2  # U: m.txt and the untitled marker
+UNTITLED = "<untitled>"
+# (P) v1 src/editor/recovery.c restore_source: the notice of a partial restore that dropped
+# clean tabs and set its source aside, with U unsaved and D dropped tabs (D > 1 here).
+NOTICE = ("restored {u} unsaved tabs; {d} unmodified tabs from the last session were not "
+          "reopened; the old session journal was set aside")
+
+
+class Mismatch(Exception):
+    """An observation contradicted the assertion."""
+
+
+def filler_name(index):
+    return f"f{index:04d}.txt"
+
+
+def probe_name(index):
+    return f"p{index:04d}.txt"
+
+
+def content(name):
+    return name.removesuffix(".txt").encode("ascii")
+
+
+def write_fixture(path, data):
+    with path.open("xb") as file:
+        file.write(data)
+
+
+def sessions(data_dir):
+    """Journal sources as v1 discovery sees them: session-* without a dot."""
+    if not data_dir.exists():
+        return set()
+    return {p.name for p in data_dir.iterdir()
+            if p.name.startswith("session-") and "." not in p.name}
+
+
+class Case:
+    def __init__(self, artifacts, negative):
+        self.artifacts = artifacts
+        self.run_id = artifacts.name
+        self.negative = negative
+        self.asserted = []
+        self.results = []
+        self.children = []
+        self.facts = {}
+        self.stage = "setup"
+        self.observed = self.expected = None
+
+    def note(self, message):
+        with (self.artifacts / "steps.log").open("a", encoding="utf-8") as file:
+            print(message, file=file)
+
+    def step(self, stage):
+        self.stage = stage
+        self.note(stage)
+
+    def emit(self, assertion, status, predicate, **extra):
+        record = {
+            "run_id": self.run_id, "case_id": CASE_ID, "assertion_id": assertion,
+            "evidence": EVIDENCE.get(assertion, "A+B"), "first_required_wave": FIRST_WAVE,
+            "status": status, "predicate": predicate, "observed": self.observed,
+            "expected": self.expected, "negative": self.negative, "stage": self.stage,
+            "facts": self.facts, "artifacts": str(self.artifacts),
+            "child_status": [{"role": role, "pid": child.pid, "exit": child.poll()}
+                             for role, child in self.children],
+            **extra,
+        }
+        with (self.artifacts / "results.jsonl").open("a", encoding="utf-8") as file:
+            print(json.dumps(record, default=describe, sort_keys=True), file=file)
+        records.emit(record, default=describe)
+        if status != "PASS":
+            print(f"{CASE_ID}.{assertion}: {status} {predicate}", file=sys.stderr, flush=True)
+        self.results.append(status)
+
+    def check(self, assertion, observed, expected, wrong=None):
+        """Compare once, in inventory order; the first failure is final."""
+        if assertion in self.asserted or ASSERTIONS[len(self.asserted)] != assertion:
+            raise Refused(f"assertion {assertion} out of inventory order")
+        self.asserted.append(assertion)
+        self.observed = observed
+        self.expected = wrong if self.negative == assertion else expected
+        if self.observed != self.expected:
+            raise Mismatch(f"{assertion}: observed value differs from expectation")
+        self.emit(assertion, "PASS", assertion)
+
+    def failure(self, exc):
+        status = "FAIL" if isinstance(exc, Mismatch) else "ERROR"
+        assertion = (self.asserted[-1] if isinstance(exc, Mismatch) else
+                     ASSERTIONS[len(self.asserted)] if len(self.asserted) < len(ASSERTIONS)
+                     else "assertion-inventory")
+        self.emit(assertion, status, f"{self.stage}: {type(exc).__name__}: {exc}")
+
+    @property
+    def status(self):
+        for status in ("ERROR", "FAIL"):
+            if status in self.results:
+                return status
+        return "PASS" if self.results else "ERROR"
+
+
+class Editor:
+    """One inspected editor: its process, inspector, log and bound window."""
+
+    def __init__(self, case, stack, role):
+        self.case = case
+        self.role = role
+        self.inspector = Snapshots(stack)
+        self.stack = stack
+        self.log = case.artifacts / f"{role}.log"
+        self.child = self.window = None
+
+    def spawn(self, launch, argv, **kwargs):
+        with self.log.open("wb") as log:
+            self.child = launch([*self.inspector.args, *argv], stdout=log, stderr=log,
+                                pass_fds=self.inspector.fds, **kwargs)
+        self.case.children.append((self.role, self.child))
+        self.inspector.writer.close()
+        self.inspector.pidfd = os.pidfd_open(self.child.pid)
+        self.stack.callback(os.close, self.inspector.pidfd)
+        return self
+
+    def bind(self, driver):
+        self.driver = driver
+        self.window = driver.find(self.child.pid, WAIT_MS)
+        driver.focus()
+        self.case.note(f"{self.role}: PID {self.child.pid} window {self.window:#x}")
+        return self.window
+
+    def frame(self):
+        """One settled frame; the adapter answers once queued input is disposed (A9)."""
+        self.inspector.deadline = time.monotonic() + WATCHDOG
+        snapshot = self.inspector.receive(self.inspector.send(self.driver))
+        if len(snapshot.frames) != 1:
+            raise Refused("the pinned oracle must provide exactly one settled frame")
+        frame = snapshot.settled
+        if frame.window_width > SCREEN[0] or frame.window_height > SCREEN[1]:
+            raise Refused(f"window {frame.window_width}x{frame.window_height} exceeds the mapping")
+        return frame
+
+    def tab(self, frame):
+        """(title, first document row) of the active tab."""
+        titles, active = tab_strip(frame)
+        if active is None:
+            raise Refused(f"{self.role}: no single active tab in the strip")
+        rows = document_rows(frame)
+        return titles[active], rows[0] if rows else ""
+
+    def ring(self, bound):
+        """Walk every live tab with Ctrl+PageDown until the walk returns to its start.
+
+        Tab identities are unique by fixture construction (title and first row), so the
+        first repeat closes the ring. Off-strip tabs are visited, not inferred."""
+        first = self.tab(self.frame())
+        walked = [first]
+        for _ in range(bound):
+            self.driver.chord("Control_L", "Next")
+            current = self.tab(self.frame())
+            if current == first:
+                return walked
+            if current in walked:
+                raise Refused(f"{self.role}: tab ring repeats {current!r} before its start")
+            walked.append(current)
+        raise Refused(f"{self.role}: tab ring did not close within {bound} steps")
+
+    def steps(self, walked, start, index):
+        """Move from ring entry `start` to `index` the shorter way and verify the arrival."""
+        forward = (index - start) % len(walked)
+        key, count = ("Next", forward) if forward <= len(walked) - forward else \
+            ("Prior", len(walked) - forward)
+        for _ in range(count):
+            self.driver.chord("Control_L", key)
+        observed = self.tab(self.frame())
+        if observed != walked[index]:
+            raise Refused(f"{self.role}: expected tab {walked[index]!r}, found {observed!r}")
+
+    def copy_at(self, walked, index):
+        """Copy ring entry `index`, then return to the ring's start."""
+        self.steps(walked, 0, index)
+        data = self.copy()
+        self.steps(walked, index, 0)
+        return data
+
+    def copy(self):
+        """Select All, Copy and read CLIPBOARD from the editor after its frame settles."""
+        sentinel = self.driver.own("CLIPBOARD", b"copy observation pending")
+        self.driver.chord("Control_L", "a")
+        self.driver.chord("Control_L", "c")
+        self.frame()  # the reply follows the disposed Copy
+        owner = self.driver.owner("CLIPBOARD")
+        if owner != self.window:
+            raise Refused(f"{self.role}: CLIPBOARD owner {owner:#x} after Copy "
+                          f"(window {self.window:#x}, sentinel {sentinel:#x})")
+        return self.driver.read("CLIPBOARD", self.window, WAIT_MS)
+
+    def type_text(self, text):
+        for char in text:
+            self.driver.key(char)
+
+    def hot_exit(self):
+        """Ctrl+Q with unsaved tabs: v1 exits 0 and names the journal it keeps."""
+        if self.child.poll() is not None:
+            raise Refused(f"{self.role} exited before Ctrl+Q: {self.child.returncode}")
+        self.driver.chord("Control_L", "q")
+        if not exited(self.child, WATCHDOG):
+            raise TimeoutError(f"{self.role} did not exit before watchdog after Ctrl+Q")
+        status = self.child.wait()
+        if status != 0:
+            raise Refused(f"{self.role} exited {status} after Ctrl+Q")
+        found = JOURNAL_LINE.findall(self.log.read_bytes())
+        if len(found) != 1:
+            raise Refused(f"{self.role} named {len(found)} kept journals")
+        return Path(os.fsdecode(found[0]))
+
+    def law2(self):
+        report = GUARD.search(self.log.read_bytes())
+        if report is None:
+            raise Refused(f"{self.role} printed no allocation count")
+        active, allocations, scopes = map(int, report.groups())
+        # Fail closed on an inert guard or a window that measured nothing (v2-he7.11).
+        if active != 1 or scopes == 0:
+            raise Refused(f"{self.role} allocation guard inert or empty: {report.group()!r}")
+        return {"allocations": allocations, "scopes": scopes}
+
+
+def handoff(case, sandbox, paths, label):
+    """Forward `paths` to the primary through a second launch; True admitted, False refused."""
+    log_path = case.artifacts / "handoffs" / f"{label}.log"
+    with log_path.open("wb") as log:
+        child = sandbox.relay([str(path) for path in paths], stdout=log, stderr=log)
+    if not exited(child, WATCHDOG):
+        child.kill()
+        child.wait()
+        raise TimeoutError(f"handoff {label} did not exit before watchdog")
+    status = child.wait()
+    output = log_path.read_bytes()
+    if status == 0 and output == b"":
+        return True
+    if status == 2 and output == REFUSED:
+        return False
+    raise Refused(f"handoff {label}: neither admitted nor a capacity refusal: "
+                  f"exit {status}, {output!r}")
+
+
+def measure_capacity(case, target, display, auth):
+    """Phase 1: C in a sacrificial fresh profile, by public opens until a capacity refusal."""
+    case.step("capacity: sacrificial profile")
+    with Sandbox(case.artifacts, target, display=display) as sandbox, ExitStack() as stack:
+        Path(sandbox.env["XAUTHORITY"]).write_bytes(auth.read_bytes())
+        driver = stack.enter_context(XDriver(BUILD / "xdriver", display, env=sandbox.env,
+                                             timeout=WATCHDOG * 2))
+
+        def probes(start, count):
+            paths = [sandbox.fixtures / probe_name(start + i) for i in range(count)]
+            for path in paths:
+                write_fixture(path, content(path.name))
+            return paths
+
+        probe = Editor(case, stack, "sacrificial").spawn(sandbox.start, [str(*probes(0, 1))])
+        window = probe.bind(driver)
+        sandbox.record_server()
+        admitted, batch, attempts = 1, BATCH, []
+        # A refused request admits nothing (buffers.c: the whole request is refused), so
+        # halving the batch after each refusal ends at a refused one-path request exactly
+        # when no new tab fits: the live tab count is then C.
+        while True:
+            if admitted + batch > PROBE_BOUND:
+                raise Refused(f"no capacity refusal within {PROBE_BOUND} admitted tabs")
+            paths = probes(admitted, batch)
+            ok = handoff(case, sandbox, paths, f"probe-{len(attempts):03d}")
+            attempts.append([admitted, batch, ok])
+            if ok:
+                admitted += batch
+            elif batch == 1:
+                break
+            else:
+                for path in paths:
+                    path.unlink()
+                batch //= 2
+        refused_name = probe_name(admitted)
+        # Control: the editor is alive and an already-open path is still accepted, so the
+        # refusal was about a new slot, not a broken primary.
+        reopen = handoff(case, sandbox, [sandbox.fixtures / probe_name(0)], "probe-reopen")
+        alive = probe.child.poll() is None
+        last = probe.tab(probe.frame())
+        stop(probe.child, signal.SIGTERM)
+        case.facts["capacity"] = {
+            "C": admitted, "window": window, "pid": probe.child.pid,
+            "first": probe_name(0), "last_admitted": probe_name(admitted - 1),
+            "refused": refused_name, "receipt": REFUSED.decode().strip(),
+            "attempts": attempts, "reopen_admitted": reopen, "alive_after_refusal": alive,
+            "active_after_reopen": list(last),
+        }
+        return admitted, {"refused_one_path": True, "reopen_admitted": reopen,
+                          "alive": alive, "active_after_reopen": list(last)}
+
+
+def producers(case, sandbox, driver, stack, capacity, fill):
+    """Phase 2: the older source O, then the newer filler source F, both hot-exited."""
+    root = sandbox.fixtures
+    disk = {}
+    for name, data in OLDER:
+        write_fixture(root / name, data)
+        disk[name] = data
+    for index in range(fill):
+        name = filler_name(index)
+        write_fixture(root / name, content(name))
+        disk[name] = content(name)
+    token = os.urandom(4).hex()
+    dirty_marker = f"x{token}"
+    untitled_marker = f"u{token}"
+    expected_dirty = {DIRTY_FILE: OLDER[2][1] + dirty_marker.encode(),
+                      UNTITLED: untitled_marker.encode()}
+    data_dir = sandbox.data_dir
+
+    case.step("producers: filler starts as the IPC primary")
+    filler = Editor(case, stack, "filler").spawn(sandbox.start, [str(root / filler_name(0))])
+    filler.bind(driver)
+    sandbox.record_server()
+    started = sessions(data_dir)
+    if len(started) != 1:
+        raise Refused(f"filler start left journals {sorted(started)}")
+    filler_source = data_dir / started.pop()
+
+    case.step("producers: older starts as a --new-instance peer while the filler lives")
+    older = Editor(case, stack, "older").spawn(
+        sandbox.relay, ["--new-instance", *(str(root / name) for name, _ in OLDER)])
+    older.bind(driver)
+    both = sessions(data_dir) - {filler_source.name}
+    if len(both) != 1:
+        raise Refused(f"older start left journals {sorted(both)}")
+    older_source = data_dir / both.pop()
+
+    case.step("producers: dirty the named file and add the untitled marker")
+    for _ in range(len(OLDER)):
+        if older.tab(older.frame())[0] == DIRTY_FILE:
+            break
+        older.driver.chord("Control_L", "Next")
+    else:
+        raise Refused(f"older never activated {DIRTY_FILE}")
+    older.driver.chord("Control_L", "End")
+    older.type_text(dirty_marker)
+    older.driver.chord("Control_L", "Next")
+    if older.tab(older.frame())[0] != "c2.txt":
+        raise Refused("older: c2.txt does not follow m.txt")
+    older.driver.chord("Control_L", "n")
+    older.type_text(untitled_marker)
+    older_ring = older.ring(len(OLDER) + UNSAVED)
+    older_journal = older.hot_exit()
+    # Count rule: the producer's typing window is recorded, not asserted; v1 counts its known
+    # typing-path allocation there (xcb read_packet, docs/decisions/v2-he7.23.md).
+    case.facts["law2_older_typing"] = older.law2()
+    older_bytes = older_source.read_bytes()
+    (case.artifacts / "older-source.journal").write_bytes(older_bytes)
+
+    case.step("producers: the filler admits its clean files and exits last")
+    filler.bind(driver)
+    pending = [root / filler_name(i) for i in range(1, fill)]
+    admitted = 1
+    for start in range(0, len(pending), BATCH):
+        if not handoff(case, sandbox, pending[start:start + BATCH], f"fill-{start // BATCH:03d}"):
+            break
+        admitted += len(pending[start:start + BATCH])
+    filler_last = filler.tab(filler.frame())
+    filler_journal = filler.hot_exit()
+    filler_bytes = filler_source.read_bytes()
+    (case.artifacts / "filler-source.journal").write_bytes(filler_bytes)
+    older_mtime = older_source.stat().st_mtime_ns
+    filler_mtime = filler_source.stat().st_mtime_ns
+
+    # The older ring as a cycle starting at c0; the untitled tab's title is v1's own.
+    names = [UNTITLED if title not in dict(OLDER) else title for title, _ in older_ring]
+    if "c0.txt" not in names:
+        raise Refused(f"older ring lacks c0.txt: {older_ring}")
+    turn = names.index("c0.txt")
+    rows = {name: row for name, (_, row) in zip(names, older_ring)}
+    observed = {
+        "older_ring": names[turn:] + names[:turn],
+        "older_rows": rows,
+        "older_journal": older_journal == older_source,
+        "filler_admitted": admitted,
+        "filler_last": list(filler_last),
+        "filler_journal": filler_journal == filler_source,
+        "filler_newer": filler_mtime > older_mtime,
+        "below_startup_scan": max(len(older_bytes), len(filler_bytes)) < STARTUP_SCAN_BYTES,
+    }
+    expected = {
+        "older_ring": [name for name, _ in OLDER] + [UNTITLED],
+        "older_rows": {**{name: data.decode() for name, data in OLDER},
+                       DIRTY_FILE: expected_dirty[DIRTY_FILE].decode(),
+                       UNTITLED: untitled_marker},
+        "older_journal": True, "filler_admitted": fill,
+        "filler_last": [filler_name(fill - 1), content(filler_name(fill - 1)).decode()],
+        "filler_journal": True, "filler_newer": True, "below_startup_scan": True,
+    }
+    case.facts["producers"] = {
+        "older_source": older_source.name, "older_bytes": len(older_bytes),
+        "older_mtime_ns": older_mtime, "filler_source": filler_source.name,
+        "filler_bytes": len(filler_bytes), "filler_mtime_ns": filler_mtime,
+        "fill": fill, "U": UNSAVED, "C": capacity, "token": token,
+        "older_ring_raw": older_ring,
+    }
+    case.check("producers-admitted", observed, expected)
+    return disk, expected_dirty, older_source, older_bytes, filler_source
+
+
+def classify(walked):
+    """Split a restored ring into fillers, older clean files and the dirty tabs."""
+    olders = dict(OLDER)
+    fillers, older_clean, dirty, other = [], [], {}, []
+    for index, (title, row) in enumerate(walked):
+        if re.fullmatch(r"f\d{4}\.txt", title) and row.encode() == content(title):
+            fillers.append(title)
+        elif title in OLDER_CLEAN and row.encode() == olders[title]:
+            older_clean.append(title)
+        elif title == DIRTY_FILE:
+            dirty[DIRTY_FILE] = index
+        elif title not in olders and not re.fullmatch(r"[fp]\d{4}\.txt", title):
+            dirty.setdefault(UNTITLED, index)
+            if dirty[UNTITLED] != index:
+                other.append(title)
+        else:
+            other.append(title)
+    return fillers, older_clean, dirty, other
+
+
+def restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
+            older_source, older_bytes, filler_source):
+    """Phase 3: the pressured relaunch, then a SIGKILL and a second relaunch."""
+    room_clean = capacity - fill - UNSAVED  # live room left once F and every unsaved tab fit
+    case.step("restore: argument-free relaunch under pressure")
+    first = Editor(case, stack, "restored").spawn(sandbox.restart, [])
+    first.bind(driver)
+    sandbox.record_server()
+    frame = first.frame()
+    notice = frame.bottom_row_text().rstrip(" ")
+    columns = frame.bottom_row.width
+    data_after = sorted(p.name for p in sandbox.data_dir.iterdir())
+    walked = first.ring(capacity + 1)
+    (case.artifacts / "restored-ring.json").write_text(json.dumps(walked) + "\n")
+    fillers, older_clean, dirty, other = classify(walked)
+    case.facts["restored"] = {"live": len(walked), "fillers": len(fillers),
+                              "older_clean": older_clean, "dirty_positions": dirty,
+                              "unclassified": other, "notice": notice, "columns": columns,
+                              "data_dir": data_after}
+    case.check("partial-restore-triggered",
+               {"live": len(walked), "fillers": len(fillers),
+                "older_restored_whole": len(older_clean) == len(OLDER_CLEAN) and len(dirty) == 2,
+                "unclassified": other},
+               {"live": capacity, "fillers": fill, "older_restored_whole": False,
+                "unclassified": []})
+    dropped = len(OLDER_CLEAN) - len(older_clean)
+    case.check("notice-visible", notice,
+               NOTICE.format(u=UNSAVED, d=dropped)[:columns].rstrip(" "))
+    copies = {key: first.copy_at(walked, dirty[key]) if key in dirty else None
+              for key in (DIRTY_FILE, UNTITLED)}
+    case.check("dirty-restored", copies, expected_dirty)
+    # (P) the fixture leaves live room for exactly room_clean = C - fill - U = 1 clean tab of
+    # the older session's three, so at least two known clean tabs are excess.
+    case.check("excess-clean-absent", len(older_clean), room_clean, wrong=len(OLDER_CLEAN))
+    aside = [name for name in data_after
+             if name.startswith(older_source.name + ".set-aside-")]
+    if filler_source.name in data_after:
+        raise Refused("the filler source is still present: no durable restore checkpoint")
+    case.check("omitted-state-recoverable",
+               {"set_aside": len(aside),
+                "bytes": [hashlib.sha256((sandbox.data_dir / name).read_bytes()).hexdigest()
+                          for name in aside]},
+               {"set_aside": 1, "bytes": [hashlib.sha256(older_bytes).hexdigest()]})
+
+    case.step("restore: SIGKILL before any save, then relaunch")
+    with os.fdopen(os.pidfd_open(first.child.pid), "rb") as pidfd:
+        signal.pidfd_send_signal(pidfd.fileno(), signal.SIGKILL)
+    if not exited(first.child, WATCHDOG):
+        raise TimeoutError("restored editor survived SIGKILL past the watchdog")
+    if first.child.wait() != -signal.SIGKILL:
+        raise Refused(f"restored editor exit {first.child.returncode}, expected SIGKILL")
+    second = Editor(case, stack, "relaunched").spawn(sandbox.restart, [])
+    second.bind(driver)
+    sandbox.record_server()
+    second_notice = second.frame().bottom_row_text().rstrip(" ")
+    again = second.ring(capacity + 1)
+    (case.artifacts / "relaunched-ring.json").write_text(json.dumps(again) + "\n")
+    _, _, dirty_again, _ = classify(again)
+    copies_again = {key: second.copy_at(again, dirty_again[key]) if key in dirty_again else None
+                    for key in (DIRTY_FILE, UNTITLED)}
+    case.facts["relaunched"] = {"live": len(again), "notice": second_notice}
+    case.check("second-recovery",
+               {"tabs": sorted(again), "dirty": copies_again},
+               {"tabs": sorted(walked), "dirty": expected_dirty})
+
+    case.step("restore: clean close and disk check")
+    status = stop(second.child, signal.SIGTERM)
+    if status != 0:
+        raise Refused(f"relaunched editor clean close returned {status}")
+    case.check("disk-intact",
+               {name: (sandbox.fixtures / name).read_bytes() for name in sorted(disk)},
+               {name: disk[name] for name in sorted(disk)})
+    return second
+
+
+def scenario(case, target, display, auth):
+    capacity, receipt = measure_capacity(case, target, display, auth)
+    case.check("capacity-measured", receipt,
+               {"refused_one_path": True, "reopen_admitted": True, "alive": True,
+                "active_after_reopen": [probe_name(0), content(probe_name(0)).decode()]})
+    fill = 1 if case.negative == "no-pressure" else capacity - UNSAVED - 1
+    if fill < 1:
+        raise Refused(f"capacity {capacity} leaves no room for a filler")
+    with Sandbox(case.artifacts, target, display=display) as sandbox, ExitStack() as stack:
+        Path(sandbox.env["XAUTHORITY"]).write_bytes(auth.read_bytes())
+        driver = stack.enter_context(XDriver(BUILD / "xdriver", display, env=sandbox.env,
+                                             timeout=WATCHDOG * 2))
+        try:
+            disk, expected_dirty, older_source, older_bytes, filler_source = producers(
+                case, sandbox, driver, stack, capacity, fill)
+            last = restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
+                           older_source, older_bytes, filler_source)
+            counts = {"relaunched": last.law2()}
+            case.facts["law2"] = counts
+            # Count rule (wave0-contract-design.md): v1 measured 0 over the relaunched editor's
+            # tab-walk and copy windows (run contract-capacity-v8wtgv9p: 1007 scopes), so the
+            # count is asserted on v1 as on v2.
+            case.check("law2-count", counts["relaunched"]["allocations"], 0, wrong=1)
+        finally:
+            if sandbox.data_dir.exists():
+                shutil.copytree(sandbox.data_dir, case.artifacts / "data")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--build-dir", required=True, type=Path,
+                        help="absolute inspected v1 build/contract-oracle directory")
+    parser.add_argument("--display", required=True)
+    parser.add_argument("--negative", choices=NEGATIVES,
+                        help="red control: a wrong expectation or a fixture without pressure")
+    args = parser.parse_args()
+    if not CONTRACT_DISPLAY.fullmatch(args.display):
+        parser.error("--display must be a contract display, :120 through :199")
+    if not args.build_dir.is_absolute():
+        parser.error("--build-dir must be absolute")
+
+    BUILD.mkdir(exist_ok=True)
+    artifacts = Path(tempfile.mkdtemp(prefix="contract-capacity-", dir=BUILD))
+    (artifacts / "handoffs").mkdir()
+    case = Case(artifacts, args.negative)
+    try:
+        battery = Path("/sys/class/power_supply/BAT0/status").read_text(encoding="ascii").strip()
+    except OSError:
+        battery = None
+    manifest = {"run_id": artifacts.name, "display": args.display, "geometry": GEOMETRY,
+                "battery_status": battery, "load_average": os.getloadavg(),
+                "negative": args.negative, "oracle_build": str(args.build_dir),
+                "started": time.time()}
+    print(f"R4 run artifacts in {artifacts}", file=sys.stderr, flush=True)
+    try:
+        stamp = json.loads((args.build_dir / STAMP).read_text(encoding="utf-8"))
+        if stamp["pin"] != PIN or stamp["patch_sha256"] != sha256(PATCH):
+            raise Refused("oracle manifest differs from the pinned source or patch")
+        target = RunTarget("v1", args.build_dir / EDITOR, args.build_dir,
+                           stamp["executables"][EDITOR])
+        manifest.update(role=target.role, oracle=str(target.executable), sha256=target.sha256,
+                        commit=PIN, patch_sha256=stamp["patch_sha256"])
+        with private_display(args.display, artifacts) as auth:
+            scenario(case, target, args.display, auth)
+        if tuple(case.asserted) != ASSERTIONS:
+            case.stage = "assertion-inventory"
+            raise Refused(f"assertion inventory incomplete: {case.asserted}")
+    except Mismatch as exc:
+        case.failure(exc)
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        case.failure(exc)
+    finally:
+        manifest["finished"] = time.time()
+        manifest["status"] = case.status
+        (artifacts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n",
+                                                 encoding="utf-8")
+    return records.EXIT[case.status]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -467,13 +467,18 @@ class Sandbox:
                 raise Refused("recorded IPC primary already exited")
             return self._verify_peer(endpoint)
 
-    def relay(self, argv=(), *, stdin=subprocess.DEVNULL, stdout=None, stderr=None):
-        """Launch a forwarding process after verifying the existing primary."""
+    def relay(self, argv=(), *, stdin=subprocess.DEVNULL, stdout=None, stderr=None, pass_fds=()):
+        """Launch a forwarding process after verifying the existing primary.
+
+        The same launch starts a peer that shares this profile without the endpoint (v1
+        --new-instance); `pass_fds` names the caller's descriptors it may inherit (R4's
+        inspector pair), exactly as for `start` and `restart`."""
         with self.connect():
             pass
         with self._checked() as env:
             self._verify_endpoint(self._recorded())
-            return self._spawn(argv, env, stdin=stdin, stdout=stdout, stderr=stderr, pass_fds=())
+            return self._spawn(argv, env, stdin=stdin, stdout=stdout, stderr=stderr,
+                               pass_fds=pass_fds)
 
     def restart(self, argv=(), *, stdin=subprocess.DEVNULL, stdout=None, stderr=None, pass_fds=()):
         """Allow the editor to reclaim only its own recorded, dead socket.
