@@ -38,3 +38,19 @@ FUZZ_SUITES += fuzz/utf8_fuzz.c
 # indent (v2-0fv.12)
 SAN_SUITES += tests/indent_test.c
 FUZZ_SUITES += fuzz/indent_fuzz.c
+
+# os fault ids (v2-0fv.2)
+SAN_SUITES += tests/os_fault_test.c
+LAW2_SUITES += tests/law2_os_fault_test.c
+TSAN_SUITES += tests/os_fault_test.c
+FUZZ_SUITES += fuzz/os_fuzz.c
+
+# Per-suite link flags, LDFLAGS_<suite stem>, in every configuration. The fault
+# suite injects native failures through these wrappers (CLAUDE.md: --wrap).
+LDFLAGS_os_fault_test := -Wl,--wrap=mmap,--wrap=sigaction,--wrap=sysconf,--wrap=syscall \
+                         -Wl,--wrap=sem_init,--wrap=sem_destroy,--wrap=sem_wait,--wrap=sem_post
+
+# Per-suite test-hook objects (Makefile CFG_TEST_HOOKS): os built with its
+# generation setter (A15) for the fault suites.
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/os_fault_test: $(B)/$(c)/src/os/os_posix_test_hooks.o))
+$(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o

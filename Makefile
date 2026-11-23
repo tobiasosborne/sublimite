@@ -121,7 +121,15 @@ $(B)/$(1)/%.o: %.c
 	@mkdir -p $$(@D)
 	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -DEDIT_APP_ID=\"$$(APP_ID)\" -c $$< -o $$@
 endef
+# A test-hooks object is its module source with EDIT_TEST_HOOKS; a suite
+# links it ahead of the archives (tests/lanes.mk), which never contain it.
+define CFG_TEST_HOOKS
+$(B)/$(1)/%_test_hooks.o: %.c
+	@mkdir -p $$(@D)
+	$$(CC_$(1)) $$(WARN) $$(CF_$(1)) $$(INC) $$(DEP) -DEDIT_APP_ID=\"$$(APP_ID)\" -DEDIT_TEST_HOOKS -c $$< -o $$@
+endef
 $(foreach c,$(CFGS),$(eval $(call CFG_COMPILE,$(c))))
+$(foreach c,$(CFGS),$(eval $(call CFG_TEST_HOOKS,$(c))))
 
 # The release binary owns the allocation hooks. Sanitizers own them in all
 # other configurations.
@@ -144,13 +152,13 @@ endif
 
 $(B)/rel/tests/%: $(B)/rel/tests/%.o $(call libs_desc,rel)
 	@mkdir -p $(@D)
-	$(CC_RELEASE) $(REL_F) -pthread $< $(call libs_desc,rel) $(LDLIBS) -o $@
+	$(CC_RELEASE) $(REL_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,rel) $(LDLIBS) -o $@
 $(B)/san/tests/%: $(B)/san/tests/%.o $(call libs_desc,san)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(SAN_F) -pthread $< $(call libs_desc,san) $(LDLIBS) -o $@
+	$(CC_SAN) $(SAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,san) $(LDLIBS) -o $@
 $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(TSAN_F) -pthread $< $(call libs_desc,tsan) $(LDLIBS) -o $@
+	$(CC_SAN) $(TSAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,tsan) $(LDLIBS) -o $@
 # Work initialization faults are injected at the OS boundary in this suite.
 WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
                    os_cond_init os_cond_destroy os_thread_start os_thread_join

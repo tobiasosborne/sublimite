@@ -44,6 +44,7 @@ __realpath_chk         os # fortified realpath
 accept4                os # accept a local stream connection, nonblocking and close-on-exec
 bind                   os # bind a local stream endpoint name
 chmod                  os # owner-only mode on a pinned socket inode via /proc/self/fd
+abort                  os # the one ASSERT: abort after its fixed message (A15)
 clock_getres           os # POSIX clock resolution
 clock_gettime          os # POSIX clock read
 close                  os # release a file descriptor
@@ -73,6 +74,7 @@ getrandom              os # Linux kernel random bytes
 getrlimit              os # current process resource limits
 getsockopt             os # SO_PEERCRED peer user ID of a local stream
 getuid                 os # real user ID for endpoint names and ownership checks
+gettid                 os # calling thread ID for the fault test trigger
 ioctl                  os # Linux FICLONE reflink request
 kill                   os # send a signal to a child process
 listen                 os # listen on a bound local stream endpoint
@@ -107,6 +109,7 @@ pthread_mutexattr_settype os # select recursive mutex semantics
 pthread_once           os # thread-safe one-time initialization
 pthread_self           os # calling thread identity
 pwrite                 os # positioned file write
+raise                  os # fault chain: re-raise SIGBUS under the default action
 read                   os # sequential read or eventfd drain
 readdir                os # advance a directory stream
 readlink               os # read a symlink target
@@ -125,6 +128,13 @@ stat                   os # path metadata following symlinks
 sysconf                os # query Linux physical page count
 timerfd_create         os # wait set alarm
 timerfd_settime        os # arm or disarm the wait set alarm
+sem_destroy            os # release the fault drain semaphore after a failed installation
+sem_init               os # fault drain semaphore at installation
+sem_post               os # last handler leaving a retiring fault slot (async-signal-safe)
+sem_wait               os # retiring owner waits for admitted fault handlers
+sigaction              os # query, install and reset the SIGBUS action (fault service)
+sigemptyset            os # empty mask for the fault chain's default action
+syscall                os # rt_tgsigqueueinfo for the fault test trigger
 unlink                 os # remove a non-directory name
 unlinkat               os # directory-relative name removal
 unsetenv               os # remove a process environment variable

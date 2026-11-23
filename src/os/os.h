@@ -53,6 +53,16 @@ typedef enum os_err {
 const char *os_err_name(os_err e);
 int os_native_error(void);
 
+/* The one assertion for the whole tree (CLAUDE.md, A15), compiled into every
+ * build. Only for conditions no input, file content, resource exhaustion or
+ * timing can produce; anything those can produce is a return code. A failure
+ * writes "file:line: ASSERT failed: expression" to stderr with write(2) and
+ * aborts. Both are async-signal-safe, so a signal handler may ASSERT.
+ * An ASSERT argument has no side effects: do the call as a statement, then
+ * ASSERT its result. */
+#define ASSERT(x) ((x) ? (void)0 : os_assert_fail(__FILE__, __LINE__, #x))
+_Noreturn void os_assert_fail(const char *file, int line, const char *expr);
+
 /* (P) Linux PATH_MAX includes the NUL. Name storage includes NAME_MAX
  * bytes plus the NUL (linux/limits.h). */
 #define OS_PATH_MAX 4096u
@@ -292,6 +302,62 @@ typedef struct os_map {
 os_err os_map_file(os_map *out, const os_file *f, uint64_t offset, size_t len);
 void os_unmap(os_map *m);
 void os_map_prefetch(const os_map *m, size_t off, size_t len);
+
+/* Mapped-file fault service (docs/decisions/wave1-os-fault-lease.md). A file
+ * can shrink, or its device fail, under a view: Linux raises SIGBUS with code
+ * BUS_ADRERR or BUS_OBJERR. For a registered view the process-wide handler
+ * counts the registration's epoch, then replaces the view from the faulting
+ * page through its end with zero pages, and the read completes with zeros.
+ * Bytes before that page keep reading the file. A SIGBUS the service does not
+ * repair terminates the process by SIGBUS, unless a callable handler was
+ * installed before the service, which is then called with the original
+ * signal, siginfo and ucontext, errno restored; its SA_RESETHAND is not
+ * emulated, and a prior SIG_IGN counts as SIG_DFL. os is the only module that
+ * sets a signal action; the service installs on first registration.
+ *
+ * Capacity (M): v1 OS_FAULT_SLOTS, from v1 src/file/file.c FILE_GUARD_SLOTS.
+ * An id is a copyable value. Generation 0 is the absent id; issued
+ * generations never repeat, so a stale id never reads another registration.
+ * An id grants no access to bytes: readers hold the backing that owns the
+ * view, and only its final release retires the id. None of these four
+ * functions allocate; none may be called from a signal handler. */
+#define OS_FAULT_SLOTS 256
+
+typedef struct os_fault_id {
+    uint32_t slot;
+    uint64_t gen;
+} os_fault_id;
+
+#define OS_FAULT_ID_INIT { .slot = 0, .gen = 0 }
+
+/* Owner, before publishing readable bytes. The view is a live read-only
+ * private os_map_file view, borrowed until a successful retire. Null inputs,
+ * an empty or unaligned view, or an end (or page-rounded end) past the address
+ * space give OS_E_INVAL; a page-rounded extent intersecting a registered one
+ * gives OS_E_EXIST (distinct views of one file are fine); OS_E_NOTSUP if the
+ * service cannot be installed (sticky); OS_E_NOSPC with no free slot or no
+ * issuable generation. On failure *out is the absent id. */
+os_err os_fault_register(const os_map *view, os_fault_id *out);
+/* Any thread, lock-free, on a copied id, concurrently with anything else.
+ * On OS_OK *epoch is the registration's recovery count (0: pristine; it
+ * saturates at UINT64_MAX and never returns to 0). A zero generation, an
+ * index outside the table or a null epoch give OS_E_INVAL; an id that is not
+ * registered (retired, or superseded by a later registration) OS_E_NOENT.
+ * Failure leaves *epoch untouched. Bracket mapped reads with two polls and
+ * require 0 from both: the poll orders the caller's earlier reads before it. */
+os_err os_fault_poll(os_fault_id id, uint64_t *epoch);
+/* The registration owner only, at final release after all byte access has
+ * ended. Invalidates the id, waits for handlers already inside the view to
+ * finish, and frees the slot; only OS_OK permits unmapping the view.
+ * OS_E_INVAL for a malformed id, OS_E_NOENT for a missing or stale one, which
+ * leaves the current registration untouched. */
+os_err os_fault_retire(os_fault_id id);
+/* TEST ONLY. Sends SIGBUS (code BUS_ADRERR, address view->addr + off) to the
+ * calling thread, which must have SIGBUS unblocked; it is delivered before
+ * the call returns. OS_E_INVAL for a null view or off >= view->len; the
+ * native send error otherwise. A recovered or forwarded and returning signal
+ * gives OS_OK; a forwarded signal can also terminate the process. */
+os_err os_fault_test_trigger(const os_map *view, size_t off);
 
 /* Reservation uses lazily backed read/write pages. Commit validates the
  * page-aligned range. Decommit discards its backing and the next touch reads

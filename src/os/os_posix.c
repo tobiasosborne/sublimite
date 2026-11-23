@@ -7,9 +7,11 @@
 #include <linux/fs.h>
 #include <poll.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -86,6 +89,28 @@ const char *os_err_name(os_err e)
     return i < sizeof names / sizeof names[0] ? names[i] : "OS_E_?";
 }
 int os_native_error(void) { return errno; }
+
+_Noreturn void os_assert_fail(const char *file, int line, const char *expr)
+{
+    /* Async-signal-safe: digits by hand, then write(2) and abort(3). */
+    char digits[sizeof "2147483647"];
+    size_t at = sizeof digits;
+    unsigned v = line > 0 ? (unsigned)line : 0u;
+    do digits[--at] = (char)('0' + v % 10u); while ((v /= 10u) != 0 && at > 0);
+    const char *part[] = {file, ":", NULL, ": ASSERT failed: ", expr, "\n"};
+    for (size_t i = 0; i < sizeof part / sizeof part[0]; i++) {
+        const char *p = part[i] ? part[i] : digits + at;
+        size_t n = part[i] ? strlen(p) : sizeof digits - at;
+        while (n > 0) {
+            ssize_t w = write(STDERR_FILENO, p, n);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            p += w;
+            n -= (size_t)w;
+        }
+    }
+    abort();
+}
 
 /* Copies a NUL-terminated string into a caller buffer, or OS_E_RANGE. */
 static os_err copy_out(char *out, size_t cap, const char *s, size_t len)
@@ -814,6 +839,351 @@ os_err os_vm_decommit(void *addr, size_t len)
 void os_vm_release(void *addr, size_t len)
 {
     if (addr && len) (void)munmap(addr, len);
+}
+
+/* ---- mapped-file fault service ------------------------------------------ */
+/* docs/decisions/wave1-os-fault-lease.md. The signal ABI gives the handler no
+ * context, so the registry is the one PLAN-named global, os_fault_service.
+ * Audited target: Linux x86-64 with glibc, whose mmap is async-signal-safe;
+ * the build compiles no other backend.
+ *
+ * Every atomic operation is seq_cst, written without _explicit forms. A
+ * weaker order needs a proof and a measured need; the default needs neither.
+ *
+ * The handler takes no lock, waits for nothing, allocates nothing and logs
+ * nothing. It calls mmap, sem_post, sigemptyset, sigaction and raise (and,
+ * on a broken invariant, ASSERT's write and abort), uses only atomics checked
+ * lock-free at installation, and restores errno. */
+
+/* The control word: a phase in its low two bits plus FAULT_HANDLER per
+ * admitted handler. */
+typedef enum fault_phase { SLOT_FREE, SLOT_LIVE, SLOT_RETIRING } fault_phase;
+#define FAULT_PHASE_MASK UINT64_C(3)
+#define FAULT_HANDLER UINT64_C(4)
+/* (P) The count has 62 bits. Every simultaneous admission holds one slot in
+ * its own live signal frame, which contains a siginfo_t; a 64-bit address
+ * space holds at most 2^64 / sizeof(siginfo_t) such frames, fewer than 2^61
+ * when sizeof(siginfo_t) > 8. So the count cannot overflow. */
+_Static_assert(sizeof(void *) == sizeof(uint64_t), "fault count bound: 64-bit address space");
+_Static_assert(sizeof(siginfo_t) > 8, "fault count bound: signal frame larger than eight bytes");
+
+typedef enum fault_install_state { FAULT_COLD, FAULT_READY, FAULT_UNAVAILABLE } fault_install_state;
+/* Where an unrepaired SIGBUS goes: death by SIGBUS, or the callable handler
+ * installed before the service, in its signature. */
+typedef enum fault_prior { PRIOR_NONE, PRIOR_HANDLER, PRIOR_SIGINFO } fault_prior;
+
+typedef struct fault_slot {
+    /* Only the mutex holder changes the phase. Handlers add FAULT_HANDLER
+     * only in LIVE and remove it in LIVE or RETIRING. FREE has no handlers;
+     * RETIRING exists only while its retiring owner holds the mutex. */
+    _Atomic uint64_t control;
+    /* The issued generation from publication to invalidation, else 0. */
+    _Atomic uint64_t gen;
+    /* Recoveries of the current registration, saturating at UINT64_MAX;
+     * reset only by register while gen is 0 and no handler is admitted. */
+    _Atomic uint64_t epoch;
+    /* Written by the registering owner while FREE; read by a handler only
+     * after its admission, so they are the registration it entered. */
+    uintptr_t base;
+    size_t len;
+} fault_slot;
+
+typedef struct fault_service {
+    fault_slot slots[OS_FAULT_SLOTS];
+    /* Serializes register and retire, including the whole drain. Never taken
+     * by poll or the handler. */
+    pthread_mutex_t mu;
+    /* Last issued generation across all slots; under mu, never polled. */
+    uint64_t issued;
+    os_once once;
+    /* Written once by fault_install; read after os_once_run returns. */
+    fault_install_state install;
+    /* Zero except between the last departure from a closed slot and its
+     * retiring owner's wait, both inside that owner's hold of mu. */
+    sem_t drain;
+    /* A power of two, set before the handler is installed. */
+    uintptr_t page;
+    /* The action the service replaced; written once, before prior_kind. */
+    struct sigaction prior;
+    _Atomic fault_prior prior_kind;
+} fault_service;
+
+static fault_service os_fault_service = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+    .once = OS_ONCE_INIT,
+    .install = FAULT_COLD,
+};
+
+static uintptr_t fault_end(uintptr_t base, size_t len, uintptr_t page)
+{
+    return (base + len + page - 1u) & ~(page - 1u);
+}
+
+/* Admits a handler into a LIVE slot; a failed CAS re-evaluates the phase. */
+static bool fault_admit(fault_slot *slot)
+{
+    uint64_t w = atomic_load(&slot->control);
+    for (;;) {
+        switch ((fault_phase)(w & FAULT_PHASE_MASK)) {
+        case SLOT_FREE:
+        case SLOT_RETIRING:
+            return false;
+        case SLOT_LIVE:
+            break;
+        }
+        if (atomic_compare_exchange_weak(&slot->control, &w, w + FAULT_HANDLER)) return true;
+    }
+}
+
+/* Drops an admission after the handler's last access to the slot and its
+ * view. The departure that leaves a closed slot empty owes one post. */
+static void fault_leave(fault_slot *slot)
+{
+    if (atomic_fetch_sub(&slot->control, FAULT_HANDLER) == (FAULT_HANDLER | SLOT_RETIRING)) {
+        int posted = sem_post(&os_fault_service.drain);
+        ASSERT(posted == 0);
+    }
+}
+
+/* True if a registration covers a and its suffix now reads zeros. */
+static bool fault_recover(uintptr_t a)
+{
+    fault_service *s = &os_fault_service;
+    for (size_t i = 0; i < OS_FAULT_SLOTS; i++) {
+        fault_slot *slot = &s->slots[i];
+        if (!fault_admit(slot)) continue;
+        uintptr_t base = slot->base;
+        size_t len = slot->len;
+        if (a < base || a - base >= len) {
+            fault_leave(slot);
+            continue;
+        }
+        /* Overlap rejection makes this the only match. Taint, saturating,
+         * then fence, so no zero page is readable before the count. */
+        uint64_t e = atomic_load(&slot->epoch);
+        while (e != UINT64_MAX && !atomic_compare_exchange_weak(&slot->epoch, &e, e + 1u)) {}
+        atomic_thread_fence(memory_order_seq_cst);
+        /* From the faulting page through the logical end; the kernel rounds
+         * the length up within the registered page-rounded extent. */
+        uintptr_t from = a & ~(s->page - 1u);
+        bool ok = mmap((void *)from, base + len - from, PROT_READ,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) != MAP_FAILED;
+        fault_leave(slot);
+        return ok;
+    }
+    return false;
+}
+
+static void fault_handler(int sig, siginfo_t *si, void *uc)
+{
+    int saved = errno;
+    if ((si->si_code == BUS_ADRERR || si->si_code == BUS_OBJERR) && fault_recover((uintptr_t)si->si_addr)) {
+        errno = saved;
+        return;
+    }
+    /* Unrepaired. With no prior handler (PRIOR_NONE) the process dies by
+     * SIGBUS: never back to the faulting instruction with nothing changed.
+     * With a prior callable handler the outcome is that handler's, as it would
+     * be without the service (a handler that returns re-executes the
+     * instruction). The prior handler runs in signal context under its own
+     * async-signal-safety obligation; its SA_RESETHAND is not emulated.
+     * prior_kind's load reads the store fault_install made after writing the
+     * prior cell and before the sigaction that installed this handler: that
+     * atomic is the happens-before edge to the cell on every thread. */
+    switch (atomic_load(&os_fault_service.prior_kind)) {
+    case PRIOR_HANDLER:
+        errno = saved;
+        os_fault_service.prior.sa_handler(sig);
+        break;
+    case PRIOR_SIGINFO:
+        errno = saved;
+        os_fault_service.prior.sa_sigaction(sig, si, uc);
+        break;
+    case PRIOR_NONE: {
+        /* SIGBUS stays blocked until this handler returns, then the pending
+         * one kills under SIG_DFL (as would a repeated real fault). */
+        struct sigaction def = {.sa_handler = SIG_DFL};
+        int empty = sigemptyset(&def.sa_mask);
+        ASSERT(empty == 0);
+        int reset = sigaction(SIGBUS, &def, NULL);
+        ASSERT(reset == 0);
+        int raised = raise(SIGBUS);
+        ASSERT(raised == 0);
+        break;
+    }
+    }
+    errno = saved;
+}
+
+static void fault_install(void)
+{
+    fault_service *s = &os_fault_service;
+    s->install = FAULT_UNAVAILABLE;
+    for (size_t i = 0; i < OS_FAULT_SLOTS; i++) {
+        fault_slot *slot = &s->slots[i];
+        if (!atomic_is_lock_free(&slot->control) || !atomic_is_lock_free(&slot->gen) ||
+            !atomic_is_lock_free(&slot->epoch))
+            return;
+    }
+    if (!atomic_is_lock_free(&s->prior_kind)) return;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || (page & (page - 1)) != 0) return;
+    s->page = (uintptr_t)page;
+    if (sem_init(&s->drain, 0, 0) != 0) return;
+    /* A fixed action: SA_SIGINFO, empty mask. */
+    struct sigaction sa = {.sa_sigaction = fault_handler, .sa_flags = SA_SIGINFO};
+    int empty = sigemptyset(&sa.sa_mask);
+    ASSERT(empty == 0);
+    if (sigaction(SIGBUS, NULL, &s->prior) != 0) {
+        (void)sem_destroy(&s->drain);
+        return;
+    }
+    void (*h)(int) = s->prior.sa_handler;
+    atomic_store(&s->prior_kind, h == SIG_DFL || h == SIG_IGN ? PRIOR_NONE
+                                 : (s->prior.sa_flags & SA_SIGINFO) ? PRIOR_SIGINFO
+                                                                     : PRIOR_HANDLER);
+    if (sigaction(SIGBUS, &sa, NULL) != 0) {
+        (void)sem_destroy(&s->drain);
+        return;
+    }
+    s->install = FAULT_READY;
+}
+
+/* Under mu. Rejects intersecting rounded extents, then takes the lowest free
+ * slot and publishes a fresh generation. */
+static os_err fault_claim(fault_service *s, uintptr_t base, size_t len, os_fault_id *out)
+{
+    uintptr_t end = fault_end(base, len, s->page);
+    size_t at = OS_FAULT_SLOTS;
+    for (size_t i = 0; i < OS_FAULT_SLOTS; i++) {
+        fault_slot *slot = &s->slots[i];
+        switch ((fault_phase)(atomic_load(&slot->control) & FAULT_PHASE_MASK)) {
+        case SLOT_FREE:
+            if (at == OS_FAULT_SLOTS) at = i;
+            break;
+        case SLOT_LIVE:
+            if (base < fault_end(slot->base, slot->len, s->page) && slot->base < end) return OS_E_EXIST;
+            break;
+        case SLOT_RETIRING:
+            ASSERT(false && "RETIRING outside its owner's hold of mu");
+            break;
+        }
+    }
+    /* Generations never wrap; ids already issued stay usable. */
+    if (s->issued == UINT64_MAX || at == OS_FAULT_SLOTS) return OS_E_NOSPC;
+
+    fault_slot *slot = &s->slots[at];
+    ASSERT(atomic_load(&slot->control) == SLOT_FREE);
+    slot->base = base;
+    slot->len = len;
+    atomic_store(&slot->epoch, 0);
+    atomic_store(&slot->control, SLOT_LIVE);
+    uint64_t gen = ++s->issued;
+    atomic_store(&slot->gen, gen); /* Last: the pollable identity. */
+    out->slot = (uint32_t)at;
+    out->gen = gen;
+    return OS_OK;
+}
+
+os_err os_fault_register(const os_map *view, os_fault_id *out)
+{
+    if (!out) return fail_with(OS_E_INVAL);
+    *out = (os_fault_id)OS_FAULT_ID_INIT;
+    if (!view || !view->addr || !view->len) return fail_with(OS_E_INVAL);
+    fault_service *s = &os_fault_service;
+    os_once_run(&s->once, fault_install);
+    switch (s->install) {
+    case FAULT_READY:
+        break;
+    case FAULT_COLD:
+    case FAULT_UNAVAILABLE:
+        return fail_with(OS_E_NOTSUP);
+    }
+    uintptr_t base = (uintptr_t)view->addr, mask = s->page - 1u;
+    if ((base & mask) || view->len > UINTPTR_MAX - base || base + view->len > UINTPTR_MAX - mask)
+        return fail_with(OS_E_INVAL);
+    (void)pthread_mutex_lock(&s->mu);
+    os_err rc = fault_claim(s, base, view->len, out);
+    (void)pthread_mutex_unlock(&s->mu);
+    return rc == OS_OK ? OS_OK : fail_with(rc);
+}
+
+os_err os_fault_poll(os_fault_id id, uint64_t *epoch)
+{
+    if (!epoch || !id.gen || id.slot >= OS_FAULT_SLOTS) return fail_with(OS_E_INVAL);
+    /* The mapped byte loads are not atomic, so the closing validation needs
+     * a barrier compiler and machine both respect. */
+    atomic_thread_fence(memory_order_seq_cst);
+    fault_slot *slot = &os_fault_service.slots[id.slot];
+    /* Two equal samples of a generation issued once bracket the epoch load
+     * inside that registration: retire zeroes gen before any reset. */
+    if (atomic_load(&slot->gen) != id.gen) return fail_with(OS_E_NOENT);
+    uint64_t e = atomic_load(&slot->epoch);
+    if (atomic_load(&slot->gen) != id.gen) return fail_with(OS_E_NOENT);
+    *epoch = e;
+    return OS_OK;
+}
+
+os_err os_fault_retire(os_fault_id id)
+{
+    if (!id.gen || id.slot >= OS_FAULT_SLOTS) return fail_with(OS_E_INVAL);
+    fault_service *s = &os_fault_service;
+    fault_slot *slot = &s->slots[id.slot];
+    (void)pthread_mutex_lock(&s->mu);
+    /* Under mu a published generation means LIVE, and only this id's. */
+    if (atomic_load(&slot->gen) != id.gen) {
+        (void)pthread_mutex_unlock(&s->mu);
+        return fail_with(OS_E_NOENT);
+    }
+    /* Invalidate before the close and before any later epoch reset. */
+    atomic_store(&slot->gen, 0);
+    /* Close LIVE -> RETIRING keeping the count: no admission after this. */
+    uint64_t w = atomic_load(&slot->control);
+    do {
+        ASSERT((w & FAULT_PHASE_MASK) == SLOT_LIVE);
+    } while (!atomic_compare_exchange_weak(&slot->control, &w, (w & ~FAULT_PHASE_MASK) | SLOT_RETIRING));
+    /* A positive count owes exactly one post, possibly already made. */
+    if (w & ~FAULT_PHASE_MASK) {
+        int rc;
+        while ((rc = sem_wait(&s->drain)) != 0 && errno == EINTR) {}
+        ASSERT(rc == 0);
+    }
+    /* Close observes every admitted handler gone, then frees the slot. */
+    w = atomic_load(&slot->control);
+    ASSERT(w == SLOT_RETIRING);
+    atomic_store(&slot->control, SLOT_FREE);
+    (void)pthread_mutex_unlock(&s->mu);
+    return OS_OK;
+}
+
+#ifdef EDIT_TEST_HOOKS
+/* Test builds only (A15): register next issues generation `next` (nonzero,
+ * forward only). Neither os.h nor libcore.a carries it (tests/lanes.mk). */
+os_err os_fault_test_next_gen(uint64_t next);
+os_err os_fault_test_next_gen(uint64_t next)
+{
+    fault_service *s = &os_fault_service;
+    (void)pthread_mutex_lock(&s->mu);
+    bool ok = next != 0 && next - 1u >= s->issued;
+    if (ok) s->issued = next - 1u;
+    (void)pthread_mutex_unlock(&s->mu);
+    return ok ? OS_OK : fail_with(OS_E_INVAL);
+}
+#endif
+
+os_err os_fault_test_trigger(const os_map *view, size_t off)
+{
+    if (!view || !view->addr || off >= view->len || off > UINTPTR_MAX - (uintptr_t)view->addr)
+        return fail_with(OS_E_INVAL);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = SIGBUS;
+    si.si_code = BUS_ADRERR;
+    si.si_addr = (void *)((uintptr_t)view->addr + off);
+    /* Linux accepts a positive si_code only for the caller's own process.
+     * Four long words (tests/os_fault_test.c forwards exactly these). */
+    long rc = syscall(SYS_rt_tgsigqueueinfo, (long)getpid(), (long)gettid(), (long)SIGBUS, &si);
+    return rc ? fail() : OS_OK;
 }
 
 /* ---- random ------------------------------------------------------------- */
