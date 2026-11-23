@@ -322,3 +322,20 @@ RESTORE_BASE_RANGE, GROUP_BEGIN/COMMIT, CHECKPOINT_BY_VALUE, SAVE(PREPARED/FINIS
 - A, B, G as Astra states them; for A the rule beside the code is the header's sentence: NOMEM exactly when base refused
   the remainder, the remainder computed after the last funding step that can change it.
 
+## A25. Piece admission as a fixpoint over the exact plan; resolve's time bound (advisor, 2026-11-24; Astra's 7b re-read)
+
+- Admission: base is never asked for the scalar over-estimate. (1) Fast path: the scalar claim from local sources only
+  (core free slots, then the reserve's whole extents); if they cover it, proceed with no plan and no base call — the
+  typing path after a successful replenish. (2) Otherwise the exact plan: slots and companion storage (ADD chunks, the
+  boundary chunk, directory nodes) as one requirement. (3) Funded as a fixpoint: remainder from current availability;
+  zero -> proceed; drain retirement, take the reserve's offer, recompute; ask base for exactly the remainder; on refusal
+  re-read availability and go round again if anything changed since the remainder was computed; PIECE_ERR_NOMEM only
+  when base refused a remainder computed from availability that did not change afterwards. Terminates: each round
+  reduces the remainder or ends. Replaces A24's "keep the admission order" and the decision file's invariants 1 and 2
+  (invariant 3 stands); the scalar-claim extent purchase and its "returned by the next replenish" excuse are deleted.
+- Resolve's contract: one call descends into at most budget nodes; each branch it copies also updates the reference counts
+  of that branch's children, at most 16 per copy (P, the branch fanout), so a call touches at most 17 x budget nodes.
+- The sweep's state is restored as a whole (copy, count, cursor, flag) when a tentative copy is discarded.
+- A bound that justifies an ASSERT is structural or address-space, never installed memory (node reference counts:
+  widened if the signed node prefix allows, else saturating at UINT32_MAX — a never-freed node, never an abort).
+
