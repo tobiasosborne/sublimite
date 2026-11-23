@@ -127,3 +127,15 @@ copy, across filesystems; the bead states which and why. (c) checkpoint-diff con
 spans appear once in increasing order. (d) the L1 dossier's piece and undo sections are superseded where the spec
 says so. Each becomes an acceptance line of the L2 bead that owns it (journal, savectl or edit), written when those
 beads are prepared after the Wave 0 gate.
+
+## A15. One always-on ASSERT; exhaustion is a return code (advisor, 2026-11-23)
+
+Raised by L0-2 (fault ids): "ASSERT in debug, NOSPC in release" had no meaning because no lane defines NDEBUG, and os
+sits below base. Rule (now in CLAUDE.md code conventions): one ASSERT macro for the whole tree, defined in os, always
+compiled in; a failure writes a fixed message async-signal-safely and aborts (an invariant violation means memory
+state is not what the code believes; aborting leaves the last journaled state for recovery). ASSERT only for
+conditions no input, file content, resource exhaustion or timing can produce; everything else is a return code.
+Expensive checks use a second macro compiled only in the sanitizer lanes, each use saying why. base's own assert is
+removed or becomes this one; only os imports abort (the per-module allowlist expresses it). Consequence for the fault
+spec: generation overflow is one comparison returning OS_E_NOSPC in every build (no ASSERT), testable at full width
+through a test-build-only setter for the next generation (one registration at UINT64_MAX − 1).

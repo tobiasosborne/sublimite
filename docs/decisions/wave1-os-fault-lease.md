@@ -146,3 +146,11 @@ VERDICT: Adopt one backing lifetime, generation-validated lock-free polling and 
 Advisor, 2026-11-22: signed off on revision 40ba37b, including (e) — the overflow comparison with ASSERT and the
 existing NOSPC is the correct form, since the 10^9/s rate was (E). Plan wording corrected in
 docs/decisions/wave0-plan-amendments.md A5. This file is the acceptance of the Wave 1 L0 lease bead.
+
+## Correction (advisor, 2026-11-23, amendment A15)
+
+Generation overflow: one comparison returning OS_E_NOSPC in every build, no ASSERT; tested at full width through a
+test-build-only setter for the next generation. Unregistered fault handling (pending Astra's confirmation): if
+siginfo si_code > 0 (kernel-raised, e.g. BUS_ADRERR), restore the default disposition and return so the re-executed
+instruction terminates the process as it would without the service; if si_code ≤ 0 (kill/sigqueue), honour the
+previous disposition (ignore for SIG_IGN, chain for a handler).

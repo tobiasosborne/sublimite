@@ -33,6 +33,11 @@ v2 is a clean-slate rebuild on branch `v2`. v1 (`main`, `~/.local/bin/sublimite`
 - Globals only where `docs/PLAN_V2.md` names them (trace ring, allocator hook, the fixed `os_fault_service` (one process-wide fault registry; it has no pins)). Anything else needs a `docs/decisions/` entry.
 - Fixed-width types, `size_t` for sizes, byte offsets `uint64_t`.
 - Errors are return codes; no `abort()` outside `ASSERT`. No `printf` on the UI thread.
+- **One `ASSERT` for the whole tree**, defined in `os`, always compiled in (every lane and the shipped binary): a failed
+  ASSERT writes a fixed message with an async-signal-safe write and aborts, leaving the last journaled state for recovery.
+  ASSERT only for conditions no input, file content, resource exhaustion or timing can produce; anything those can
+  produce is a return code. Checks too expensive for the shipped binary use a second, sanitizer-lanes-only macro, and each
+  use says why. No module defines another assert; only `os` imports `abort` (docs/decisions/wave0-plan-amendments.md A15).
 - Threads: the UI thread owns the buffer; workers get snapshots. Shared state crosses only through `src/work` mailboxes.
 - Commit per bead: `<wave>.<n>: <summary> (bd-xyz)`, ending with the attribution line the harness provides.
 
