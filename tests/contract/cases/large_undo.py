@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """X3: delete an entire over-cap file, undo, save, compare bytes (Tier A, file bytes only).
 
-One invocation is one run. The run owns a private Xvfb on an explicit display in :140..:149,
-launches every editor through tests/contract/sandbox.py and drives input through
-tests/contract/xdriver.py. Every wait is woken by an event: an inotify watch armed before the
+One invocation is one run. Every session (one editor launch) gets a private Xvfb no earlier
+session used, on the run's explicit contract display (tests/contract/xserver.py); every editor
+launches through tests/contract/sandbox.py, bound to the runner's digest (--digests), and
+takes input through tests/contract/xdriver.py. Every wait is woken by an event: an inotify watch armed before the
 keys whose effect it observes, or the editor's pidfd. The only timers are the hang detectors
 below; an expired one makes the run invalid (ERROR) and never decides a verdict.
 
@@ -59,11 +60,9 @@ import math
 import os
 from pathlib import Path
 import re
-import secrets
 import select
 import selectors
 import shutil
-import socket
 import struct
 import subprocess
 import sys
@@ -73,8 +72,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 import records  # noqa: E402
-from sandbox import CONTRACT_DISPLAY, RunTarget, Sandbox  # noqa: E402
-from xdriver import XDriver, XDriverError  # noqa: E402
+from sandbox import RunTarget, Sandbox  # noqa: E402
+from xdriver import XDriverError  # noqa: E402
+from xserver import TeardownError, fresh_display  # noqa: E402
 import large_undo_fixture as fixture  # noqa: E402
 
 ROOT = HERE.parents[2]
@@ -94,7 +94,6 @@ SCORED_KEYS = (("Control_L", "a"), "Delete", ("Control_L", "z"))
 # the ThinkPad, 12 CPUs, 2026-11-23, in the X3 run records named in docs/decisions/v2-he7.15.md
 # "Deadlines".
 WATCHDOG_FACTOR = 10
-XVFB_READY_S = math.ceil(0.26 * WATCHDOG_FACTOR)            # (M) Xvfb readiness, load 1-17
 WINDOW_MAP_MS = 1000 * math.ceil(0.481 * WATCHDOG_FACTOR)   # (M) launch -> window, [bat] load 17.18
 JOURNAL_COMMIT_S = math.ceil(4.178 * WATCHDOG_FACTOR)       # (M) "x" -> session-* commit, [bat] load 13.28
 SAVE_RENAME_S = math.ceil(49.408 * WATCHDOG_FACTOR)         # (M) Ctrl+S -> rename after Ctrl+A + Delete,
@@ -232,68 +231,10 @@ class DirWatch:
         os.close(self.fd)
 
 
-def display_free(number):
-    path = f"/tmp/.X11-unix/X{number}"
-    if os.path.lexists(path) or os.path.lexists(f"/tmp/.X{number}-lock"):
-        return False
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind("\0" + path)
-        except OSError:
-            return False
-    return True
-
-
-@contextlib.contextmanager
-def private_xvfb(display, run_dir):
-    """Start Xvfb on exactly `display` with a fresh MIT cookie; stop it by its own pid."""
-    match = CONTRACT_DISPLAY.fullmatch(display)
-    if match is None:
-        raise HarnessError("X3.harness.display", "display must be a contract display",
-                           display, ":120..:199")
-    number = int(match[1])
-    if not display_free(number):
-        raise HarnessError("X3.harness.display", "display is in use", display, "free")
-    auth = run_dir / "xauthority"
-    # Xauthority FamilyLocal record (network order) with a fresh 128-bit MIT cookie.
-    fields = (os.fsencode(socket.gethostname()), str(number).encode(),
-              b"MIT-MAGIC-COOKIE-1", secrets.token_bytes(16))
-    record = struct.pack("!H", 256) + b"".join(struct.pack("!H", len(f)) + f for f in fields)
-    fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(record)
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "XAUTHORITY": str(auth)}
-    read_fd, write_fd = os.pipe()
-    with (run_dir / "Xvfb.log").open("wb") as log:
-        server = subprocess.Popen(
-            ["Xvfb", display, "-displayfd", str(write_fd), "-noreset", "-nolisten", "tcp",
-             "-auth", str(auth)],
-            env=env, pass_fds=(write_fd,), stdin=subprocess.DEVNULL, stdout=log, stderr=log)
-    os.close(write_fd)
-    try:
-        with os.fdopen(read_fd, "rb") as ready, selectors.DefaultSelector() as selector:
-            selector.register(ready, selectors.EVENT_READ)
-            if not selector.select(XVFB_READY_S):
-                raise HarnessError("X3.harness.display", "hang detector expired: Xvfb readiness",
-                                   "silent", display)
-            answer = ready.readline()
-        if answer != f"{number}\n".encode() or server.poll() is not None:
-            raise HarnessError("X3.harness.display", "Xvfb did not claim the display",
-                               answer.decode(errors="replace"), str(number))
-        yield {"pid": server.pid, "env": env, "record": record}
-    finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=XVFB_READY_S)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait()
-
-
 class Run:
-    def __init__(self, target, display, run_dir, fixtures):
+    def __init__(self, target, display, run_dir, fixtures, diagnostic=False):
         self.target, self.display, self.dir, self.fixtures = target, display, run_dir, fixtures
+        self.diagnostic = diagnostic
         self.records = []
         self.steps = []
         self.t0 = time.monotonic()
@@ -304,8 +245,8 @@ class Run:
         print(f"[{entry['t']:8.3f}] {what} {json.dumps(extra) if extra else ''}", flush=True)
 
     @contextlib.contextmanager
-    def editor(self, x, label, variant):
-        """One sandbox, one fixture copy, one editor, one driver; yields a Session."""
+    def editor(self, label, variant):
+        """One sandbox, one server, one fixture copy, one editor, one driver; yields a Session."""
         source = self.fixtures[variant]
         base = self.dir / "cases"
         base.mkdir(mode=0o700, exist_ok=True)
@@ -313,9 +254,9 @@ class Run:
             out = stack.enter_context((self.dir / f"{label}.stdout").open("wb"))
             err = stack.enter_context((self.dir / f"{label}.stderr").open("wb"))
             box = stack.enter_context(Sandbox(base, self.target, display=self.display))
-            # The runner populates the case's private Xauthority with the run cookie.
-            with open(box.root / "Xauthority", "r+b") as auth:
-                auth.write(x["record"])
+            server, driver = stack.enter_context(fresh_display(
+                self.display, self.dir, f"Xvfb-{label}", box.env, timeout=DRIVER_PIPE_S))
+            self.step("xvfb", label=label, pid=server.pid, display=self.display)
             path = box.work / Path(source["path"]).name
             shutil.copyfile(source["path"], path)
             before = identity(path)
@@ -325,7 +266,6 @@ class Run:
             pidfd = os.pidfd_open(child.pid)
             stack.callback(os.close, pidfd)
             self.step("launch", label=label, pid=child.pid, path=str(path))
-            driver = stack.enter_context(XDriver(DRIVER, self.display, env=x["env"], timeout=DRIVER_PIPE_S))
             window = driver.find(child.pid, WINDOW_MAP_MS)
             driver.focus()
             self.step("window", label=label, xid=window)
@@ -348,7 +288,8 @@ class Run:
         entry = {"case_id": CASE, "assertion_id": assertion.removeprefix(f"{CASE}."),
                  "status": status, "evidence": EVIDENCE, "first_required_wave": FIRST_REQUIRED_WAVE,
                  "predicate": predicate, "observed": observed, "expected": expected,
-                 "run_id": self.dir.name, "artifacts": str(self.dir), **extra}
+                 "run_id": self.dir.name, "artifacts": str(self.dir), **extra,
+                 **({"diagnostic_fixture": True} if self.diagnostic else {})}
         records.emit(entry)
         self.records.append(entry)
         return entry
@@ -618,10 +559,10 @@ def classify(original, outcome, input_after):
     return "FAIL", "saved bytes differ from the original", want, None
 
 
-def variant_run(run, x, variant):
+def variant_run(run, variant):
     source = run.fixtures[variant]
     original = (source["bytes"], source["sha256"])
-    with run.editor(x, f"{variant}-control", variant) as s:
+    with run.editor(f"{variant}-control", variant) as s:
         if s.edits_applied(f"X3.{variant}.ctl.load_save", ["x"]) == "exited":
             raise HarnessError(f"X3.{variant}.ctl.load_save", "editor exited during a control",
                                {"exit": s.exit_status, "stderr": s.stderr()[-400:]}, "running")
@@ -638,7 +579,7 @@ def variant_run(run, x, variant):
         run.record(f"X3.{variant}.ctl.exit", "PASS", "editor exited 0 after Ctrl+Q", {"exit": 0},
                    {"exit": 0}, kind="control")
     assertion = f"X3.{variant}.roundtrip"
-    with run.editor(x, f"{variant}-scored", variant) as s:
+    with run.editor(f"{variant}-scored", variant) as s:
         size, data = source["bytes"], s.box.data_dir
         deleted = s.edits_applied(assertion, SCORED_KEYS[:2], "journal commit holding DELETE(0, L)",
                                   lambda label, mask, name: journal_commit(label, mask, name)
@@ -667,12 +608,20 @@ def variant_run(run, x, variant):
         input_after = describe(source["path"])
         status, predicate, expected, signature = classify(source, outcome, input_after)
         s.failed = status != "PASS"
-    if outcome["kind"] == "exited":
-        outcome["stderr"] = outcome["stderr"][-400:]
-    run.record(assertion, status, predicate, {**outcome, "input_after": input_after}, expected,
-               kind="scored", save_s=None if took is None else round(took, 3),
-               **({"signature": signature} if signature else {}))
+        if outcome["kind"] == "exited":
+            outcome["stderr"] = outcome["stderr"][-400:]
+        # Recorded before the session's teardown, whose own ERROR then stands beside it.
+        run.record(assertion, status, predicate, {**outcome, "input_after": input_after}, expected,
+                   kind="scored", save_s=None if took is None else round(took, 3),
+                   **({"signature": signature} if signature else {}))
     return status
+
+
+def harness_error(run, exc):
+    if isinstance(exc, HarnessError):
+        run.record(exc.assertion, "ERROR", exc.predicate, exc.observed, exc.expected, kind="harness")
+    else:
+        run.record("X3.harness", "ERROR", f"{type(exc).__name__}: {exc}", None, None, kind="harness")
 
 
 def main(argv=None):
@@ -681,6 +630,9 @@ def main(argv=None):
     parser.add_argument("--display", required=True, help="explicit contract display, :120 .. :199")
     parser.add_argument("--fixtures", default=str(BUILD / "large-undo" / "fixtures"))
     parser.add_argument("--runs", default=str(BUILD / "large-undo" / "runs"))
+    parser.add_argument("--diagnostic-fixture", action="store_true",
+                        help="the target is a self-test stub bound by its writer, not a reviewed binary")
+    records.digests_argument(parser)
     args = parser.parse_args(argv)
 
     executable = Path(args.target)
@@ -688,24 +640,28 @@ def main(argv=None):
     run_dir = Path(args.runs).resolve() / run_id
     run_dir.mkdir(parents=True, mode=0o700)
     header = {"case": CASE, "run_id": run_id, "role": "v1", "target": str(executable),
-              "display": args.display, "argv": sys.argv, "power_start": power_stamp()}
+              "display": args.display, "argv": sys.argv, "power_start": power_stamp(),
+              "binding": "diagnostic-fixture" if args.diagnostic_fixture else "runner"}
     print("RUN " + json.dumps(header), flush=True)
-    run = Run(None, args.display, run_dir, {})
+    run = Run(None, args.display, run_dir, {}, args.diagnostic_fixture)
     try:
-        if not executable.is_absolute():
-            raise HarnessError("X3.harness.target", "target must be absolute", str(executable), "absolute")
-        header["target_sha256"] = sha256_file(executable)
+        if str(executable) not in args.digests:
+            raise HarnessError("X3.harness.target", "--digests binds no digest for the target",
+                               str(executable), sorted(args.digests))
+        header["target_sha256"] = args.digests[str(executable)]
         header["fixtures"] = {v: fixture.write(args.fixtures, v) for v in ("twin", "over")}
         run.target = RunTarget("v1", executable, executable.parent, header["target_sha256"])
         run.fixtures = header["fixtures"]
-        with private_xvfb(args.display, run_dir) as x:
-            run.step("xvfb", pid=x["pid"], display=args.display)
-            for variant in ("twin", "over"):
-                variant_run(run, x, variant)
-    except HarnessError as exc:
-        run.record(exc.assertion, "ERROR", exc.predicate, exc.observed, exc.expected, kind="harness")
+        for variant in ("twin", "over"):
+            variant_run(run, variant)
+    except TeardownError as exc:
+        # A server that outlived its stop is ERROR beside the failure it interrupted, if any.
+        if exc.pending is not None:
+            harness_error(run, exc.pending)
+        run.record("X3.harness.teardown", "ERROR", f"TeardownError: {exc}", None, None,
+                   kind="harness")
     except Exception as exc:  # any other runner failure is an ERROR, never a pass
-        run.record("X3.harness", "ERROR", f"{type(exc).__name__}: {exc}", None, None, kind="harness")
+        harness_error(run, exc)
     exit_code = records.exit_status(entry["status"] for entry in run.records)
     header["power_end"] = power_stamp()
     header["exit"] = exit_code

@@ -4,13 +4,13 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import replace
+from typing import NamedTuple
 import fcntl
-import json
+import itertools
 import mmap
 import os
 from pathlib import Path
 import re
-import secrets
 import select
 import selectors
 import socket
@@ -20,57 +20,56 @@ import tempfile
 import time
 import unittest
 
-from build_oracle import EDITOR, FAULT, PATCH, STAMP, STOCK, manifest, sha256
+from build_oracle import EDITOR, FAULT, STOCK
 import records
-from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
+from sandbox import Refused, RunTarget, Sandbox
 import snapwire as wire
-from test_xdriver import WATCHDOG, available, readable, stop
-from xdriver import XDriver, XDriverError
+from test_xdriver import WATCHDOG, readable
+import xserver
+from xdriver import XDriverError
 
 ROOT = Path(__file__).resolve().parents[2]
 # The v1 tab strip uses 16 cells per tab. This small screen leaves a partial
 # slot at the right edge, with room for document text and several tab titles.
 WIDTH, HEIGHT, DEPTH = 640, 480, 24
-# One settled frame, at most one overscan row, one clipped tab per column,
-# and at most the UTF-8 replacement scalar per cell. One pixel per cell is the lower bound.
-CAPACITY = (2 * wire.WORD.size + wire.FRAME_SIZES.size + 3 * wire.RECT.size
+GEOMETRY = f"{WIDTH}x{HEIGHT}x{DEPTH}"
+
+
+def capacity(width, height):
+    """Mapping bytes for one settled frame of a window no larger than width x height pixels:
+    at most one overscan row, one clipped tab per column and the UTF-8 replacement scalar per
+    cell; one pixel per cell is the lower bound."""
+    return (2 * wire.WORD.size + wire.FRAME_SIZES.size + 3 * wire.RECT.size
             + wire.SCROLL.size + wire.FRAME_TAIL.size + wire.WORD.size
-            + WIDTH * (HEIGHT + 1) * (wire.CELL_HEADER.size + len("�".encode()))
-            + WIDTH * (wire.RECT.size + wire.WORD.size))
+            + width * (height + 1) * (wire.CELL_HEADER.size + len("\ufffd".encode()))
+            + width * (wire.RECT.size + wire.WORD.size))
+
+
+CAPACITY = capacity(WIDTH, HEIGHT)
 GUARD = re.compile(rb"oracle law2: active=(\d+) allocations=(\d+) scopes=(\d+)")
 IN_MOVED_TO = 0x00000080
 IN_Q_OVERFLOW = 0x00004000
 IN_IGNORED = 0x00008000
 INOTIFY_EVENT = struct.Struct("=iIII")
+LAUNCHES = itertools.count(1)
 
 
-@contextmanager
-def display(number, scratch):
-    if not CONTRACT_DISPLAY.fullmatch(number) or not available(int(number[1:])):
-        raise ValueError("oracle requires a free contract display, :120 through :199")
-    auth = scratch / "authority"
-    fields = (os.fsencode(socket.gethostname()), number[1:].encode(),
-              b"MIT-MAGIC-COOKIE-1", secrets.token_bytes(16))
-    record = struct.pack("!H", 256)  # Xauthority FamilyLocal
-    record += b"".join(struct.pack("!H", len(field)) + field for field in fields)
-    fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(record)
-    with ExitStack() as stack:
-        rfd, wfd = os.pipe()
-        with os.fdopen(wfd, "wb") as ready, (scratch / "Xvfb.log").open("wb") as log:
-            server = subprocess.Popen(
-                ["Xvfb", number, "-screen", "0", f"{WIDTH}x{HEIGHT}x{DEPTH}",
-                 "-displayfd", str(ready.fileno()), "-noreset", "-nolisten", "tcp",
-                 "-auth", str(auth)], pass_fds=(ready.fileno(),), stdout=log, stderr=log,
-            )
-        stack.callback(stop, server)
-        with os.fdopen(rfd, "rb") as ready:
-            readable(ready)
-            if ready.readline() != number[1:].encode() + b"\n" or server.poll() is not None:
-                raise RuntimeError(f"Xvfb did not start. See {scratch / 'Xvfb.log'}")
-        print(f"Xvfb {number}, owned PID {server.pid}", flush=True)
-        yield record
+class Law2(NamedTuple):
+    allocations: int
+    scopes: int
+
+
+def law2_count(log):
+    """The one validated passive Law-2 report in an editor's log bytes: exactly one report,
+    an active guard and at least one measured window (v2-he7.11). Missing, repeated, inert or
+    empty is Refused; whether the count must be zero is the caller's policy."""
+    reports = GUARD.findall(log)
+    if len(reports) != 1:
+        raise Refused(f"expected one allocation report, found {len(reports)}")
+    active, allocations, scopes = map(int, reports[0])
+    if active != 1 or scopes == 0:
+        raise Refused(f"allocation guard inert or no window measured: active={active} scopes={scopes}")
+    return Law2(allocations, scopes)
 
 
 @contextmanager
@@ -130,12 +129,15 @@ def next_event(control, deadline, ignore=b"P"):
 
 
 def target(path):
-    digest = DIGESTS[path.name] if DIGESTS else sha256(path)
-    return RunTarget("v1", path, path.parent, digest)
+    """The runner's reviewed digest for `path` (--digests); an unbound path is a KeyError."""
+    return RunTarget("v1", path, path.parent, ARGS.digests[str(path)])
 
 
 class Inspector:
+    """The snapshot transport of one inspected editor: its mapping, reply socket and exit."""
+
     def __init__(self, stack, capacity=CAPACITY):
+        self.stack = stack
         self.fd = os.memfd_create("oracle-cells", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         stack.callback(os.close, self.fd)
         os.ftruncate(self.fd, capacity)
@@ -146,6 +148,14 @@ class Inspector:
         stack.enter_context(self.reader)
         stack.enter_context(self.writer)
         self.ticket = self.serial = 0
+        self.pidfd = self.deadline = None
+
+    def attach(self, child):
+        """After the launch: drop our copy of the editor's end and watch the editor's exit."""
+        self.writer.close()
+        self.pidfd = os.pidfd_open(child.pid)
+        self.stack.callback(os.close, self.pidfd)
+        return child
 
     @property
     def args(self):
@@ -162,7 +172,19 @@ class Inspector:
         return request
 
     def packet(self):
-        readable(self.reader)
+        """One reply packet before `deadline` (WATCHDOG from now when unset). A queued reply
+        is read even when the attached editor has exited as well: a case that needs a live
+        editor checks that itself. Exit without a reply is Refused, silence TimeoutError."""
+        deadline = time.monotonic() + WATCHDOG if self.deadline is None else self.deadline
+        with selectors.DefaultSelector() as ready:
+            ready.register(self.reader, selectors.EVENT_READ)
+            if self.pidfd is not None:
+                ready.register(self.pidfd, selectors.EVENT_READ)
+            pending = {key.fd for key, _ in ready.select(max(0, deadline - time.monotonic()))}
+        if self.reader.fileno() not in pending:
+            if self.pidfd in pending:
+                raise Refused("editor exited while awaiting a snapshot")
+            raise TimeoutError("missing snapshot reply before watchdog")
         packet, ancillary, flags, _ = self.reader.recvmsg(wire.PACKET.size)
         if flags or ancillary:
             raise wire.ProtocolError("truncated reply or unexpected ancillary data")
@@ -184,7 +206,10 @@ class OracleTests(unittest.TestCase):
         with ExitStack() as stack:
             box = stack.enter_context(Sandbox(SCRATCH, target(executable or ARGS.editor),
                                               display=ARGS.display))
-            (box.root / "Xauthority").write_bytes(AUTH)
+            # Every launch gets a server no earlier launch used (v2-he7.33).
+            _, driver = stack.enter_context(xserver.fresh_display(
+                ARGS.display, SCRATCH, f"Xvfb-{next(LAUNCHES)}", box.env, timeout=2 * WATCHDOG,
+                geometry=GEOMETRY, driver=ARGS.driver))
             paths = [box.fixtures / name for name in files]
             for path in paths:
                 path.write_bytes(b"")
@@ -199,9 +224,7 @@ class OracleTests(unittest.TestCase):
             if control:
                 control.close()
             if inspector:
-                inspector.writer.close()
-            driver = stack.enter_context(XDriver(ARGS.driver, ARGS.display, env=box.env,
-                                                timeout=2 * WATCHDOG))
+                inspector.attach(child)
             try:
                 window = driver.find(child.pid, WATCHDOG * 1000)
             except XDriverError:
@@ -405,10 +428,9 @@ class OracleTests(unittest.TestCase):
         with ExitStack() as stack:
             box = stack.enter_context(Sandbox(SCRATCH, target(ARGS.stock or ARGS.editor),
                                               display=ARGS.display))
-            (box.root / "Xauthority").write_bytes(AUTH)
             inspection = Inspector(stack)
             child = box.start(inspection.args, pass_fds=inspection.fds, stderr=subprocess.PIPE)
-            inspection.writer.close()
+            inspection.attach(child)
             _, stderr = child.communicate(timeout=WATCHDOG)
             self.assertEqual(child.returncode, 2, stderr.decode())
             self.assertIn(b"usage: sublimite", stderr)
@@ -424,7 +446,7 @@ def ready_now(fd):
 
 
 def main():
-    global ARGS, AUTH, DIGESTS, SCRATCH
+    global ARGS, SCRATCH
     parser = argparse.ArgumentParser(description=__doc__)
     editor = parser.add_mutually_exclusive_group(required=True)
     editor.add_argument("--editor", type=lambda path: Path(path).absolute())
@@ -434,14 +456,10 @@ def main():
     parser.add_argument("--driver", default=ROOT / "build/xdriver", type=Path)
     parser.add_argument("--display", required=True)
     parser.add_argument("--expect-unpatched", action="store_true")
+    records.digests_argument(parser)
     parser.add_argument("tests", nargs="*")
     ARGS = parser.parse_args()
-    DIGESTS = {}
     if ARGS.build_dir:
-        recorded = json.loads((ARGS.build_dir / STAMP).read_text())
-        if recorded != manifest(ARGS.build_dir, sha256(PATCH)):
-            parser.error("oracle build manifest differs from current patch or executables")
-        DIGESTS = recorded["executables"]
         ARGS.editor = ARGS.build_dir / EDITOR
         ARGS.stock = ARGS.build_dir / STOCK
         ARGS.fault = ARGS.build_dir / FAULT
@@ -450,11 +468,9 @@ def main():
     root = ROOT / "build"
     root.mkdir(exist_ok=True)
     SCRATCH = Path(tempfile.mkdtemp(prefix="oracle-test-", dir=root))
-    with display(ARGS.display, SCRATCH) as AUTH:
-        tests = ARGS.tests or (["test_unpatched_refusal"] if ARGS.expect_unpatched else
-                              unittest.defaultTestLoader.getTestCaseNames(OracleTests))
-        suite = unittest.TestSuite(OracleTests(name) for name in tests)
-        return records.run_suite(suite, "ADAPTER")
+    tests = ARGS.tests or (["test_unpatched_refusal"] if ARGS.expect_unpatched else
+                          unittest.defaultTestLoader.getTestCaseNames(OracleTests))
+    return records.run_suite(unittest.TestSuite(OracleTests(name) for name in tests), "ADAPTER")
 
 
 if __name__ == "__main__":

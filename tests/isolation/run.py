@@ -14,6 +14,9 @@ CLEAN = '''/* "sublimite" is the v1 leaf. */
 const char *ok = EDIT_APP_ID "/config.toml";
 const char *socket = "\\0" EDIT_APP_ID "-%lu";
 const char *words[] = {"sub", "limite"};
+// A spliced line comment continues \\
+   "sublimite" on its next physical line, as a CRLF splice does \\\r
+   "sublimite" too (finding 23: clex reads despliced, newline-normalized text).
 '''
 
 LITERAL = 'identity in string literal {!r}'
@@ -39,6 +42,8 @@ SOURCES = {
                               '{ snprintf(buf, n, "%s%s", "sub", "limite"); }',
                               2, 'identity assembled from formatted string arguments'),
     'bare leaf': ('const char *path = "sublimite";', 1, LITERAL.format('sublimite')),
+    'literal after a line comment': ('// ends here\nconst char *path = "sublimite";', 2,
+                                     LITERAL.format('sublimite')),
     'absolute path': ('const char *path = "/home/x/.config/sublimite/config.toml";', 1,
                       LITERAL.format('/home/x/.config/sublimite/config.toml')),
     'adjacent strings': ('const char *path = "sub" /* next piece */ "limite";', 1, LITERAL.format('sublimite')),

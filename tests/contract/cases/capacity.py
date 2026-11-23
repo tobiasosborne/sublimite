@@ -1,7 +1,8 @@
 """R4: restore under real live-tab pressure keeps every unsaved tab and drops excess clean ones.
 
 One run per invocation against the pinned, inspected v1 oracle
-(docs/decisions/v2-he7.17.md). Three phases on one private display:
+(docs/decisions/v2-he7.17.md). Three phases on one display number; each phase, and each
+editor launch scored in phase 3, gets a private X server no earlier one used:
 
 1. Capacity. A sacrificial fresh profile admits individually named clean files through
    public handoffs (a second launch forwarding its paths) until a one-path handoff is
@@ -41,15 +42,14 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
-from cases.files import (GEOMETRY, SCREEN, WATCHDOG, Snapshots, describe, document_rows,
-                         exited, private_display, tab_strip)
-from cases.navigation import stop
+from build_oracle import EDITOR
+from cases.files import (CAPACITY, GEOMETRY, SCREEN, WATCHDOG, describe, document_rows, exited,
+                         tab_strip)
 from cases.recovery import copied_text
 import records
 from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
-from test_oracle_inspector import GUARD
-from xdriver import XDriver
+from test_oracle_inspector import Inspector, law2_count
+from xserver import TeardownError, fresh_display, stop
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -132,7 +132,8 @@ def sessions(data_dir):
 
 
 class Case:
-    def __init__(self, artifacts, negative):
+    def __init__(self, artifacts, negative, display):
+        self.display = display
         self.artifacts = artifacts
         self.run_id = artifacts.name
         self.negative = negative
@@ -141,7 +142,7 @@ class Case:
         self.children = []
         self.facts = {}
         self.stage = "setup"
-        self.observed = self.expected = None
+        self.observed = self.expected = self.ordinary = None
 
     def note(self, message):
         with (self.artifacts / "steps.log").open("a", encoding="utf-8") as file:
@@ -156,7 +157,8 @@ class Case:
             "run_id": self.run_id, "case_id": CASE_ID, "assertion_id": assertion,
             "evidence": EVIDENCE.get(assertion, "A+B"), "first_required_wave": FIRST_WAVE,
             "status": status, "predicate": predicate, "observed": self.observed,
-            "expected": self.expected, "negative": self.negative, "stage": self.stage,
+            "expected": self.expected, "ordinary": self.ordinary, "negative": self.negative,
+            "stage": self.stage,
             "facts": self.facts, "artifacts": str(self.artifacts),
             "child_status": [{"role": role, "pid": child.pid, "exit": child.poll()}
                              for role, child in self.children],
@@ -169,23 +171,23 @@ class Case:
             print(f"{CASE_ID}.{assertion}: {status} {predicate}", file=sys.stderr, flush=True)
         self.results.append(status)
 
-    def check(self, assertion, observed, expected, wrong=None):
+    def check(self, assertion, observed, expected, wrong=None, **extra):
         """Compare once, in inventory order; the first failure is final.
 
         A red control is credited only from a healthy run: its observation must first meet
         the ordinary expectation, and only then is it compared with the wrong one."""
         if assertion in self.asserted or ASSERTIONS[len(self.asserted)] != assertion:
             raise Refused(f"assertion {assertion} out of inventory order")
-        self.observed, self.expected = observed, expected
+        self.observed, self.expected, self.ordinary = observed, expected, None
         if self.negative == assertion:
             if observed != expected:
                 raise Refused(f"{assertion}: the control's observation fails the ordinary "
                               "expectation, so its red would not be the deliberate one")
-            self.expected = wrong
+            self.ordinary, self.expected = {"expected": expected, "observed": observed}, wrong
         self.asserted.append(assertion)
         if self.observed != self.expected:
             raise Mismatch(f"{assertion}: observed value differs from expectation")
-        self.emit(assertion, "PASS", assertion)
+        self.emit(assertion, "PASS", assertion, **extra)
 
     def failure(self, exc):
         status = "FAIL" if isinstance(exc, Mismatch) else "ERROR"
@@ -193,6 +195,11 @@ class Case:
                      ASSERTIONS[len(self.asserted)] if len(self.asserted) < len(ASSERTIONS)
                      else "assertion-inventory")
         self.emit(assertion, status, f"{self.stage}: {type(exc).__name__}: {exc}")
+
+    def server(self, sandbox, label):
+        """A fresh private server and driver; the sandbox's Xauthority gets its cookie."""
+        return fresh_display(self.display, self.artifacts, f"Xvfb-{label}", sandbox.env,
+                             timeout=WATCHDOG * 2, geometry=GEOMETRY)
 
     @property
     def status(self):
@@ -208,19 +215,17 @@ class Editor:
     def __init__(self, case, stack, role):
         self.case = case
         self.role = role
-        self.inspector = Snapshots(stack)
+        self.inspector = Inspector(stack, CAPACITY)
         self.stack = stack
         self.log = case.artifacts / f"{role}.log"
         self.child = self.window = None
 
     def spawn(self, launch, argv, **kwargs):
         with self.log.open("wb") as log:
-            self.child = launch([*self.inspector.args, *argv], stdout=log, stderr=log,
-                                pass_fds=self.inspector.fds, **kwargs)
+            self.child = self.inspector.attach(launch(
+                [*self.inspector.args, *argv], stdout=log, stderr=log,
+                pass_fds=self.inspector.fds, **kwargs))
         self.case.children.append((self.role, self.child))
-        self.inspector.writer.close()
-        self.inspector.pidfd = os.pidfd_open(self.child.pid)
-        self.stack.callback(os.close, self.inspector.pidfd)
         return self
 
     def bind(self, driver):
@@ -313,14 +318,7 @@ class Editor:
         return Path(os.fsdecode(found[0]))
 
     def law2(self):
-        report = GUARD.search(self.log.read_bytes())
-        if report is None:
-            raise Refused(f"{self.role} printed no allocation count")
-        active, allocations, scopes = map(int, report.groups())
-        # Fail closed on an inert guard or a window that measured nothing (v2-he7.11).
-        if active != 1 or scopes == 0:
-            raise Refused(f"{self.role} allocation guard inert or empty: {report.group()!r}")
-        return {"allocations": allocations, "scopes": scopes}
+        return law2_count(self.log.read_bytes())._asdict()
 
 
 def handoff(case, sandbox, paths, label):
@@ -342,13 +340,11 @@ def handoff(case, sandbox, paths, label):
                   f"exit {status}, {output!r}")
 
 
-def measure_capacity(case, target, display, auth):
+def measure_capacity(case, target):
     """Phase 1: C in a sacrificial fresh profile, by public opens until a capacity refusal."""
     case.step("capacity: sacrificial profile")
-    with Sandbox(case.artifacts, target, display=display) as sandbox, ExitStack() as stack:
-        Path(sandbox.env["XAUTHORITY"]).write_bytes(auth.read_bytes())
-        driver = stack.enter_context(XDriver(BUILD / "xdriver", display, env=sandbox.env,
-                                             timeout=WATCHDOG * 2))
+    with Sandbox(case.artifacts, target, display=case.display) as sandbox, ExitStack() as stack:
+        _, driver = stack.enter_context(case.server(sandbox, "capacity"))
 
         def probes(start, count):
             paths = [sandbox.fixtures / probe_name(start + i) for i in range(count)]
@@ -383,7 +379,7 @@ def measure_capacity(case, target, display, auth):
         reopen = handoff(case, sandbox, [sandbox.fixtures / probe_name(0)], "probe-reopen")
         alive = probe.child.poll() is None
         last = probe.tab(probe.frame())
-        stop(probe.child, signal.SIGTERM)
+        stop(probe.child, WATCHDOG)
         case.facts["capacity"] = {
             "C": admitted, "window": window, "pid": probe.child.pid,
             "first": probe_name(0), "last_admitted": probe_name(admitted - 1),
@@ -555,111 +551,114 @@ def status_row(frame, dropped):
     return observed, expected
 
 
-def restore(case, sandbox, driver, stack, capacity, fill, disk, expected_dirty,
+def restore(case, sandbox, capacity, fill, disk, expected_dirty,
             older_source, older_bytes, filler_source, older_ring):
-    """Phase 3: the pressured relaunch, then a SIGKILL and a second relaunch."""
+    """Phase 3: the pressured relaunch, then a SIGKILL and a second relaunch, each on its own
+    server."""
     room_clean = capacity - fill - UNSAVED  # live room left once F and every unsaved tab fit
-    case.step("restore: argument-free relaunch under pressure")
-    first = Editor(case, stack, "restored").spawn(sandbox.restart, [])
-    first.bind(driver)
-    sandbox.record_server()
-    frame = first.frame()
-    data_after = sorted(p.name for p in sandbox.data_dir.iterdir())
-    walked = first.ring(capacity + 1)
-    (case.artifacts / "restored-ring.json").write_text(json.dumps(walked) + "\n")
-    fillers, older_clean, dirty, other = classify(walked)
-    dropped = len(OLDER_CLEAN) - len(older_clean)
-    notice, notice_expected = status_row(frame, dropped)
-    case.facts["restored"] = {"live": len(walked), "fillers": len(fillers),
-                              "older_clean": older_clean, "dirty_positions": dirty,
-                              "unclassified": other, "notice": notice, "data_dir": data_after}
-    admitted_fillers = [filler_name(i) for i in range(fill)]
-    if case.negative == "no-pressure":
-        # The control is credited only from the exact unpressured restore under ample C: both
-        # fillers and all five older tabs with their identities and dirty rows. Anything else
-        # (a dropped dirty tab, a wrong filler) is not the deliberate red.
-        whole = sorted([(name, content(name).decode()) for name in admitted_fillers] + older_ring)
-        if capacity <= len(whole) or sorted(walked) != whole:
-            raise Refused(f"no-pressure control: restored {sorted(walked)!r}, not the "
-                          f"unpressured {whole!r} under C = {capacity}")
-    case.check("partial-restore-triggered",
-               {"live": len(walked), "fillers": sorted(fillers),
-                "older_restored_whole": len(older_clean) == len(OLDER_CLEAN) and len(dirty) == 2,
-                "unclassified": other},
-               {"live": capacity, "fillers": admitted_fillers, "older_restored_whole": False,
-                "unclassified": []})
-    case.check("notice-visible", notice, notice_expected)
-    copies = {key: first.copy_at(walked, dirty[key]) if key in dirty else None
-              for key in (DIRTY_FILE, UNTITLED)}
-    case.check("dirty-restored", copies, expected_dirty)
-    # v1's rule (P, src/editor/recovery.c:plan_partial, "Unmodified tabs in recorded tab
-    # order"): after every unsaved buffer is placed, the clean tabs of the last TABS record are
-    # kept in that order, skipping the PAINT-named buffer and vanished targets, while
-    # spare = room - live unsaved (- 1 with closed ones) remains. Fixture inputs: TABS is
-    # c0 c1 m c2 untitled (producers-admitted, older_strip); every target exists; PAINT is 0
-    # because each older tab presented during the producer walk (editor_journal_painted
-    # appends PAINT 0); spare = room_clean = C - fill - U = 1. So c0 survives, c1 and c2 drop.
-    # By path, publicly: at C live tabs a forwarded open of a live path is admitted (it
-    # activates that tab) and of an absent path is refused for capacity (no room exists:
-    # partial-restore-triggered asserted live == C).
-    paths = {name: str(sandbox.fixtures / name) for name in OLDER_CLEAN}
-    admitted = {paths[name]: handoff(case, sandbox, [sandbox.fixtures / name], f"restored-{name}")
-                for name in OLDER_CLEAN}
-    active = list(first.tab(first.frame()))
+    with case.server(sandbox, "restored") as (_, driver), ExitStack() as stack:
+        case.step("restore: argument-free relaunch under pressure")
+        first = Editor(case, stack, "restored").spawn(sandbox.restart, [])
+        first.bind(driver)
+        sandbox.record_server()
+        frame = first.frame()
+        data_after = sorted(p.name for p in sandbox.data_dir.iterdir())
+        walked = first.ring(capacity + 1)
+        (case.artifacts / "restored-ring.json").write_text(json.dumps(walked) + "\n")
+        fillers, older_clean, dirty, other = classify(walked)
+        dropped = len(OLDER_CLEAN) - len(older_clean)
+        notice, notice_expected = status_row(frame, dropped)
+        case.facts["restored"] = {"live": len(walked), "fillers": len(fillers),
+                                  "older_clean": older_clean, "dirty_positions": dirty,
+                                  "unclassified": other, "notice": notice, "data_dir": data_after}
+        admitted_fillers = [filler_name(i) for i in range(fill)]
+        if case.negative == "no-pressure":
+            # The control is credited only from the exact unpressured restore under ample C: both
+            # fillers and all five older tabs with their identities and dirty rows. Anything else
+            # (a dropped dirty tab, a wrong filler) is not the deliberate red.
+            whole = sorted([(name, content(name).decode()) for name in admitted_fillers] + older_ring)
+            if capacity <= len(whole) or sorted(walked) != whole:
+                raise Refused(f"no-pressure control: restored {sorted(walked)!r}, not the "
+                              f"unpressured {whole!r} under C = {capacity}")
+        case.check("partial-restore-triggered",
+                   {"live": len(walked), "fillers": sorted(fillers),
+                    "older_restored_whole": len(older_clean) == len(OLDER_CLEAN) and len(dirty) == 2,
+                    "unclassified": other},
+                   {"live": capacity, "fillers": admitted_fillers, "older_restored_whole": False,
+                    "unclassified": []})
+        case.check("notice-visible", notice, notice_expected)
+        copies = {key: first.copy_at(walked, dirty[key]) if key in dirty else None
+                  for key in (DIRTY_FILE, UNTITLED)}
+        case.check("dirty-restored", copies, expected_dirty)
+        # v1's rule (P, src/editor/recovery.c:plan_partial, "Unmodified tabs in recorded tab
+        # order"): after every unsaved buffer is placed, the clean tabs of the last TABS record are
+        # kept in that order, skipping the PAINT-named buffer and vanished targets, while
+        # spare = room - live unsaved (- 1 with closed ones) remains. Fixture inputs: TABS is
+        # c0 c1 m c2 untitled (producers-admitted, older_strip); every target exists; PAINT is 0
+        # because each older tab presented during the producer walk (editor_journal_painted
+        # appends PAINT 0); spare = room_clean = C - fill - U = 1. So c0 survives, c1 and c2 drop.
+        # By path, publicly: at C live tabs a forwarded open of a live path is admitted (it
+        # activates that tab) and of an absent path is refused for capacity (no room exists:
+        # partial-restore-triggered asserted live == C).
+        paths = {name: str(sandbox.fixtures / name) for name in OLDER_CLEAN}
+        admitted = {paths[name]: handoff(case, sandbox, [sandbox.fixtures / name], f"restored-{name}")
+                    for name in OLDER_CLEAN}
+        active = list(first.tab(first.frame()))
 
-    def clean_choice(kept):
-        return {"kept": [paths[name] for name in OLDER_CLEAN if name in kept],
-                "dropped": [paths[name] for name in OLDER_CLEAN if name not in kept],
-                "handoff_admitted": {paths[name]: name in kept for name in OLDER_CLEAN},
-                "active_after_handoffs": [kept[-1], dict(OLDER)[kept[-1]].decode()]}
+        def clean_choice(kept):
+            return {"kept": [paths[name] for name in OLDER_CLEAN if name in kept],
+                    "dropped": [paths[name] for name in OLDER_CLEAN if name not in kept],
+                    "handoff_admitted": {paths[name]: name in kept for name in OLDER_CLEAN},
+                    "active_after_handoffs": [kept[-1], dict(OLDER)[kept[-1]].decode()]}
 
-    observed = clean_choice(older_clean) if older_clean else {"kept": [], "dropped": list(paths.values())}
-    observed.update(handoff_admitted=admitted, active_after_handoffs=active)
-    case.check("clean-survivor-tab-order", observed, clean_choice(OLDER_CLEAN[:room_clean]),
-               wrong=clean_choice(OLDER_CLEAN[-room_clean:]))
-    aside = [name for name in data_after
-             if name.startswith(older_source.name + ".set-aside-")]
-    if filler_source.name in data_after:
-        raise Refused("the filler source is still present: no durable restore checkpoint")
-    case.check("omitted-state-recoverable",
-               {"set_aside": len(aside),
-                "bytes": [hashlib.sha256((sandbox.data_dir / name).read_bytes()).hexdigest()
-                          for name in aside]},
-               {"set_aside": 1, "bytes": [hashlib.sha256(older_bytes).hexdigest()]})
+        observed = clean_choice(older_clean) if older_clean else {"kept": [], "dropped": list(paths.values())}
+        observed.update(handoff_admitted=admitted, active_after_handoffs=active)
+        case.check("clean-survivor-tab-order", observed, clean_choice(OLDER_CLEAN[:room_clean]),
+                   wrong=clean_choice(OLDER_CLEAN[-room_clean:]))
+        aside = [name for name in data_after
+                 if name.startswith(older_source.name + ".set-aside-")]
+        if filler_source.name in data_after:
+            raise Refused("the filler source is still present: no durable restore checkpoint")
+        case.check("omitted-state-recoverable",
+                   {"set_aside": len(aside),
+                    "bytes": [hashlib.sha256((sandbox.data_dir / name).read_bytes()).hexdigest()
+                              for name in aside]},
+                   {"set_aside": 1, "bytes": [hashlib.sha256(older_bytes).hexdigest()]})
 
-    case.step("restore: SIGKILL before any save, then relaunch")
-    with os.fdopen(os.pidfd_open(first.child.pid), "rb") as pidfd:
-        signal.pidfd_send_signal(pidfd.fileno(), signal.SIGKILL)
-    if not exited(first.child, WATCHDOG):
-        raise TimeoutError("restored editor survived SIGKILL past the watchdog")
-    if first.child.wait() != -signal.SIGKILL:
-        raise Refused(f"restored editor exit {first.child.returncode}, expected SIGKILL")
-    second = Editor(case, stack, "relaunched").spawn(sandbox.restart, [])
-    second.bind(driver)
-    sandbox.record_server()
-    second_notice = second.frame().bottom_row_text().rstrip(" ")
-    again = second.ring(capacity + 1)
-    (case.artifacts / "relaunched-ring.json").write_text(json.dumps(again) + "\n")
-    _, _, dirty_again, _ = classify(again)
-    copies_again = {key: second.copy_at(again, dirty_again[key]) if key in dirty_again else None
-                    for key in (DIRTY_FILE, UNTITLED)}
-    case.facts["relaunched"] = {"live": len(again), "notice": second_notice}
-    case.check("second-recovery",
-               {"tabs": sorted(again), "dirty": copies_again},
-               {"tabs": sorted(walked), "dirty": expected_dirty})
+        case.step("restore: SIGKILL before any save, then relaunch")
+        with os.fdopen(os.pidfd_open(first.child.pid), "rb") as pidfd:
+            signal.pidfd_send_signal(pidfd.fileno(), signal.SIGKILL)
+        if not exited(first.child, WATCHDOG):
+            raise TimeoutError("restored editor survived SIGKILL past the watchdog")
+        if first.child.wait() != -signal.SIGKILL:
+            raise Refused(f"restored editor exit {first.child.returncode}, expected SIGKILL")
+    with case.server(sandbox, "relaunched") as (_, driver), ExitStack() as stack:
+        second = Editor(case, stack, "relaunched").spawn(sandbox.restart, [])
+        second.bind(driver)
+        sandbox.record_server()
+        second_notice = second.frame().bottom_row_text().rstrip(" ")
+        again = second.ring(capacity + 1)
+        (case.artifacts / "relaunched-ring.json").write_text(json.dumps(again) + "\n")
+        _, _, dirty_again, _ = classify(again)
+        copies_again = {key: second.copy_at(again, dirty_again[key]) if key in dirty_again else None
+                        for key in (DIRTY_FILE, UNTITLED)}
+        case.facts["relaunched"] = {"live": len(again), "notice": second_notice}
+        case.check("second-recovery",
+                   {"tabs": sorted(again), "dirty": copies_again},
+                   {"tabs": sorted(walked), "dirty": expected_dirty})
 
-    case.step("restore: clean close and disk check")
-    status = stop(second.child, signal.SIGTERM)
-    if status != 0:
-        raise Refused(f"relaunched editor clean close returned {status}")
-    case.check("disk-intact",
-               {name: (sandbox.fixtures / name).read_bytes() for name in sorted(disk)},
-               {name: disk[name] for name in sorted(disk)})
+        case.step("restore: clean close and disk check")
+        status = stop(second.child, WATCHDOG)
+        if status != 0:
+            raise Refused(f"relaunched editor clean close returned {status}")
+        case.check("disk-intact",
+                   {name: (sandbox.fixtures / name).read_bytes() for name in sorted(disk)},
+                   {name: disk[name] for name in sorted(disk)})
     return second
 
 
-def scenario(case, target, display, auth):
-    capacity, receipt = measure_capacity(case, target, display, auth)
+def scenario(case, target):
+    capacity, receipt = measure_capacity(case, target)
     case.check("capacity-measured", receipt,
                {"refused_one_path": True, "reopen_admitted": True, "alive": True,
                 "active_after_reopen": [probe_name(0), content(probe_name(0)).decode()]})
@@ -669,19 +668,19 @@ def scenario(case, target, display, auth):
     fill = 2 if case.negative == "no-pressure" else capacity - UNSAVED - 1
     if fill < 2:
         raise Refused(f"capacity {capacity} leaves no room for a filler")
-    with Sandbox(case.artifacts, target, display=display) as sandbox, ExitStack() as stack:
-        Path(sandbox.env["XAUTHORITY"]).write_bytes(auth.read_bytes())
-        driver = stack.enter_context(XDriver(BUILD / "xdriver", display, env=sandbox.env,
-                                             timeout=WATCHDOG * 2))
+    with Sandbox(case.artifacts, target, display=case.display) as sandbox:
         try:
-            last = restore(case, sandbox, driver, stack, capacity, fill,
-                           *producers(case, sandbox, driver, stack, capacity, fill))
+            with case.server(sandbox, "producers") as (_, driver), ExitStack() as stack:
+                produced = producers(case, sandbox, driver, stack, capacity, fill)
+            last = restore(case, sandbox, capacity, fill, *produced)
             counts = {"relaunched": last.law2()}
             case.facts["law2"] = counts
-            # Count rule (wave0-contract-design.md): v1 measured 0 over the relaunched editor's
-            # tab-walk and copy windows (run contract-capacity-v8wtgv9p: 1007 scopes), so the
-            # count is asserted on v1 as on v2.
-            case.check("law2-count", counts["relaunched"]["allocations"], 0)
+            # Count rule (wave0-contract-design.md): on a server of its own the relaunched editor
+            # counts 4 on v1 (v2-he7.33; the 0 of run contract-capacity-v8wtgv9p was a shared
+            # server's history), so the case requires a healthy instrument and the manifest's
+            # per-target predicate decides the count: recorded on v1-pin, zero on v2.
+            case.check("law2-count", counts["relaunched"]["scopes"] >= 1, True,
+                       law2=counts["relaunched"])
         finally:
             if sandbox.data_dir.exists():
                 shutil.copytree(sandbox.data_dir, case.artifacts / "data")
@@ -695,6 +694,7 @@ def main():
     parser.add_argument("--display", required=True)
     parser.add_argument("--negative", choices=NEGATIVES,
                         help="red control: a wrong expectation or a fixture without pressure")
+    records.digests_argument(parser)
     args = parser.parse_args()
     if not CONTRACT_DISPLAY.fullmatch(args.display):
         parser.error("--display must be a contract display, :120 through :199")
@@ -704,7 +704,7 @@ def main():
     BUILD.mkdir(exist_ok=True)
     artifacts = Path(tempfile.mkdtemp(prefix="contract-capacity-", dir=BUILD))
     (artifacts / "handoffs").mkdir()
-    case = Case(artifacts, args.negative)
+    case = Case(artifacts, args.negative, args.display)
     try:
         battery = Path("/sys/class/power_supply/BAT0/status").read_text(encoding="ascii").strip()
     except OSError:
@@ -715,18 +715,18 @@ def main():
                 "started": time.time()}
     print(f"R4 run artifacts in {artifacts}", file=sys.stderr, flush=True)
     try:
-        stamp = json.loads((args.build_dir / STAMP).read_text(encoding="utf-8"))
-        if stamp["pin"] != PIN or stamp["patch_sha256"] != sha256(PATCH):
-            raise Refused("oracle manifest differs from the pinned source or patch")
         target = RunTarget("v1", args.build_dir / EDITOR, args.build_dir,
-                           stamp["executables"][EDITOR])
-        manifest.update(role=target.role, oracle=str(target.executable), sha256=target.sha256,
-                        commit=PIN, patch_sha256=stamp["patch_sha256"])
-        with private_display(args.display, artifacts) as auth:
-            scenario(case, target, args.display, auth)
+                           args.digests[str(args.build_dir / EDITOR)])
+        manifest.update(role=target.role, oracle=str(target.executable), digests=args.digests)
+        scenario(case, target)
         if tuple(case.asserted) != ASSERTIONS:
             case.stage = "assertion-inventory"
             raise Refused(f"assertion inventory incomplete: {case.asserted}")
+    except TeardownError as exc:
+        # A server that outlived its stop is ERROR beside the failure it interrupted, if any.
+        if exc.pending is not None:
+            case.failure(exc.pending)
+        case.emit("teardown", "ERROR", f"{case.stage}: TeardownError: {exc}")
     except Mismatch as exc:
         case.failure(exc)
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:

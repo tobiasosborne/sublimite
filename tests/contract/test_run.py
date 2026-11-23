@@ -43,13 +43,14 @@ class RunnerTests(unittest.TestCase):
 
     def manifest(self, steps, *, assertions=("a", "b"), expect=None, role="harness",
                  identity=None, displays=0, timeout=TIMEOUT_S, script=FIXTURE, raw=None,
-                 cases=None, overrides=None, targets=None):
+                 cases=None, overrides=None, targets=None, digests=False):
         """`cases` maps case ID -> (invocation, assertion IDs); every invocation plays the same
         plan, so step n is the n-th launch overall. `overrides` maps "case.assertion" to its
         manifest override object; `targets` adds targets beside "fixture"."""
         plan = self.dir / "plan.json"
         plan.write_text(json.dumps({"counter": str(self.counter), "steps": steps}))
         argv = [script, "--plan", str(plan)] + (["--display", "{display}"] if displays else [])
+        argv += ["--digests", "{digests}"] if digests else []
         cases = cases or {"A": ("fixture", assertions)}
         overrides = overrides or {}
 
@@ -385,13 +386,14 @@ class RunnerTests(unittest.TestCase):
         return build, stub, identity
 
     def test_expected_digests_reach_every_invocation(self):
-        # Finding 2, runner half: the selected target's digests, keyed by executed path.
+        # Finding 2: the selected target's digests, keyed by executed path, travel in the
+        # invocation's own argv ({digests}); no inherited variable carries a binding.
         build, stub, identity = self.oracle_build()
         steps = [{"records": [record("a", "PASS")], "exit": 0, "digests": True},
                  {"records": [record("a", "PASS", case="B")], "exit": 0, "digests": True}]
         path = self.manifest(steps, cases={"A": ("first", ("a",)), "B": ("second", ("a",))},
-                             role="v1", identity=identity)
-        outer = dict(os.environ, **{records.DIGESTS_ENV: json.dumps({str(stub): "0" * 64})})
+                             role="v1", identity=identity, digests=True)
+        outer = dict(os.environ, CONTRACT_DIGESTS=json.dumps({str(stub): "0" * 64}))
         code, gate, out = self.run_gate(path, "--exe", f"stub={stub}", "--oracle-build", str(build),
                                         role="v1", env=outer)
         self.assertEqual(code, records.EXIT["PASS"], out)
@@ -399,8 +401,43 @@ class RunnerTests(unittest.TestCase):
                     str(build / "sublimite"): identity["oracle_build"]["sublimite"]}
         self.assertEqual(gate["digests"], expected)
         for name in ("first", "second"):
-            # The outer environment's value never leaks through.
             self.assertEqual(gate["invocations"][name]["records"][0]["digests"], expected)
+        # A stand-alone diagnostic run takes the same binding from the same selection.
+        printed = subprocess.run(
+            [sys.executable, "-B", str(RUN), "--manifest", str(path), "--role", "v1", "--binding",
+             "--exe", f"stub={stub}", "--oracle-build", str(build)],
+            capture_output=True, text=True, check=False)
+        self.assertEqual((printed.returncode, records.binding(printed.stdout)), (0, expected),
+                         printed.stderr)
+
+    def test_count_predicate_per_target(self):
+        # Advisor ruling (R6/R1): the manifest names the count predicate per target; "zero"
+        # asserts allocations == 0, "recorded" only requires a valid count in the record.
+        def gate_for(count, law2, status="PASS"):
+            self.out = self.dir / f"out-{count}-{json.dumps(law2)}-{status}"
+            extra = {} if law2 is None else {"law2": law2}
+            path = self.manifest([{"records": [record("a", status, **extra)],
+                                   "exit": records.EXIT[status]}], assertions=("a",),
+                                 overrides={"A.a": {"count": {"fixture": count}}})
+            return self.run_gate(path)
+        for count, law2, want in (("zero", {"allocations": 0, "scopes": 3}, "PASS"),
+                                  ("zero", {"allocations": 1, "scopes": 3}, "FAIL"),
+                                  ("recorded", {"allocations": 4, "scopes": 3}, "PASS"),
+                                  ("recorded", None, "ERROR"),
+                                  ("recorded", {"allocations": 4, "scopes": 0}, "ERROR"),
+                                  ("zero", {"allocations": -1, "scopes": 3}, "ERROR"),
+                                  ("sometimes", {"allocations": 0, "scopes": 3}, "ERROR")):
+            with self.subTest(count=count, law2=law2):
+                code, gate, out = gate_for(count, law2)
+                self.assertEqual(code, records.EXIT[want], out)
+                if count != "sometimes":
+                    self.assertEqual(gate["assertions"]["A.a"]["count"],
+                                     {"predicate": count, "observed": law2})
+        with self.subTest("checked-in manifest: R1, R6 and R4 assert zero on v2 only"):
+            manifest = json.loads((HERE / "expectations.json").read_text())
+            for case in ("R1", "R6", "R4"):
+                self.assertEqual(manifest["cases"][case]["assertions"]["law2-count"]["count"],
+                                 {"v1-pin": "recorded", "v2": "zero"})
 
     def test_replaced_executable_is_an_error_before_launch(self):
         # Finding 2 proof: select A, replace it by B with a matching new stamp before a launch.
@@ -447,11 +484,82 @@ class RunnerTests(unittest.TestCase):
     def test_reserved_environment_in_the_manifest(self):
         path = self.manifest([{"records": [], "exit": 0}])
         manifest = json.loads(path.read_text())
-        manifest["invocations"]["fixture"]["env"] = {records.DIGESTS_ENV: "{}"}
+        manifest["invocations"]["fixture"]["env"] = {"DISPLAY": ":0"}
         code, gate, out = self.run_gate(self.manifest([], raw=json.dumps(manifest)))
         self.assertEqual(code, records.EXIT["ERROR"], out)
-        self.assertIn(records.DIGESTS_ENV, " ".join(gate["problems"]))
+        self.assertIn("DISPLAY", " ".join(gate["problems"]))
         self.assertEqual(self.invocations(), 0)
+
+
+def red_record(case, assertion, status, **extra):
+    return {"case_id": case, "assertion_id": assertion, "status": status, "evidence": "B",
+            "first_required_wave": 2, "predicate": assertion, **extra}
+
+
+class RedTests(unittest.TestCase):
+    """Finding 17: tests/contract/reds.py credits a red only for its own cause."""
+
+    def setUp(self):
+        import reds
+        self.reds = reds
+        self.manifest = json.loads((HERE / "expectations.json").read_text())
+
+    def problems(self, name, *found):
+        return self.reds.check(self.reds.REDS[name],
+                               [records.PREFIX + json.dumps(r) for r in found], self.manifest)
+
+    def swap(self, **changes):
+        fields = {"predicate": "minimal reveal and neighbouring word fragments",
+                  "observed": ["row 1"], "expected": ["row 2"],
+                  "ordinary": {"expected": ["row 1"], "observed": ["row 1"]}}
+        fields.update(changes)
+        return red_record("R1", "wrapped-return", "FAIL", **fields)
+
+    def test_the_deliberate_red_qualifies(self):
+        self.assertEqual(self.problems("R1.wrapped-return",
+                                       red_record("R1", "bottom-setup", "PASS"), self.swap()), [])
+        timeout = red_record("R3", "save-b-bytes", "ERROR", step="save-b-signal",
+                             predicate="TimeoutError: no 0x80 file event for b.c before deadline")
+        self.assertEqual(self.problems("R3.save-signal",
+                                       red_record("R3", "results-between-a-and-b", "PASS"),
+                                       timeout), [])
+        recovered = red_record("R31", "post-ack-file", "FAIL", step="recovered-buffer",
+                               predicate="recovered-buffer: expected (b'x',), got b'y'",
+                               observed_hex="79", expected_hex=["78"],
+                               ordinary={"expected": "79", "observed": "79"})
+        self.assertEqual(self.problems("R31.post-ack-file", recovered), [])
+
+    def test_an_earlier_setup_error_does_not_qualify(self):
+        found = self.problems("R1.wrapped-return",
+                              red_record("R1", "setup", "ERROR", predicate="Refused: occupied"))
+        self.assertTrue(any("first non-PASS record is setup ERROR" in p for p in found), found)
+
+    def test_a_different_mismatch_at_the_same_id_does_not_qualify(self):
+        setup = red_record("R1", "bottom-setup", "PASS")
+        for name, red in (
+                ("another comparison of the group", self.swap(predicate="click preserves setup viewport",
+                                                              ordinary=None)),
+                ("the healthy observation was not shown", self.swap(ordinary=None)),
+                ("an unhealthy observation", self.swap(ordinary={"expected": ["row 1"],
+                                                                 "observed": ["row 3"]})),
+                ("a contrary expectation equal to the observation", self.swap(expected=["row 1"]))):
+            with self.subTest(name):
+                self.assertNotEqual(self.problems("R1.wrapped-return", setup, red), [])
+        exited = red_record("R3", "save-b-bytes", "ERROR", step="save-b-signal",
+                            predicate="Refused: editor exited while waiting for b.c: 1")
+        with self.subTest("an editor exit in place of the withheld save's timeout"):
+            self.assertNotEqual(self.problems("R3.save-signal",
+                                              red_record("R3", "results-between-a-and-b", "PASS"),
+                                              exited), [])
+
+    def test_preceding_controls_and_first_failure_final(self):
+        found = self.problems("R1.wrapped-return", self.swap())
+        self.assertTrue(any("preceding controls" in p for p in found), found)
+        found = self.problems("R1.wrapped-return", red_record("R1", "bottom-setup", "PASS"),
+                              self.swap(), red_record("R1", "teardown", "ERROR"))
+        self.assertTrue(any("records after the red" in p for p in found), found)
+        found = self.problems("R1.wrapped-return", red_record("R1", "bottom-setup", "PASS"))
+        self.assertEqual(found, ["no non-PASS record: the control did not fail"])
 
 
 class ManifestTests(unittest.TestCase):

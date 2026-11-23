@@ -4,7 +4,7 @@
 one line to the counter file first, then plays step min(n, len - 1), where n counts earlier
 invocations: STEP = {"records": [...], "lines": [...], "exit": N, "hang": bool, "write": {PATH:
 TEXT}, "digests": bool}. "write" replaces files before any output (a rebuild between two
-launches); "digests" adds the runner's records.expected_digests() map to every record. A
+launches); "digests" adds the runner's --digests map (records.binding) to every record. A
 fail-once plan is therefore two steps, FAIL then PASS: a rerun would pass.
 """
 
@@ -24,6 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", required=True, type=Path)
     parser.add_argument("--display")
+    parser.add_argument("--digests", type=records.binding)
     args = parser.parse_args()
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     counter = Path(plan["counter"])
@@ -35,7 +36,7 @@ def main():
         replacement = Path(path + ".new")
         replacement.write_text(text, encoding="utf-8")
         replacement.replace(path)  # atomic, as a rebuild installs its output
-    digests = {"digests": records.expected_digests()} if step.get("digests") else {}
+    digests = {"digests": args.digests} if step.get("digests") else {}
     for line in step.get("lines", ()):
         print(line, flush=True)
     for record in step.get("records", ()):

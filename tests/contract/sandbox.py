@@ -314,12 +314,11 @@ class Sandbox:
 
     @contextmanager
     def _checked(self):
+        """One verified view of the case tree for one spawn or connect: the environment is
+        exactly the one built under the pinned root (so no profile, relative or missing
+        location), and every pin, file and endpoint is walked once."""
         self._require_creator()
         env = self.env.copy()
-        for key in _DIRS:
-            value = _absolute(env.get(key), key)
-            if value in self._forbidden.get(key, ()):
-                raise Refused(f"{key} selects an original profile or runtime location")
         if env != self._env:
             raise Refused("child environment differs from the sandbox allowlist")
         with self._root() as (_, root_fd):
@@ -462,10 +461,13 @@ class Sandbox:
     def connect(self):
         """Return a connection to the verified primary, owned by the caller."""
         with self._checked():
-            endpoint = self._recorded()
-            if self._primary.poll() is not None:
-                raise Refused("recorded IPC primary already exited")
-            return self._verify_peer(endpoint)
+            return self._live_peer()
+
+    def _live_peer(self):
+        endpoint = self._recorded()
+        if self._primary.poll() is not None:
+            raise Refused("recorded IPC primary already exited")
+        return self._verify_peer(endpoint)
 
     def relay(self, argv=(), *, stdin=subprocess.DEVNULL, stdout=None, stderr=None, pass_fds=()):
         """Launch a forwarding process after verifying the existing primary.
@@ -473,9 +475,9 @@ class Sandbox:
         The same launch starts a peer that shares this profile without the endpoint (v1
         --new-instance); `pass_fds` names the caller's descriptors it may inherit (R4's
         inspector pair), exactly as for `start` and `restart`."""
-        with self.connect():
-            pass
         with self._checked() as env:
+            with self._live_peer():
+                pass
             self._verify_endpoint(self._recorded())
             return self._spawn(argv, env, stdin=stdin, stdout=stdout, stderr=stderr,
                                pass_fds=pass_fds)
@@ -486,7 +488,7 @@ class Sandbox:
         A reaped SIGKILL must leave the recorded socket refusing connections. Any exit with a
         status (0, or an error status such as v1's 1 after a fatal editor error) must have
         removed its socket. Other signals are refused."""
-        with self._checked():
+        with self._checked() as env:
             endpoint = self._recorded()
             status = self._primary.poll()
             if status is None:
@@ -500,11 +502,9 @@ class Sandbox:
                     pass
             elif status < 0 or self._verify_endpoint(endpoint, allow_missing_socket=True):
                 raise Refused("restart requires SIGKILL or an exit that removed its socket")
-
-        with self._checked() as env:
+            # The recorded endpoint once more, immediately before the spawn.
             exited = status >= 0
-            has_socket = self._verify_endpoint(endpoint, allow_missing_socket=exited)
-            if has_socket and exited:
+            if self._verify_endpoint(endpoint, allow_missing_socket=exited) and exited:
                 raise Refused("IPC socket reappeared after exit")
             self._primary = self._spawn(argv, env, stdin=stdin, stdout=stdout,
                                         stderr=stderr, pass_fds=pass_fds)

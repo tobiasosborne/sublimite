@@ -5,8 +5,8 @@ The manifest (tests/contract/expectations.json, format in docs/decisions/v2-he7.
 every case and assertion with its evidence kind, first required wave and per-target
 expectation, and binds each target to an exact identity (pin, patch digest, executable
 digests). The runner owns no case logic: it hashes the target, picks the reviewed target whose
-identity matches, hands each invocation a free private display and the selected target's
-executable digests (records.DIGESTS_ENV), re-hashes those executables, runs it exactly once
+identity matches, hands each invocation a free private display and, in its argv ({digests}),
+the selected target's executable digests, re-hashes those executables, runs it exactly once
 under its watchdog, parses the RECORD lines it printed (tests/contract/records.py) and
 compares by the (case_id, assertion_id) pair. Green means every required assertion is PASS
 or XFAIL with its reviewed signature; a required ID without a record is NOT-RUN only after a
@@ -39,7 +39,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import records  # noqa: E402
 from sandbox import CONTRACT_DISPLAY  # noqa: E402
-from test_xdriver import available  # noqa: E402
+from xserver import available  # noqa: E402
 
 ROOT = HERE.parents[1]
 MANIFEST = HERE / "expectations.json"
@@ -48,9 +48,12 @@ ERRORS = ("ERROR", "MISSING", "WRONG-SIGNATURE")
 ACCEPTED = ("PASS", "XFAIL")  # the only outcomes a green run is made of
 STOPPING = ("FAIL", "ERROR", "WRONG-SIGNATURE")  # observed failures after which a case stops
 PLACEHOLDER = re.compile(r"\{([a-z_]+)(?::([A-Za-z0-9_.-]+))?\}")
-# The child must never reach the desktop session; cases set what they need explicitly.
+# The child must never reach the desktop session; cases set what they need explicitly. No
+# manifest env may set these either.
 DROPPED_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY")
-RESERVED_ENV = DROPPED_ENV + (records.DIGESTS_ENV,)  # no manifest env may set these
+# Count predicates per target (advisor, R1/R6): "zero" asserts the record's passive Law-2
+# count is 0; "recorded" requires a valid count in the record and asserts nothing on it.
+COUNTS = ("recorded", "zero")
 
 
 class Invalid(Exception):
@@ -103,6 +106,7 @@ def assertions_of(manifest):
                 "first_required_wave": override.get("first_required_wave",
                                                     case.get("first_required_wave")),
                 "expect": expect,
+                "count": override.get("count", {}),
             }
 
 
@@ -144,8 +148,8 @@ def validate(manifest):
         env = invocation.get("env", {})
         if not isinstance(env, dict) or not all(isinstance(v, str) for v in env.values()):
             found.append(f"invocation {name}: env must map names to strings")
-        elif set(env) & set(RESERVED_ENV):
-            found.append(f"invocation {name}: env may not set {sorted(set(env) & set(RESERVED_ENV))}")
+        elif set(env) & set(DROPPED_ENV):
+            found.append(f"invocation {name}: env may not set {sorted(set(env) & set(DROPPED_ENV))}")
     for case_id, case in cases.items():
         if not isinstance(case, dict) or case.get("invocation") not in invocations:
             found.append(f"case {case_id}: unknown invocation")
@@ -172,6 +176,10 @@ def validate(manifest):
             if target not in targets:
                 found.append(f"assertion {full}: expectation for unknown target {target}")
             found += expectation_problems(f"assertion {full} on {target}", expect)
+        count = spec["count"]
+        if not isinstance(count, dict) or not set(count) <= set(spec["expect"]) \
+                or not set(count.values()) <= set(COUNTS):
+            found.append(f"assertion {full}: count maps its expected targets to one of {COUNTS}")
     return found
 
 
@@ -217,7 +225,7 @@ def select_target(manifest, identity, role):
 
 def digests_of(identity, exes, oracle_build):
     """{absolute path: sha256} of the selected target's identity, the one binding every
-    invocation gets (records.DIGESTS_ENV) and the runner re-checks before each launch."""
+    invocation gets ({digests} in its argv) and the runner re-checks before each launch."""
     digests = {str(exes[name]): digest for name, digest in identity.get("executables", {}).items()}
     for name, digest in identity.get("oracle_build", {}).items():
         path = str(oracle_build / name)
@@ -271,7 +279,7 @@ def execute(name, invocation, values, digests, pool, used, artifacts):
     if not script.is_file():
         receipt["problems"].append(f"case script missing: {invocation['argv'][0]}")
         return receipt
-    values = dict(values, artifacts=str(artifacts))
+    values = dict(values, artifacts=str(artifacts), digests=json.dumps(digests, sort_keys=True))
     if invocation["displays"]:
         number = next((n for n in pool if n not in used and available(n)), None)
         if number is None:
@@ -285,8 +293,8 @@ def execute(name, invocation, values, digests, pool, used, artifacts):
     except Invalid as exc:
         receipt["problems"].append(str(exc))
         return receipt
-    env = {key: value for key, value in os.environ.items() if key not in RESERVED_ENV}
-    env.update(extra, **{records.DIGESTS_ENV: json.dumps(digests, sort_keys=True)})
+    env = {key: value for key, value in os.environ.items() if key not in DROPPED_ENV}
+    env.update(extra)
     # Narrows, never closes, the window to the launch: the case checks the fd it executes.
     replaced = changed(digests)
     if replaced:
@@ -333,12 +341,20 @@ def execute(name, invocation, values, digests, pool, used, artifacts):
     return receipt
 
 
-def verdict(expect, record):
-    if record["status"] == "ERROR":
+def verdict(expect, record, count=None):
+    status = record["status"]
+    if count is not None and status == "PASS":
+        law2 = record.get("law2")
+        if not (isinstance(law2, dict) and set(law2) == {"allocations", "scopes"}
+                and all(type(v) is int for v in law2.values())
+                and law2["allocations"] >= 0 and law2["scopes"] >= 1):
+            return "ERROR"
+        status = "FAIL" if count == "zero" and law2["allocations"] else status
+    if status == "ERROR":
         return "ERROR"
     if expect == "PASS":
-        return record["status"]
-    if record["status"] == "PASS":
+        return status
+    if status == "PASS":
         return "XPASS"
     return "XFAIL" if record.get("signature") == expect["signature"] else "WRONG-SIGNATURE"
 
@@ -374,10 +390,13 @@ def reconcile(receipt, owned, target):
                 f"{case_id} / {assertion_id}: record keys (evidence {record['evidence']}, wave "
                 f"{record['first_required_wave']}) differ from the manifest "
                 f"({spec['evidence']}, {spec['first_required_wave']})")
-        outcome = verdict(spec["expect"][target], record)
+        count = spec["count"].get(target)
+        outcome = verdict(spec["expect"][target], record, count)
         observed[key] = {"outcome": outcome, "observed": record["status"],
                          "predicate": record["predicate"], "signature": record.get("signature"),
                          "artifacts": record.get("artifacts")}
+        if count is not None:
+            observed[key]["count"] = {"predicate": count, "observed": record.get("law2")}
         reached[case_id] = max(reached.get(case_id, -1), order[key])
         if outcome in STOPPING:
             stops.append((case_id, order[key]))
@@ -425,11 +444,23 @@ def summary(gate):
     for full, entry in gate["assertions"].items():
         counts[entry["outcome"]] = counts.get(entry["outcome"], 0) + 1
         if entry["outcome"] != "PASS":
+            count = entry.get("count") or {}
+            reason = (f"Law-2 count {count['observed']}, the manifest's {count['predicate']} "
+                      "predicate" if count.get("observed") else entry.get("predicate"))
             lines.append(f"  {full}: {entry['outcome']} (expected "
                          f"{entry['expected'] if entry['expected'] == 'PASS' else 'XFAIL'})"
-                         + (f": {entry['predicate'][:160]}" if entry.get("predicate") else ""))
+                         + (f": {reason[:160]}" if reason else ""))
     lines.append("  outcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     return "\n".join(lines) + "\n"
+
+
+def select(args):
+    """(manifest, gate identity, target, digests) of a run; Invalid and friends propagate."""
+    manifest = load(args.manifest)
+    identity = identity_of(dict(args.exe), args.oracle_build)
+    target = select_target(manifest, identity, args.role)
+    return manifest, identity, target, digests_of(manifest["targets"][target]["identity"],
+                                                  dict(args.exe), args.oracle_build)
 
 
 def run(args):
@@ -444,11 +475,8 @@ def run(args):
     required = []
     try:
         gate["manifest"]["sha256"] = sha256(args.manifest)
-        manifest = load(args.manifest)
-        gate["identity"] = identity_of(dict(args.exe), args.oracle_build)
-        gate["target"] = target = select_target(manifest, gate["identity"], args.role)
-        gate["digests"] = digests = digests_of(manifest["targets"][target]["identity"],
-                                               dict(args.exe), args.oracle_build)
+        manifest, gate["identity"], target, digests = select(args)
+        gate["target"], gate["digests"] = target, digests
     except (Invalid, OSError, KeyError, ValueError) as exc:
         gate["problems"].append(f"{type(exc).__name__}: {exc}")
     else:
@@ -496,6 +524,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--validate", action="store_true", help="check the manifest and exit")
+    parser.add_argument("--binding", action="store_true",
+                        help="print the selected target's --digests value (stand-alone runs)")
     parser.add_argument("--role", choices=ROLES)
     parser.add_argument("--exe", type=exe_pair, action="append", default=[],
                         help="NAME=/abs/path: a target executable, hashed into the identity")
@@ -519,6 +549,13 @@ def main():
         parser.error("--oracle-build must be absolute")
     if len({name for name, _ in args.exe}) != len(args.exe):
         parser.error("--exe names must be unique")
+    if args.binding:
+        try:
+            print(json.dumps(select(args)[3], sort_keys=True))
+        except (Invalid, OSError, KeyError, ValueError) as exc:
+            print(f"run.py: no reviewed binding: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return records.EXIT["ERROR"]
+        return records.EXIT["PASS"]
     return run(args)
 
 

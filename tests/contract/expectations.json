@@ -57,6 +57,16 @@
    },
    "timeout_derivation": "(E) Xvfb start plus 8 tests of at most a few 15 s driver operations each (P, WATCHDOG in test_xdriver.py) stay below 60 x 15 s"
   },
+  "plumbing": {
+   "argv": [
+    "tests/contract/test_plumbing.py",
+    "--display",
+    "{display}"
+   ],
+   "displays": 1,
+   "timeout_s": 115,
+   "timeout_derivation": "(M) slowest run 11.40 s (2026-11-23 W0.7-B6 make check, BAT0 Charging, load 8.56; 10.29 s Discharging load 6.45) x 10 (R4 precedent) = 114.0 s, rounded up; it includes one stand-in readiness expiry (xserver.READY_S), the X driver suite under a TERM-ignoring server and five case scripts refusing a replaced editor (docs/decisions/v2-he7.33.md)"
+  },
   "x3-selftest": {
    "argv": [
     "tests/contract/test_large_undo.py",
@@ -64,8 +74,8 @@
     "{display}"
    ],
    "displays": 1,
-   "timeout_s": 116,
-   "timeout_derivation": "(M) slowest X3 self-test invocation 11.55 s (2026-11-23 W0.7-B2, cold fixtures, BAT0 Charging, load 5.71) x 10 (R4 precedent) = 115.5 s, rounded up; the current self-test (three stub runs) measured 6.70 s cold and 7.09 s warm (M) [AC, BAT0 Not charging, load 5.5] (docs/decisions/v2-he7.15.md Deadlines)"
+   "timeout_s": 126,
+   "timeout_derivation": "(M) slowest X3 self-test invocation 12.58 s (2026-11-23 21:36 W0.7-B6 standalone, four stub runs including the replaced-stub refusal; power and load not stamped for that run) x 10 (R4 precedent) = 125.8 s, rounded up; stamped runs 11.44 s [BAT0 Charging, load 8.56] and 9.49 s [Charging, load 7.33], earlier 11.55 s (W0.7-B2, Charging, load 5.71) (docs/decisions/v2-he7.15.md Deadlines, v2-he7.33.md)"
   },
   "adapter": {
    "argv": [
@@ -73,7 +83,9 @@
     "--build-dir",
     "{oracle_build}",
     "--display",
-    "{display}"
+    "{display}",
+    "--digests",
+    "{digests}"
    ],
    "displays": 1,
    "timeout_s": 1800,
@@ -85,7 +97,9 @@
     "--build-dir",
     "{oracle_build}",
     "--display",
-    "{display}"
+    "{display}",
+    "--digests",
+    "{digests}"
    ],
    "displays": 1,
    "timeout_s": 2400,
@@ -97,7 +111,9 @@
     "--build-dir",
     "{oracle_build}",
     "--display",
-    "{display}"
+    "{display}",
+    "--digests",
+    "{digests}"
    ],
    "displays": 1,
    "timeout_s": 1800,
@@ -113,7 +129,9 @@
     "--display",
     "{display}",
     "--case",
-    "all"
+    "all",
+    "--digests",
+    "{digests}"
    ],
    "displays": 1,
    "timeout_s": 1800,
@@ -125,7 +143,9 @@
     "--target",
     "{exe:oracle}",
     "--display",
-    "{display}"
+    "{display}",
+    "--digests",
+    "{digests}"
    ],
    "displays": 1,
    "timeout_s": 801,
@@ -137,7 +157,9 @@
     "--build-dir",
     "{oracle_build}",
     "--display",
-    "{display}"
+    "{display}",
+    "--digests",
+    "{digests}"
    ],
    "displays": 1,
    "timeout_s": 1900,
@@ -224,6 +246,29 @@
     "ProtocolTests.test_rejects_malformed_missing_and_extra_replies": {}
    }
   },
+  "PLUMBING": {
+   "invocation": "plumbing",
+   "evidence": "harness",
+   "first_required_wave": 0,
+   "expect": {
+    "harness": "PASS"
+   },
+   "assertions": {
+    "BindingTests.test_replaced_editor_is_refused_before_launch": {},
+    "CountTests.test_one_validated_count": {},
+    "TransportTests.test_exit_without_a_packet": {},
+    "TransportTests.test_malformed_frames": {},
+    "TransportTests.test_missing_packet": {},
+    "TransportTests.test_simultaneous_packet_and_exit_returns_the_packet": {},
+    "XServerTests.test_authenticated_client_at_each_geometry": {},
+    "XServerTests.test_displayfd_answers": {},
+    "XServerTests.test_early_server_exit_surfaces": {},
+    "XServerTests.test_occupied_display_is_refused_before_any_server": {},
+    "XServerTests.test_successive_servers_share_no_history": {},
+    "XServerTests.test_term_ignored_is_reaped_then_error_keeping_the_first_failure": {},
+    "XServerTests.test_term_ignoring_server_leaves_a_passing_suite_at_exit_4": {}
+   }
+  },
   "X3-SELFTEST": {
    "invocation": "x3-selftest",
    "evidence": "harness",
@@ -271,6 +316,13 @@
     "return-caret": {},
     "saved-bytes": {
      "evidence": "A"
+    },
+    "law2-count": {
+     "count": {
+      "v1-pin": "recorded",
+      "v2": "zero"
+     },
+     "note": "Passive Law-2 count over R1's input-to-submit windows. v1-pin: the guard is active over at least one measured window and the count is recorded (4 at 0.48: libxcb read_packet under xcb_flush in cpu_paint_margins, docs/decisions/v2-he7.23.md). v2: count == 0 (Law 2, amendment A12)."
     }
    }
   },
@@ -286,7 +338,14 @@
     "first-viewport": {},
     "tail-navigation": {},
     "marker": {},
-    "occupied-navigation": {}
+    "occupied-navigation": {},
+    "law2-count": {
+     "count": {
+      "v1-pin": "recorded",
+      "v2": "zero"
+     },
+     "note": "Passive Law-2 count over R6's input-to-submit windows. v1-pin: the guard is active over at least one measured window and the count is recorded (docs/decisions/v2-he7.33.md: 4 on a fresh server, 0 after R1 on a shared one; every case now has its own server). v2: count == 0 (Law 2, amendment A12)."
+    }
    }
   },
   "R3": {
@@ -415,7 +474,12 @@
      "evidence": "A"
     },
     "law2-count": {
-     "evidence": "B"
+     "evidence": "B",
+     "count": {
+      "v1-pin": "recorded",
+      "v2": "zero"
+     },
+     "note": "Passive Law-2 count over the relaunched editor's tab-walk and copy windows. v1-pin: the guard is active over at least one measured window and the count is recorded (4 on a server of its own, docs/decisions/v2-he7.33.md; the earlier 0 was a shared server's history). v2: count == 0 (Law 2, amendment A12)."
     }
    },
    "note": "docs/decisions/v2-he7.17.md. Assumes a discoverable live-tab capacity refusal through a public open, which v2 must also provide."

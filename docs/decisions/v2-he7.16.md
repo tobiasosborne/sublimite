@@ -168,6 +168,8 @@ Simplest alternative, rejected: drop NOT-RUN and make every missing ID MISSING. 
 
 **Parsing (finding 16).** `records.unique_object` is the one `object_pairs_hook`. It rejects a repeated key on every JSON stream the runner reads: the manifest, each RECORD line (`records.parse`) and the oracle build stamp. Records reconcile by the `(case_id, assertion_id)` pair. The joined `case.assertion` survives only as the gate record's display key, which the manifest already keeps unique. Problems spell the pair as `case / assertion`, and each gate entry carries both IDs. Dotted assertion IDs (`over.ctl.delete`, `Class.method`) stay legal. `case_id "A.x"` + `assertion_id "y"` no longer claims `A / x.y`.
 
+*Superseded 2026-11-23 by v2-he7.33 §4: the map travels in each invocation's argv (`{digests}` → `--digests`), not in `CONTRACT_DIGESTS`; the paragraph below is the history.*
+
 **Digest interface (finding 2, runner half).** Each invocation's environment carries `CONTRACT_DIGESTS` (`records.DIGESTS_ENV`). It holds a JSON object `{absolute path: sha256 hex}` with one entry per executable in the **selected manifest target's identity**: each `executables.NAME` under the `--exe NAME=` path, and each `oracle_build.NAME` under `str(<--oracle-build>/NAME)`. Keys use exactly the spelling of the corresponding placeholder value (`{exe:NAME}`, or `{oracle_build}` joined with the stamp name). A case looks up the path it will execute: `records.expected_digests()[str(path)]`. That covers the adapter's `sublimite-stock` and `sublimite-drop-submit` too.
 
 - The environment was chosen over an argument because it needs no manifest or case argv change and reaches every invocation the same way.

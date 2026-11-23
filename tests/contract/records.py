@@ -9,10 +9,11 @@ a reviewed expected failure. Cases never write XFAIL or XPASS: those are verdict
 runner against expectations.json, never observations. Every other key is case evidence.
 A JSON object with a repeated key is malformed on every stream (records, manifest, stamp).
 
-The runner binds each invocation to the reviewed executables: DIGESTS_ENV holds a JSON
-object {absolute path: sha256 hex} for every executable of the selected target, keyed by
-the path spelling of its placeholder ({exe:NAME}, or {oracle_build} joined with the stamp
-name). expected_digests() reads it; a case hashes the fd it will execute against it.
+The runner binds each invocation to the reviewed executables through its own argv: the
+manifest's {digests} placeholder expands to a JSON object {absolute path: sha256 hex} for
+every executable of the selected target, keyed by the path spelling of its placeholder
+({exe:NAME}, or {oracle_build} joined with the stamp name). A case takes it as --digests
+(digests_argument) and hashes the fd it will execute against it; nothing is inherited.
 
 Exit statuses, one each, the same for every case script, self-test and the runner
 (docs/decisions/v2-he7.16.md): PASS 0, FAIL 3, ERROR 4; the runner alone adds XPASS 5.
@@ -21,7 +22,7 @@ can be read as a result.
 """
 
 import json
-import os
+import re
 import sys
 import unittest
 
@@ -74,12 +75,21 @@ def parse(line):
     return json.loads(line[len(PREFIX):], object_pairs_hook=unique_object)
 
 
-DIGESTS_ENV = "CONTRACT_DIGESTS"
+def binding(text):
+    """The --digests value: {absolute path: sha256 hex}, unique keys (ValueError otherwise)."""
+    digests = json.loads(text, object_pairs_hook=unique_object)
+    if not isinstance(digests, dict) or not all(
+            path.startswith("/") and isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest)
+            for path, digest in digests.items()):
+        raise ValueError("--digests takes a JSON object {absolute path: sha256 hex}")
+    return digests
 
 
-def expected_digests(environ=os.environ):
-    """The runner's {absolute path: sha256} binding for this invocation; KeyError outside it."""
-    return json.loads(environ[DIGESTS_ENV], object_pairs_hook=unique_object)
+def digests_argument(parser):
+    """The required --digests option: the runner's selection ({digests}), or the same binding
+    printed by `run.py --binding` for a stand-alone diagnostic run."""
+    parser.add_argument("--digests", required=True, type=binding,
+                        help="JSON {absolute path: sha256 hex} of the executables to launch")
 
 
 def emit(record, default=str):

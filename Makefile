@@ -6,7 +6,7 @@
 #
 # Targets: all  check  check-lints  check-layers  check-san  check-law2
 #          check-contract  check-tsan  fuzz  fuzz-smoke  clean
-#          contract-gate (oracle-driven; not part of check)
+#          contract-gate  contract-reds (oracle-driven; not part of check)
 #
 # Independent objects use the available CPUs; an explicit make -j still wins.
 ifeq ($(MAKELEVEL)$(filter -j% --jobserver%,$(MAKEFLAGS)),0)
@@ -113,17 +113,28 @@ check-xdriver: $(B)/xdriver $(B)/xdriver-test-client
 	python3 -B tests/contract/test_xdriver.py
 
 ORACLE_JOBS ?= 1
+# A stand-alone diagnostic run launches only what the gate would: the reviewed binding the
+# runner selects for ORACLE and ORACLE_TREE (run.py --binding; docs/decisions/v2-he7.33.md).
+CONTRACT_BINDING = $$(python3 -B tests/contract/run.py --binding --role v1 \
+    --exe oracle="$(abspath $(ORACLE))" --oracle-build "$(abspath $(ORACLE_TREE))/build/contract-oracle")
 .PHONY: check-contract-oracle
 check-contract-oracle: $(B)/xdriver
-	@test -n "$(ORACLE_TREE)" && test -n "$(ORACLE_DISPLAY)" || { echo "Set ORACLE_TREE and ORACLE_DISPLAY (:130 through :139)" >&2; exit 2; }
+	@test -n "$(ORACLE_TREE)" && test -n "$(ORACLE)" && test -n "$(ORACLE_DISPLAY)" || { echo "Set ORACLE_TREE, ORACLE and ORACLE_DISPLAY (:130 through :139)" >&2; exit 2; }
 	python3 -B tests/contract/build_oracle.py --jobs "$(ORACLE_JOBS)" "$(ORACLE_TREE)"
-	python3 -B tests/contract/test_oracle_inspector.py --build-dir "$(ORACLE_TREE)/build/contract-oracle" --driver "$(abspath $(B)/xdriver)" --display "$(ORACLE_DISPLAY)"
+	python3 -B tests/contract/test_oracle_inspector.py --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --driver "$(abspath $(B)/xdriver)" --display "$(ORACLE_DISPLAY)" --digests "$(CONTRACT_BINDING)"
 
 .PHONY: check-contract-recovery
 check-contract-recovery: $(B)/xdriver
-	python3 -B tests/contract/cases/recovery.py --oracle "$$ORACLE" \
-		$${ORACLE_TREE:+--build-dir "$$ORACLE_TREE/build/contract-oracle"} \
-		--display "$$RECOVERY_DISPLAY" --case "$${RECOVERY_CASE:-pre-ack}"
+	python3 -B tests/contract/cases/recovery.py --oracle "$(abspath $(ORACLE))" \
+		--build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" \
+		--display "$$RECOVERY_DISPLAY" --case "$${RECOVERY_CASE:-pre-ack}" --digests "$(CONTRACT_BINDING)"
+
+# Red receipts that verify their cause (tests/contract/reds.py, finding 17): every red, or REDS.
+.PHONY: contract-reds
+contract-reds: $(B)/xdriver
+	python3 -B tests/contract/reds.py --oracle "$(abspath $(ORACLE))" \
+	    --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" \
+	    --display "$(CONTRACT_DISPLAY)" --digests "$(CONTRACT_BINDING)" $(REDS)
 
 # ---- objects (one tree per configuration) ----
 define CFG_COMPILE
@@ -263,7 +274,7 @@ contract-gate: $(B)/xdriver $(B)/xdriver-test-client
 .PHONY: check-contract-large-undo
 check-contract-large-undo: $(B)/xdriver $(B)/xdriver-test-client
 	python3 -B tests/contract/test_large_undo.py --display "$(CONTRACT_DISPLAY)"
-	python3 -B tests/contract/cases/large_undo.py --target "$(ORACLE)" --display "$(CONTRACT_DISPLAY)"
+	python3 -B tests/contract/cases/large_undo.py --target "$(abspath $(ORACLE))" --display "$(CONTRACT_DISPLAY)" --digests "$(CONTRACT_BINDING)"
 
 .PHONY: check-contract-sandbox
 check-contract-sandbox:
@@ -275,13 +286,13 @@ check-contract-inspect:
 
 .PHONY: check-contract-files
 check-contract-files: $(B)/xdriver
-	python3 -B tests/contract/cases/files.py \
+	python3 -B tests/contract/cases/files.py --digests "$(CONTRACT_BINDING)" \
 	    --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --display "$(CONTRACT_DISPLAY)"
 
 .PHONY: check-contract-navigation
 check-contract-navigation: $(B)/xdriver
-	@test -n "$(ORACLE_TREE)" && test -n "$(CONTRACT_DISPLAY)" || { echo "Set ORACLE_TREE and CONTRACT_DISPLAY (:170 through :179)" >&2; exit 2; }
-	python3 -B tests/contract/cases/navigation.py --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --display "$(CONTRACT_DISPLAY)"
+	@test -n "$(ORACLE_TREE)" && test -n "$(ORACLE)" && test -n "$(CONTRACT_DISPLAY)" || { echo "Set ORACLE_TREE, ORACLE and CONTRACT_DISPLAY (:170 through :179)" >&2; exit 2; }
+	python3 -B tests/contract/cases/navigation.py --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --display "$(CONTRACT_DISPLAY)" --digests "$(CONTRACT_BINDING)"
 
 check-lints: check-layout check-includes
 	python3 tools/check_isolation.py

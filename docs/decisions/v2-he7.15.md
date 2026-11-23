@@ -468,7 +468,7 @@ ThinkPad with 12 CPUs, on 2026-11-23, from the X3 run records of this bead (all 
 
 | wait | constant | slowest measured (M) | × factor | bound |
 |---|---|---|---|---|
-| Xvfb readiness | `XVFB_READY_S` | 0.26 s, load 1-17 | 10 | 3 s |
+| Xvfb readiness | `XVFB_READY_S` (now `xserver.READY_S`, v2-he7.33) | 0.26 s, load 1-17 | 10 | 3 s |
 | launch → mapped window | `WINDOW_MAP_MS` | 0.481 s, run `074710Z-107549` [bat] load 17.18 | 10 | 5 s |
 | `x` → `session-*` commit (load fence) | `JOURNAL_COMMIT_S` | 4.178 s, run `075412Z-114350` [bat] load 13.28 | 10 | 42 s |
 | Ctrl+S → rename (every save) | `SAVE_RENAME_S` | 49.408 s after Ctrl+A + Delete, run `075412Z-114350` [bat] load 13.28; other saves ≤ 1.712 s | 10 | 495 s |

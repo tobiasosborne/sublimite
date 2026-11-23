@@ -3,38 +3,37 @@
 Every wait is on an event: a snapshot reply on the inspector socket (SNAP, or
 NEXT after a named submit serial), an inotify event armed before the keys that
 cause it, or the editor's pidfd. The only timers are hang detectors; an expired
-one is ERROR, never FAIL.
+one is ERROR, never FAIL. Every editor launch gets a private X server no earlier
+case or launch used (tests/contract/xserver.py).
 
 Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
 """
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import secrets
 import selectors
 import shutil
 import signal
-import socket
 import stat
-import struct
 import subprocess
 import sys
 import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from build_oracle import EDITOR, PATCH, PIN, STAMP, sha256
+from build_oracle import EDITOR
 from files_fixtures import BINARY_SEED, SEARCH_FILES, binary_bytes, search_results, search_tree
 import records
 from sandbox import CONTRACT_DISPLAY, Refused, RunTarget, Sandbox
 import snapwire as wire
-from test_oracle_inspector import GUARD, IN_MOVED_TO, Inspector, directory_watch, wait_for_file_event
-from xdriver import XDriver
+from test_oracle_inspector import (IN_MOVED_TO, Inspector, capacity, directory_watch, law2_count,
+                                   wait_for_file_event)
+from xserver import TeardownError, fresh_display
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -44,13 +43,8 @@ WATCHDOG = 15
 WAIT_MS = WATCHDOG * 1000
 SCREEN = (1280, 1024)  # Xvfb(1)'s default screen geometry.
 GEOMETRY = f"{SCREEN[0]}x{SCREEN[1]}x24"
-# test_oracle_inspector.CAPACITY's bound (one settled frame, one overscan row,
-# a cell per window pixel carrying at most U+FFFD, a tab per column) evaluated
-# at this screen. Each frame's window must fit the screen, or the run is ERROR.
-CAPACITY = (2 * wire.WORD.size + wire.FRAME_SIZES.size + 3 * wire.RECT.size
-            + wire.SCROLL.size + wire.FRAME_TAIL.size + wire.WORD.size
-            + SCREEN[0] * (SCREEN[1] + 1) * (wire.CELL_HEADER.size + len("�".encode()))
-            + SCREEN[0] * (wire.RECT.size + wire.WORD.size))
+# The mapping bound at this screen; each frame's window must fit the screen, or ERROR.
+CAPACITY = capacity(*SCREEN)
 ASSERTIONS = {
     "R3": ("results-between-a-and-b", "save-b-bytes", "save-a-bytes",
            "results-text-still-visible", "other-files-unchanged", "law2-count"),
@@ -85,63 +79,6 @@ def describe(value):
     raise TypeError(f"cannot encode {type(value).__name__}")
 
 
-def display_ready(fd, number):
-    expected = f"{number}\n".encode()
-    response = bytearray()
-    deadline = time.monotonic() + WATCHDOG
-    with selectors.DefaultSelector() as ready:
-        ready.register(fd, selectors.EVENT_READ)
-        # The display number and newline can arrive in separate pipe writes.
-        while len(response) < len(expected) and ready.select(max(0, deadline - time.monotonic())):
-            chunk = os.read(fd, len(expected) - len(response))
-            if not chunk:
-                break
-            response.extend(chunk)
-    return bytes(response)
-
-
-@contextmanager
-def private_display(display, artifacts):
-    number = display[1:]
-    socket_path = f"/tmp/.X11-unix/X{number}"
-    if os.path.lexists(socket_path) or os.path.lexists(f"/tmp/.X{number}-lock"):
-        raise Refused(f"display {display} is occupied")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-        probe.bind("\0" + socket_path)
-
-    auth = artifacts / "Xauthority"
-    # FamilyLocal and a 128-bit cookie, as in the X driver conformance fixture.
-    fields = (os.fsencode(socket.gethostname()), number.encode(), b"MIT-MAGIC-COOKIE-1",
-              secrets.token_bytes(16))
-    with os.fdopen(os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
-        file.write(struct.pack("!H", 256))
-        for field in fields:
-            file.write(struct.pack("!H", len(field)) + field)
-    with ExitStack() as stack:
-        read_fd, write_fd = os.pipe()
-        stack.callback(os.close, read_fd)
-        with os.fdopen(write_fd, "wb") as ready, (artifacts / "Xvfb.log").open("wb") as log:
-            server = subprocess.Popen(
-                ["Xvfb", display, "-displayfd", str(ready.fileno()), "-noreset",
-                 "-nolisten", "tcp", "-auth", str(auth), "-screen", "0", GEOMETRY],
-                env={"PATH": os.environ["PATH"], "TMPDIR": str(artifacts)},
-                cwd=artifacts, pass_fds=(ready.fileno(),), stdout=log, stderr=log,
-                stdin=subprocess.DEVNULL,
-            )
-        try:
-            (artifacts / "Xvfb.pid").write_text(f"{server.pid}\n", encoding="ascii")
-            response = display_ready(read_fd, number)
-            if response != f"{number}\n".encode() or server.poll() is not None:
-                raise Refused(f"Xvfb PID {server.pid} did not claim {display}: {response!r}")
-            yield auth
-        finally:
-            if server.poll() is None:
-                server.terminate()
-                if not exited(server, WATCHDOG):
-                    server.kill()
-            server.wait()
-
-
 def exited(process, timeout):
     """Wait on the process's pidfd; True once it can be reaped without blocking."""
     if process.poll() is not None:
@@ -153,29 +90,6 @@ def exited(process, timeout):
             return bool(ready.select(timeout))
     finally:
         os.close(pidfd)
-
-
-class Snapshots(Inspector):
-    """The oracle transport; each reply wait also wakes on the editor's exit."""
-
-    def __init__(self, stack):
-        super().__init__(stack, CAPACITY)
-        self.pidfd = None
-        self.deadline = None
-
-    def packet(self):
-        with selectors.DefaultSelector() as ready:
-            ready.register(self.reader, selectors.EVENT_READ)
-            ready.register(self.pidfd, selectors.EVENT_READ)
-            pending = {key.fd for key, _ in ready.select(max(0, self.deadline - time.monotonic()))}
-        if self.reader.fileno() not in pending:
-            if self.pidfd in pending:
-                raise Refused("editor exited while awaiting a snapshot")
-            raise TimeoutError("missing snapshot reply before watchdog")
-        packet, ancillary, flags, _ = self.reader.recvmsg(wire.PACKET.size)
-        if flags or ancillary:
-            raise wire.ProtocolError("truncated reply or unexpected ancillary data")
-        return packet
 
 
 def row_text(frame, row, start, stop):
@@ -221,8 +135,9 @@ def hard_wrapped(text, width, height):
 
 
 class Case:
-    def __init__(self, case_id, artifacts, negative):
+    def __init__(self, case_id, artifacts, negative, display):
         self.id = case_id
+        self.display = display
         self.artifacts = artifacts / case_id
         self.artifacts.mkdir(mode=0o700)
         self.records = artifacts / "results.jsonl"
@@ -247,7 +162,7 @@ class Case:
         self.assertion = assertion
         self.part = part
         self.expected = expected
-        self.observed = None
+        self.observed = self.ordinary = None
         self.note(assertion if part is None else f"{assertion}/{part}")
 
     def emit(self, status, *, reason=None):
@@ -257,7 +172,7 @@ class Case:
             "first_required_wave": 3 if self.id == "R3" else 2,
             "status": status, "predicate": reason or self.assertion,
             "step": self.part or self.assertion,
-            "observed": self.observed, "expected": self.expected,
+            "observed": self.observed, "expected": self.expected, "ordinary": self.ordinary,
             "ticket": self.ticket, "submit_serial": self.serial,
             "seed": self.seed, "negative": self.negative,
             "child_status": [{"pid": child.pid, "exit": child.poll()} for child in self.children],
@@ -278,13 +193,23 @@ class Case:
         return "PASS" if self.results else "ERROR"
 
     def check(self, assertion, observe, expected, wrong):
-        """Compare once. `observe` is a value or a function of the active expectation."""
-        self.step(assertion, wrong if self.negative == f"{self.id}.{assertion}" else expected)
+        """Compare once. `observe` is a value or a function of the active expectation.
+
+        Under this assertion's red control the observation must first meet the ordinary
+        expectation (kept as `ordinary`); only then is the wrong one expected."""
+        self.step(assertion, expected)
         if assertion in self.asserted or assertion not in ASSERTIONS[self.id]:
             self.step("assertion-inventory", "each known assertion executes once")
             raise Refused(f"duplicate or unknown assertion {assertion}")
         self.asserted.append(assertion)
-        self.observed = observe(self.expected) if callable(observe) else observe
+        self.observed = observe(expected) if callable(observe) else observe
+        if self.negative == f"{self.id}.{assertion}":
+            if self.observed != expected:
+                raise Refused(f"{assertion}: the control's observation fails the ordinary "
+                              "expectation, so its red would not be the deliberate one")
+            self.ordinary = {"expected": expected, "observed": self.observed}
+            self.expected = wrong
+            self.observed = observe(wrong) if callable(observe) else self.observed
         if self.observed != self.expected:
             raise Mismatch(f"{assertion}: observed value differs from expectation")
         self.emit("PASS")
@@ -304,19 +229,31 @@ class Case:
             # A FAIL is scored only under a listed ID; a mismatch elsewhere is a harness bug.
             self.emit("ERROR", reason=f"mismatch outside a listed assertion: {reason}")
 
+    def teardown(self, exc):
+        """A server that outlived its stop is ERROR even after this case's first failure,
+        which is recorded first when the server's block was raising it."""
+        if exc.pending is not None:
+            self.failure(exc.pending)
+        self.step("teardown", "owned X server stopped within its deadline")
+        self.emit("ERROR", reason=f"TeardownError: {exc}")
+
+    def server(self, sandbox, label):
+        """A fresh private server and driver for one launch; the case's Xauthority gets its
+        cookie. Yields (server, driver)."""
+        return fresh_display(self.display, self.artifacts, f"Xvfb-{label}", sandbox.env,
+                             timeout=WATCHDOG * 2, geometry=GEOMETRY)
+
     def launch(self, stack, start, paths, driver):
         """Start one inspected editor, owned by `stack` for its lifetime."""
-        self.inspector = Snapshots(stack)
+        self.inspector = Inspector(stack, CAPACITY)
         self.driver = driver
         log_path = self.artifacts / f"editor-{len(self.children) + 1}.log"
         with log_path.open("wb") as log:
-            self.child = start([*self.inspector.args, *map(str, paths)], stdout=log, stderr=log,
-                               pass_fds=self.inspector.fds)
+            self.child = self.inspector.attach(start(
+                [*self.inspector.args, *map(str, paths)], stdout=log, stderr=log,
+                pass_fds=self.inspector.fds))
         self.children.append(self.child)
         self.logs.append(log_path)
-        self.inspector.writer.close()
-        self.inspector.pidfd = os.pidfd_open(self.child.pid)
-        stack.callback(os.close, self.inspector.pidfd)
         return self.child
 
     def bind(self, sandbox):
@@ -371,21 +308,16 @@ class Case:
         return self.child.wait()
 
     def allocation_count(self, part):
-        """The passive Law-2 report printed by the last editor's clean exit."""
+        """The passive Law-2 count of the last editor's clean exit (one validated report)."""
         self.step("law2-count", "an active guard's report with measured scopes", part=part)
-        report = GUARD.search(self.logs[-1].read_bytes())
-        if report is None:
-            raise Refused(f"{self.logs[-1].name} has no allocation count")
-        active, allocations, scopes = map(int, report.groups())
-        self.note(report.group().decode("ascii"))
-        # Fail closed on an inert guard or a window that measured nothing (v2-he7.11).
-        if active != 1 or scopes == 0:
-            raise Refused(f"allocation guard inert or no window measured: {report.group()!r}")
-        return {"allocations": allocations, "scopes": scopes}
+        count = law2_count(self.logs[-1].read_bytes())
+        self.note(f"law2 {count}")
+        return count.allocations
 
 
-def search_frame(case, expected):
-    """NEXT until a frame draws the search's end line, then compare that frame once."""
+def search_frame(case, expected, wrong):
+    """NEXT until a frame draws the search's end line, then compare that frame once; the
+    R3.search-results red expects `wrong` only after the ordinary `expected` held."""
     case.step("results-between-a-and-b", "the completed Find Results frame draws the fixture results",
               part="search-readiness")
     deadline = time.monotonic() + WATCHDOG
@@ -396,6 +328,12 @@ def search_frame(case, expected):
     d = frame.document
     case.expected = hard_wrapped(expected, d.width, d.height)
     case.observed = document_rows(frame)
+    if case.negative == "R3.search-results":
+        if case.observed != case.expected:
+            raise Refused("search-results: the control's observation fails the ordinary "
+                          "expectation, so its red would not be the deliberate one")
+        case.ordinary = {"expected": case.expected, "observed": case.observed}
+        case.expected = hard_wrapped(wrong, d.width, d.height)
     if case.observed != case.expected:
         raise Mismatch("completed Find Results differ from the fixture results")
     return frame
@@ -440,7 +378,7 @@ def unrelated_files(root, edited):
     return files
 
 
-def r3(case, sandbox, driver):
+def r3(case, sandbox):
     root = sandbox.fixtures
     search_tree(root)
     a, b = "a.txt", "nested/b.c"
@@ -450,6 +388,7 @@ def r3(case, sandbox, driver):
     expected_a = b"a" + SEARCH_FILES[a]
     strip = ["a.txt", RESULTS_TITLE, "b.c"]
     with ExitStack() as stack:
+        _, driver = stack.enter_context(case.server(sandbox, "R3"))
         case.launch(stack, sandbox.start, [root / a], driver)
         case.bind(sandbox)
         case.step("search-start", "Ctrl+Shift+F, cat, Tab, private fixture root, Return")
@@ -461,8 +400,7 @@ def r3(case, sandbox, driver):
             driver.key(byte)
         driver.key("Return")
         # The negative expects a completed search with one match fewer.
-        search_frame(case, results.replace("9 matches", "8 matches")
-                     if case.negative == "R3.search-results" else results)
+        search_frame(case, results, results.replace("9 matches", "8 matches"))
 
         case.step("open-b-match", "Go to Line 8, Return on the scatter result")
         driver.chord("Control_L", "g")
@@ -473,17 +411,9 @@ def r3(case, sandbox, driver):
         case.check("results-between-a-and-b", tab_strip(frame), (strip, 2),
                    (["a.txt", "b.c", RESULTS_TITLE], 1))
 
-        case.step("save-b-bytes", "b drawn and its first journal entry before Ctrl+S (A9)",
-                  part="edit-b")
-        journals = sorted(sandbox.data_dir.glob("session-*"))
-        if len(journals) != 1:
-            raise Refused(f"expected one session journal, found {[p.name for p in journals]}")
-        with directory_watch(sandbox.data_dir, IN_MOVED_TO) as journal:
-            driver.key("b")
-            typed(case, "type b", "b.c", "sbcatter")
-            # v1 commits the session's first edit by renaming its journal (large_undo.py).
-            wait_for_file_event(journal, journals[0], IN_MOVED_TO, case.child)
-        case.note(f"IN_MOVED_TO {journals[0].name}")
+        case.step("save-b-bytes", "b drawn before Ctrl+S (A9)", part="edit-b")
+        driver.key("b")
+        typed(case, "type b", "b.c", "sbcatter")
         saved_b = save(case, "save-b-bytes", root / b, SEARCH_FILES[b])
         case.check("save-b-bytes", saved_b, expected_b, expected_a)
         after_b = unrelated_files(root, {a, b})
@@ -516,7 +446,7 @@ def r3(case, sandbox, driver):
         raise Mismatch(f"editor exited {status} after Ctrl+Q")
     count = case.allocation_count("report")
     # v1 measured 0 for this window (docs/decisions/v2-he7.13.md), so the count rule asserts 0.
-    case.check("law2-count", [count["allocations"]], [0], [1])
+    case.check("law2-count", [count], [0], [1])
 
 
 def tab_view(frame, rows):
@@ -535,7 +465,7 @@ def crossing(frame, title):
     return title, [row.replace(UNRESOLVED, "?") for row in rows[:first + 1]]
 
 
-def r5(case, sandbox, driver):
+def r5(case, sandbox):
     path = sandbox.fixtures / "fixture.pdf"
     sibling = sandbox.fixtures / "sibling.txt"
     expected = binary_bytes()
@@ -546,6 +476,7 @@ def r5(case, sandbox, driver):
     for phase, start, paths in (("open", sandbox.start, [path, sibling]),
                                 ("reopen", sandbox.restart, [path])):
         with ExitStack() as stack:
+            _, driver = stack.enter_context(case.server(sandbox, f"R5-{phase}"))
             case.step(f"{phase}-alive", "file opened, mapped owned window, live editor")
             with directory_watch(path.parent, IN_ACCESS) as watch:
                 child = case.launch(stack, start, paths, driver)
@@ -590,29 +521,26 @@ def r5(case, sandbox, driver):
             status = case.quit()
             case.check(f"{phase}-exit", status, 0, 1)
             on_disk.append(path.read_bytes())
-            counts.append(case.allocation_count(f"{phase}-report")["allocations"])
+            counts.append(case.allocation_count(f"{phase}-report"))
     case.check("bytes-unchanged", on_disk, [expected, expected], [expected, b"!" + expected[1:]])
     # v1 measured 0 for both windows (docs/decisions/v2-he7.13.md); the count rule asserts 0.
     case.check("law2-count", counts, [0, 0], [0, 1])
 
 
-def run_case(case, scenario, target, display, auth):
+def run_case(case, scenario, target):
     try:
-        with Sandbox(case.artifacts, target, display=display) as sandbox:
+        with Sandbox(case.artifacts, target, display=case.display) as sandbox:
             try:
-                Path(sandbox.env["XAUTHORITY"]).write_bytes(auth.read_bytes())
-                with XDriver(BUILD / "xdriver", display, env=sandbox.env,
-                             timeout=WATCHDOG * 2) as driver:
-                    try:
-                        scenario(case, sandbox, driver)
-                        case.step("assertion-inventory", ASSERTIONS[case.id])
-                        case.observed = case.asserted
-                        if tuple(case.asserted) != ASSERTIONS[case.id]:
-                            raise Refused("assertion inventory incomplete")
-                        case.step("teardown", "driver shutdown and fixture retention")
-                    except (OSError, RuntimeError, ValueError, Mismatch,
-                            subprocess.SubprocessError) as exc:
-                        case.failure(exc)
+                scenario(case, sandbox)
+                case.step("assertion-inventory", ASSERTIONS[case.id])
+                case.observed = case.asserted
+                if tuple(case.asserted) != ASSERTIONS[case.id]:
+                    raise Refused("assertion inventory incomplete")
+                case.step("teardown", "driver shutdown and fixture retention")
+            except TeardownError as exc:
+                case.teardown(exc)
+            except (OSError, RuntimeError, ValueError, Mismatch, subprocess.SubprocessError) as exc:
+                case.failure(exc)
             finally:
                 shutil.copytree(sandbox.fixtures, case.artifacts / "fixtures", symlinks=True)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
@@ -625,6 +553,7 @@ def main():
                         help="absolute inspected v1 build/contract-oracle directory")
     parser.add_argument("--display", required=True)
     parser.add_argument("--negative", choices=NEGATIVES)
+    records.digests_argument(parser)
     args = parser.parse_args()
     if not CONTRACT_DISPLAY.fullmatch(args.display):
         parser.error("--display must be a contract display, :120 through :199")
@@ -648,21 +577,17 @@ def main():
         "oracle_build": str(args.build_dir),
     }
     print(f"R3/R5 run artifacts in {artifacts}", file=sys.stderr)
-    cases = [Case(case_id, artifacts, args.negative) for case_id in scenarios]
+    cases = [Case(case_id, artifacts, args.negative, args.display) for case_id in scenarios]
     try:
-        stamp = json.loads((args.build_dir / STAMP).read_text(encoding="utf-8"))
-        if stamp["pin"] != PIN or stamp["patch_sha256"] != sha256(PATCH):
-            raise Refused("oracle manifest differs from the pinned source or patch")
-        target = RunTarget("v1", args.build_dir / EDITOR, args.build_dir, stamp["executables"][EDITOR])
-        manifest.update(role=target.role, oracle=str(target.executable), sha256=target.sha256,
-                        commit=PIN, patch_sha256=stamp["patch_sha256"])
-        with private_display(args.display, artifacts) as auth:
-            # Evaluate both independent cases once even after an earlier failure.
-            for case in cases:
-                run_case(case, scenarios[case.id], target, args.display, auth)
-    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        target = RunTarget("v1", args.build_dir / EDITOR, args.build_dir,
+                           args.digests[str(args.build_dir / EDITOR)])
+        manifest.update(role=target.role, oracle=str(target.executable), digests=args.digests)
+        # Evaluate both independent cases once even after an earlier failure.
         for case in cases:
-            case.step("display", "oracle identity, private Xvfb startup and shutdown")
+            run_case(case, scenarios[case.id], target)
+    except KeyError as exc:
+        for case in cases:
+            case.step("binding", "the runner's digest for the inspected oracle")
             case.failure(exc)
     finally:
         (artifacts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n",

@@ -209,3 +209,8 @@ Every case with an input-to-submit window carries the passive allocation count. 
 (Law 2). On the v1 reference build it is **recorded, not asserted**, unless v1 shows 0 for that case, in which case
 it is asserted there too, so the adapter's window is proven correct on at least one case. (R1 recorded 4 on v1 at
 0.48; attribution: docs/decisions/v2-he7.23.md — all four are a real v1 typing-path allocation, libxcb read_packet under xcb_flush in cpu_paint_margins during backend submit; R1 stays recorded on v1.)
+
+*Amended 2026-11-23 (advisor ruling, v2-he7.33 §2):* the count has its own ID per case and its
+predicate per target lives in the manifest (`"count"`): R1, R6 and R4 are recorded on v1-pin and
+asserted 0 on v2. Every case and every scored launch now gets an X server of its own; on one, v1
+counts 4 for R6 (three runs) and for R4 (two runs), where a shared server had shown 0.

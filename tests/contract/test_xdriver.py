@@ -3,10 +3,7 @@
 import contextlib
 import os
 from pathlib import Path
-import secrets
 import selectors
-import socket
-import struct
 import subprocess
 import tempfile
 import sys
@@ -15,6 +12,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import records  # noqa: E402
 from sandbox import CONTRACT_DISPLAY  # noqa: E402
+import xserver  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / "build"
@@ -36,68 +34,21 @@ def readable(fd, timeout=WATCHDOG):
             raise TimeoutError("timed out waiting for Xvfb or fixture output")
 
 
-def available(number):
-    path = f"/tmp/.X11-unix/X{number}"
-    if os.path.lexists(path) or os.path.lexists(f"/tmp/.X{number}-lock"):
-        return False
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind("\0" + path)
-        except OSError:
-            return False
-    return True
-
-
-def stop(child):
-    if child.poll() is None:
-        child.terminate()
-        try:
-            child.wait(timeout=WATCHDOG)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait(timeout=WATCHDOG)
-
-
 def setUpModule():
     global DISPLAY, ENV
     # Without a request, probe the decade the driver bead reserves; the runner passes one.
     requested = os.environ.get("XDRIVER_TEST_DISPLAY")
-    if requested is not None and not CONTRACT_DISPLAY.fullmatch(requested):
-        raise AssertionError("XDRIVER_TEST_DISPLAY must be a contract display, :120 through :199")
-    candidates = [int(requested[1:])] if requested else range(120, 130)
-    number = next((candidate for candidate in candidates if available(candidate)), None)
-    if number is None:
-        raise AssertionError("no available private Xvfb display in :120 through :129")
-    DISPLAY = f":{number}"
+    candidates = [requested] if requested else [f":{n}" for n in range(120, 130)]
+    DISPLAY = next((c for c in candidates if CONTRACT_DISPLAY.fullmatch(c)
+                    and xserver.available(int(c[1:]))), None)
+    if DISPLAY is None:
+        raise AssertionError(f"no free contract display among {candidates}")
     BUILD.mkdir(exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix="xdriver-test-", dir=BUILD))
-    auth = scratch / "authority"
-    # Xauthority network-order FamilyLocal record with a fresh 128-bit MIT cookie.
-    fields = (os.fsencode(socket.gethostname()), str(number).encode(),
-              b"MIT-MAGIC-COOKIE-1", secrets.token_bytes(16))
-    record = struct.pack("!H", 256)
-    record += b"".join(struct.pack("!H", len(field)) + field for field in fields)
-    fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(record)
-    ENV = {name: os.environ[name] for name in ("PATH",) if name in os.environ}
-    ENV["XAUTHORITY"] = str(auth)
-    with contextlib.ExitStack() as stack:
-        read_fd, write_fd = os.pipe()
-        stack.callback(os.close, read_fd)
-        with os.fdopen(write_fd, "wb") as ready, (scratch / "Xvfb.log").open("wb") as log:
-            server = subprocess.Popen(
-                ["Xvfb", DISPLAY, "-displayfd", str(ready.fileno()), "-noreset",
-                 "-nolisten", "tcp", "-auth", str(auth)],
-                env=ENV, pass_fds=(ready.fileno(),), stderr=log, stdout=log,
-            )
-        unittest.addModuleCleanup(stop, server)
-        with os.fdopen(os.dup(read_fd), "rb") as ready:
-            readable(ready)
-            response = ready.readline()
-        if response != f"{number}\n".encode() or server.poll() is not None:
-            raise AssertionError(f"Xvfb did not claim {DISPLAY}: {response!r}; {scratch}/Xvfb.log")
-    print(f"Xvfb {DISPLAY}, owned PID {server.pid}", flush=True)
+    owner = contextlib.ExitStack()
+    unittest.addModuleCleanup(owner.close)
+    ENV = owner.enter_context(xserver.private_server(
+        DISPLAY, Path(tempfile.mkdtemp(prefix="xdriver-test-", dir=BUILD)))).env
+    print(f"Xvfb {DISPLAY}", flush=True)
 
 
 class DriverTests(unittest.TestCase):
@@ -113,7 +64,7 @@ class DriverTests(unittest.TestCase):
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, bufsize=0,
         )
         self.addCleanup(child.stdout.close)
-        self.addCleanup(stop, child)
+        self.addCleanup(xserver.stop, child, WATCHDOG)
         return child
 
     def line(self, child):

@@ -393,19 +393,39 @@ for line in client.stdout:
 """
 
 
-def run_stub(directory, source):
+def run_stub(directory, source, launched=None):
     """Run the case on a stub editor written from `source` into `directory`; (exit, transcript).
-    A child process, as the runner invokes it: the case's own RECORD lines and exit status
-    stay in its transcript instead of joining this self-test's records."""
+    The stub is an explicitly identified diagnostic fixture: this writer binds its digest
+    (--digests, --diagnostic-fixture). `launched` replaces the stub's bytes after that binding
+    and before the case starts. A child process, as the runner invokes it: the case's own
+    RECORD lines and exit status stay in its transcript instead of joining this self-test's."""
     stub = directory / "stub-editor"
     stub.write_text(source, encoding="ascii")
     stub.chmod(0o700)
+    binding = json.dumps({str(stub): fixture.file_digest(stub)})
+    if launched is not None:
+        stub.write_text(launched, encoding="ascii")
     transcript = directory / "stub-run.stdout"
     with transcript.open("wb") as out:
         status = subprocess.run([sys.executable, "-B", case.__file__, "--target", str(stub),
-                                 "--display", DISPLAY, "--runs", str(directory / "runs")],
+                                 "--display", DISPLAY, "--runs", str(directory / "runs"),
+                                 "--digests", binding, "--diagnostic-fixture"],
                                 stdin=subprocess.DEVNULL, stdout=out, check=False).returncode
     return status, transcript.read_text()
+
+
+def replaced_stub_is_refused_before_input(test):
+    """Finding 2: select A, replace it by B before the case launches: ERROR before any input."""
+    standin = STUB.format(client=CLIENT)
+    status, transcript = run_stub(private_dir("replaced"), standin,
+                                  launched=standin.replace("stub bytes", "other bytes"))
+    printed = [json.loads(line[len(records.PREFIX):]) for line in transcript.splitlines()
+               if line.startswith(records.PREFIX)]
+    test.assertEqual(status, records.EXIT["ERROR"], transcript[-2000:])
+    test.assertEqual([(r["assertion_id"], r["status"]) for r in printed], [("harness", "ERROR")])
+    test.assertIn("digest mismatch", printed[0]["predicate"])
+    test.assertNotIn("] launch ", transcript)
+    test.assertNotIn("] keys ", transcript)
 
 
 def dying_stub_is_not_signed(test, dies, predicate):
@@ -442,6 +462,8 @@ class StubControlTest(unittest.TestCase):
             dying_stub_is_not_signed(self, "Delete", "editor exited before the scored Ctrl+Z was injected")
         with self.subTest("an editor that dies in Save after a journaled Undo is not signed"):
             dying_stub_is_not_signed(self, "Save", "editor exited after its Undo was journaled")
+        with self.subTest("a stub replaced after its binding is refused before any input"):
+            replaced_stub_is_refused_before_input(self)
 
 
 if __name__ == "__main__":

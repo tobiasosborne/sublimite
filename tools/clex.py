@@ -28,17 +28,10 @@ def lex(text):
         nxt = text[i + 1] if i + 1 < n else ''
         if c == '/' and nxt == '/':
             flush(i)
-            j = i + 2
-            while j < n:
-                if text[j] == '\n':
-                    k = j - 1
-                    if k > i + 1 and text[k] == '\r':
-                        k -= 1
-                    if k > i + 1 and text[k] == '\\':   # spliced line continues the comment
-                        j += 1
-                        continue
-                    break
-                j += 1
+            # The caller lexes despliced, newline-normalized text: a line comment ends at the
+            # first newline (check_isolation.desplice, read_text's universal newlines).
+            j = text.find('\n', i + 2)
+            j = n if j < 0 else j
             toks.append(('comment', i, j))
             i = start = j
         elif c == '/' and nxt == '*':
