@@ -15,10 +15,14 @@
 >   - The paired pre-fix receipt: gate `v1-20261123T120606Z-231818` records outcome XFAIL
 >     (observed FAIL, same signature). Its child run `20261123T120621Z-232247` exited 3.
 > - **Signature.** Every condition below must hold. Anything else is ERROR. `classify` checks the
->   conditions, and `inject` collects the receipt for the first one.
->   - *Undo receipt.* xdriver acknowledged all three scored keys, including Ctrl+Z, and the
->     editor's pidfd was not readable just before each one. An editor that dies on Delete, or a
->     refused final chord, means the target was lost before injection.
+>   conditions.
+>   - *Exit in Undo* (stage `in-undo`, since W0.7-B4).
+>     - Ctrl+A and Delete were acknowledged, and the delete fence held.
+>     - Ctrl+Z was acknowledged (`inject`: xdriver's receipt, with the pidfd not readable just
+>       before).
+>     - The exit was then observed before v1's undo journal group, and no Ctrl+S was sent.
+>     - Otherwise the stage is `before-undo` (an exit in Delete, a refused chord) or `after-undo`
+>       (an exit after the undo was journaled, for example on Ctrl+S); both are ERROR.
 >   - *Exit status* 1.
 >   - *Terminal line.* The last stderr line is exactly
 >     `sublimite: error -105; journal: <this session's $XDG_DATA_HOME/sublimite>/session-<id>\n`.
@@ -27,8 +31,8 @@
 >     does not match either.
 >   - *Destination.* The destination's identity is unchanged.
 >
->   The scored record's `observed` gains `undo_injected` and `journal_dir`. Every other record
->   field is unchanged.
+>   The scored record's `observed` gains `stage` (W0.7-B2 had `undo_injected`) and
+>   `journal_dir`. Every other record field is unchanged.
 > - **Retention.** A session keeps a copy of its destination only when the session failed and the
 >   bytes differ from the fixture's. A green run on the pin keeps no `*.destination`. The case
 >   used to keep 65 MB on every green run (run `20261123T120621Z-232247`: `twin-scored` and
@@ -111,8 +115,13 @@ pidfd. The only timers are hang detectors, and their expiry is ERROR.
      - BackSpace, then Ctrl+S; the bytes must equal the fixture (`ctl.restore`);
      - Ctrl+A, Delete, Ctrl+S; the file must be empty (`ctl.delete`);
      - Ctrl+Q; the editor must exit 0 (`ctl.exit`).
-   - **Scored session.** Ctrl+A, Delete, Ctrl+Z, then the load fence, then Ctrl+S, then Ctrl+Q
-     (`roundtrip`).
+   - **Scored session** (`roundtrip`, final since W0.7-B4), in order:
+     - Ctrl+A, then Delete;
+     - the delete fence: an `IN_MOVED_TO session-*` whose file holds `DELETE(0, L)`;
+     - Ctrl+Z;
+     - the undo fence or the exit, whichever comes first. The undo fence is an `IN_MODIFY` of
+       `session-*` after which the file holds a committed group of INSERTs restoring [0, L).
+     - Only if the undo fence held, and the editor is alive: Ctrl+S, then Ctrl+Q.
 3. **Load fence.** v1 parks non-control keys while a file is opening, but Ctrl+S overtakes them
    (`editor.c:1064-1086`, `queue_pick`). Saving a `pending_open` buffer is a silent no-op
    (`session.c:591`).
@@ -166,6 +175,10 @@ IDs that `expectations.json` owns for `X3-SELFTEST`, so the checks added in W0.7
   - A 0 B save, or a same-size save with other bytes, gives FAIL. A round trip gives PASS, and a
     round trip with a bad quit gives ERROR.
   - A changed input gives ERROR. The same test also runs the fixture checks listed below.
+  - The undo fence's journal reading (`undo_journaled`, `JournalTail`):
+    - a committed contiguous group after `DELETE(0, L)` counts, and so does one appended in increments
+      through a torn record;
+    - an uncommitted group, a gap, a short group or a group with no delete before it does not.
   - `inject` stops its receipts at Delete when the editor dies on Delete, and at the final chord
     when xdriver refuses it. Both then give ERROR. The A8 sequence acknowledges all three keys
     and keeps the signature.
@@ -180,6 +193,9 @@ IDs that `expectations.json` owns for `X3-SELFTEST`, so the checks added in W0.7
     33,554,433 B.
   - That record must equal the `record.json` under its own artifacts path.
   - `twin-control.destination` must hold the stub bytes.
+  - Two more stub runs (`DYING_STUB`, W0.7-B3/B4) exit 1 with v1's terminal line, one in Delete and
+    one in Ctrl+S after a journaled undo. The case must give `X3.over.roundtrip` ERROR (stage
+    `before-undo`, resp. `after-undo`) with every other assertion PASS, and exit 4.
 - Fixture checks (subtests of `test_changed_input_is_error`).
   - A generator with one changed record of the same length is rejected, and nothing is
     published.
@@ -194,6 +210,66 @@ IDs that `expectations.json` owns for `X3-SELFTEST`, so the checks added in W0.7
   `build/large-undo/selftest/runs/20261123T092643Z-144100/record.json`.
 
 ## Runs
+
+**W0.7-B4 (2026-11-23), the undo fence.** BAT0 `Not charging` [AC].
+
+- **What v1 journals for the undo.** A probe on the pin ran on the twin (`build/large-undo/explore-b4/undo_probe.py`,
+  not a suite case): Ctrl+A, Delete, the delete fence, Ctrl+Z.
+  - v1 then appended to the same `session-*` file, without a rename: GROUP_BEGIN, 2,048 INSERTs of 16 KiB covering
+    [0, 33,554,432), then GROUP_COMMIT (type 10). The commit came 1.306 s (M) after Ctrl+Z.
+  - This is `replay_slice` → `stage_tree(0, L)`, grouped by `editor_journal_staged` because the insert spans
+    more than one slice.
+- **The fence.** After Ctrl+Z is acknowledged, the case waits for whichever comes first: the editor's exit, or a
+  journal event after which `undo_journaled` holds.
+  - `undo_journaled` holds once `JournalTail` has read, after `DELETE(0, L)`, a committed group of contiguous
+    INSERTs from 0 to L. `JournalTail` reads the file incrementally; a new inode is read from its start.
+  - The journal watch adds `IN_MODIFY`.
+  - Expiry (`UNDO_JOURNAL_S`) is ERROR.
+  - Ctrl+S is sent only after the group, and only to a live editor.
+- **Red** (the case with the Delete fence only). The stub `DYING_STUB` with `DIES = "Save"` journals its undo
+  as v1 does and exits 1 with v1's terminal line 1 s into Ctrl+S.
+  - It was signed: FAIL + signature (run `20261123T200156Z-505507`).
+- **Green.**
+  - That stub is now `X3.over.roundtrip` ERROR, stage `after-undo`, "editor exited after its Undo was
+    journaled".
+  - The `DIES = "Delete"` stub is still ERROR, stage `before-undo`.
+  - The self-test is 4 tests OK, 6.70 s cold and 7.09 s warm (M).
+  - `make check CONTRACT_CHECK_DISPLAYS=:192-:199` passes.
+- **Oracle**, three runs, each exit 3, invocation wall time 15.86-16.56 s (M), load 4.8-7.4. All eight controls
+  and `X3.twin.roundtrip` PASS.
+
+  | run | Delete → commit, over | Ctrl+Z → exit, over | Ctrl+S sent, over | twin Ctrl+Z → undo group |
+  |---|---|---|---|---|
+  | `20261123T200354Z-512694` | 1.004 s | 0.023 s, status 1 | no | 2.210 s |
+  | `20261123T200410Z-513344` | 1.004 s | 0.023 s, status 1 | no | 2.156 s |
+  | `20261123T200427Z-513937` | 0.997 s | 0.021 s, status 1 | no | 2.033 s |
+
+  In each run `X3.over.roundtrip` is FAIL with the signature, stage `in-undo`, with the terminal line and the
+  destination identity unchanged. A8 is amended to this sequence.
+
+**W0.7-B3 (2026-11-23), the delete fence** (history; B4 added the undo fence). BAT0 `Charging` [AC].
+
+- **The fence.** The scored session sends Ctrl+A and Delete, then waits for an `IN_MOVED_TO session-*` commit
+  whose file holds a v1 `DELETE(offset 0, length L)` record (`journal_deletes`). That record is a 32 B header of
+  magic `0x314C4E4A`, length 48 and type 3, then u64 offset 0 and u64 L. Only then does it send Ctrl+Z.
+  - The commit is also the session's load fence.
+  - Expiry (`DELETE_JOURNAL_S`) is ERROR.
+  - Ctrl+S goes only to a live editor (`Session.send`).
+- **Red** (case at 2abe1cf). The self-test stub `DIES_IN_DELETE` (now `DYING_STUB` with `DIES = "Delete"`) exits 1 with v1's terminal line 1 s into its
+  first Delete on the over file, before journaling it.
+  - The case acknowledged Ctrl+Z during that second and signed `X3.over.roundtrip`: FAIL +
+    `exit-1-error-105-destination-untouched`, `undo_injected` true, case exit 3 (run `20261123T195210Z-475482`).
+- **Green.**
+  - The same stub gives `X3.over.roundtrip` ERROR, "editor exited before the scored Ctrl+Z was injected", and
+    exit 4. The twin passes through the stub's fence in 0.017 s.
+  - The self-test is 4 tests OK. The stub is a subtest of `StubControlTest`.
+- **Oracle**, three runs, each exit 3 and identical in shape:
+  - all eight controls and `X3.twin.roundtrip` PASS;
+  - `X3.over.roundtrip` FAIL with the signature: delete commit after 0.999-1.008 s (M), then exit 1 7-20 ms
+    (M) after Ctrl+Z, destination identity unchanged.
+
+  Runs `20261123T195316Z-477034`, `20261123T195346Z-477737`, `20261123T195353Z-477986`. A8's key sequence is
+  amended to include the fence.
 
 **W0.7-B2 (2026-11-23).** BAT0 `Charging` [AC].
 
@@ -384,17 +460,29 @@ with fsync before writing 0 B.
 ## Deadlines
 
 These are a hang detector, not a gate. Expiry is ERROR (the run is invalid) and never PASS, FAIL
-or XFAIL. There is one named constant per class of wait in `large_undo.py`. Each is (E): at
-least 2× the slowest measurement (M) above, on the ThinkPad with 12 CPUs.
+or XFAIL. There is one named constant per class of wait in `large_undo.py`.
 
-| constant | value | measured (M) |
-|---|---|---|
-| `XVFB_READY_S` | 15 s | 0.18-0.26 s |
-| `WINDOW_MAP_MS` | 30 s | 0.12-0.29 s from launch to mapped window |
-| `JOURNAL_COMMIT_S` | 120 s | 0.97-4.18 s from keys to `session-*` commit, load 4-13 |
-| `SAVE_RENAME_S` | 400 s | 0.15-0.93 s for ordinary saves. After Ctrl+A + Delete: 0.78-49.4 s at load 1-13 [bat]/[AC], and 188.6 s under synthetic contention at load 34. |
-| `EDITOR_EXIT_S` | 60 s | 0.12-0.18 s after Ctrl+Q, or 0.273 s after Ctrl+Z on the pin |
-| `DRIVER_PIPE_S` | 60 s | Pipe watchdog. It must exceed `WINDOW_MAP_MS`, xdriver's `find` deadline (v2-he7.9). |
+Since W0.7-B4 each is the slowest measurement (M) of that wait × `WATCHDOG_FACTOR` = 10, rounded
+up to a whole second. The precedent is R4: 183 s (M) × 10. The measurements were taken on the
+ThinkPad with 12 CPUs, on 2026-11-23, from the X3 run records of this bead (all worktrees).
+
+| wait | constant | slowest measured (M) | × factor | bound |
+|---|---|---|---|---|
+| Xvfb readiness | `XVFB_READY_S` | 0.26 s, load 1-17 | 10 | 3 s |
+| launch → mapped window | `WINDOW_MAP_MS` | 0.481 s, run `074710Z-107549` [bat] load 17.18 | 10 | 5 s |
+| `x` → `session-*` commit (load fence) | `JOURNAL_COMMIT_S` | 4.178 s, run `075412Z-114350` [bat] load 13.28 | 10 | 42 s |
+| Ctrl+S → rename (every save) | `SAVE_RENAME_S` | 49.408 s after Ctrl+A + Delete, run `075412Z-114350` [bat] load 13.28; other saves ≤ 1.712 s | 10 | 495 s |
+| Delete → commit holding `DELETE(0, L)` | `DELETE_JOURNAL_S` | 1.028 s quiet. Named long bound: the commit waits behind the same caret follow as the save after Delete. It lands 0.013 s before that rename, so the 49.408 s save includes it. | (= save) | 495 s |
+| Ctrl+Z → undo journal group (twin) | `UNDO_JOURNAL_S` | 2.21 s, run `200354Z-512694`, AC not charging, load 4.77 | 10 | 23 s |
+| Ctrl+Z / Ctrl+Q → exit | `EDITOR_EXIT_S` | 0.273 s after Ctrl+Z on the pin; Ctrl+Q ≤ 0.125 s | 10 | 3 s |
+| xdriver reply | `DRIVER_PIPE_S` | (P) It must exceed the longest driver command, `find`, which is bounded by `WINDOW_MAP_MS`. | 2 × `WINDOW_MAP_MS` | 10 s |
+| whole X3 invocation (runner) | `expectations.json` `large-undo` | 75.79 s complete run `075412Z-114350` [bat] load 13.28, before the fences, plus the fences' slowest waits 1.028 + 2.21 + 1.004 s = 80.03 s. Runs with the fences: 15.86-16.56 s. | 10 | 801 s |
+| X3 self-test (runner) | `expectations.json` `x3-selftest` | 11.55 s (W0.7-B2, cold fixtures, load 5.71); now 6.70 s cold, 7.09 s warm | 10 | 116 s |
+
+Each inner bound covers one hung wait. Before W0.7-B4 the bounds were (E), at least 2× the slowest
+measurement: 15, 30, 120, 400, 400, 60 and 60 s. The runner's invocation bound is the measured run time
+× 10, not the sum of the inner bounds. So a run in which one save actually took its full inner
+bound would end at the runner's bound, which is also ERROR.
 
 ## Watchdogs in the other contract cases (3a; read-only review of v2 `d61aded`)
 

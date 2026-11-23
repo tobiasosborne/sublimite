@@ -13,6 +13,16 @@ Fences (v1 at 6fec2e8, the only target this case drives today):
     opening but lets Ctrl+S overtake them (editor.c queue_pick), and saving a still-opening
     buffer is a silent no-op (session.c request_buffer). Invariant: an idle v1 writes nothing
     there, so a commit after the keys implies an applied edit, hence an adopted buffer.
+  - delete: the scored session's load fence is the journal commit whose checkpoint holds
+    DELETE(offset 0, length L) for the buffer, which v1 writes for an emptied buffer
+    (checkpoint.c:124 editor_text_ops). Only then is Ctrl+Z sent: an acknowledged key proves
+    delivery, not that the editor finished the previous key, so an exit after this fence is
+    not an exit in Delete.
+  - undo: after Ctrl+Z, whichever comes first: the editor's exit, or the appended journal group
+    (GROUP_BEGIN, INSERTs covering [0, L), GROUP_COMMIT) that v1 writes for the undo
+    (input.c replay_slice stage_tree; editor_journal_staged groups an insert over one 16 KiB
+    slice). Ctrl+S is sent only after that commit and only to a live editor, so an exit
+    observed in this wait is an exit in Undo.
   - save: IN_MOVED_TO of the destination name (v1 renames a temporary over it, file.c:1006).
 
 Per variant (twin first, then over), each session in a fresh sandbox with a fresh copy:
@@ -20,20 +30,22 @@ Per variant (twin first, then over), each session in a fresh sandbox with a fres
   control  ctl.restore     BackSpace, Ctrl+S: bytes == fixture
   control  ctl.delete      Ctrl+A, Delete, Ctrl+S: bytes == b"" (sister of the scored run)
   control  ctl.exit        Ctrl+Q: exit status 0
-  scored   roundtrip       Ctrl+A, Delete, Ctrl+Z, load fence, Ctrl+S: bytes == fixture
+  scored   roundtrip       Ctrl+A, Delete, delete fence, Ctrl+Z, undo fence or exit,
+                           Ctrl+S only to a live editor: bytes == fixture
 A control or harness failure is final: it records ERROR and the run stops. A key counts as
 injected only on xdriver's acknowledgement while the editor's pidfd is not readable (inject).
 A failed session keeps its destination's bytes when they differ from the fixture's.
 
 Scored outcomes (classify), the same on every target: PASS (saved, bytes equal, Ctrl+Q exits
 0); FAIL (saved, bytes differ, including a 0 B save); FAIL with signature SIGNATURE_EXIT_105
-when, after the scored Ctrl+Z was injected, the editor exits with status 1, its last stderr
-line is v1's terminal diagnostic "sublimite: error -105; journal: <its session journal>", and
-the destination's bytes and inode metadata are unchanged (amendment A8); ERROR for every other
-editor exit (including one before the Ctrl+Z was injected), a changed input fixture or an
-expired hang detector. Whether that signature is the reviewed expected failure of a target is
-decided by the runner against tests/contract/expectations.json, never here. Records and exit
-statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
+when the editor exits in Undo (after the delete fence and the injected Ctrl+Z, before the
+undo's journal group and before any Ctrl+S) with status 1, its last stderr line is v1's
+terminal diagnostic "sublimite: error -105; journal: <its session journal>", and the
+destination's bytes and inode metadata are unchanged (amendment A8); ERROR for every other
+editor exit (including one before the Ctrl+Z or after the undo's journal group), a changed
+input fixture or an expired hang detector. Whether that signature is the reviewed expected
+failure of a target is decided by the runner against tests/contract/expectations.json, never
+here. Records and exit statuses (PASS 0, FAIL 3, ERROR 4) follow tests/contract/records.py.
 Derivations: docs/decisions/v2-he7.15.md.
 """
 
@@ -43,6 +55,7 @@ import ctypes
 import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -76,16 +89,27 @@ FIRST_REQUIRED_WAVE = 2  # The public GUI case; W1 owns the headless index-limit
 SCORED_KEYS = (("Control_L", "a"), "Delete", ("Control_L", "z"))
 
 # One deadline per class of wait. These are a hang detector, not a gate: expiry is ERROR
-# (run invalid), never PASS or FAIL. All are (E): at least 2x the slowest step
-# measured (M) on 2026-11-23, ThinkPad, BAT0 Discharging [bat], 12 CPUs. The measurements
-# and their loads are in docs/decisions/v2-he7.15.md "Deadlines".
-XVFB_READY_S = 15         # (M) 0.18-0.26 s, load 1-17
-WINDOW_MAP_MS = 30_000    # (M) 0.12-0.29 s launch -> mapped window, load 1-17
-JOURNAL_COMMIT_S = 120    # (M) 0.97-4.18 s keys -> session-* commit, load 11-13
-SAVE_RENAME_S = 400       # (M) 0.15-0.93 s; after Ctrl+A+Delete 0.78-49.4 s at load 1-13, 188.6 s at load 34
-EDITOR_EXIT_S = 60        # (M) 0.12-0.18 s after Ctrl+Q, or after Ctrl+Z on the pin
-DRIVER_PIPE_S = 60        # xdriver pipe watchdog; must exceed WINDOW_MAP_MS (v2-he7.9)
+# (run invalid), never PASS or FAIL. Each is the slowest measurement (M) of that wait times
+# WATCHDOG_FACTOR, rounded up to a whole second (precedent: R4, 183 s (M) x 10). Measured on
+# the ThinkPad, 12 CPUs, 2026-11-23, in the X3 run records named in docs/decisions/v2-he7.15.md
+# "Deadlines".
+WATCHDOG_FACTOR = 10
+XVFB_READY_S = math.ceil(0.26 * WATCHDOG_FACTOR)            # (M) Xvfb readiness, load 1-17
+WINDOW_MAP_MS = 1000 * math.ceil(0.481 * WATCHDOG_FACTOR)   # (M) launch -> window, [bat] load 17.18
+JOURNAL_COMMIT_S = math.ceil(4.178 * WATCHDOG_FACTOR)       # (M) "x" -> session-* commit, [bat] load 13.28
+SAVE_RENAME_S = math.ceil(49.408 * WATCHDOG_FACTOR)         # (M) Ctrl+S -> rename after Ctrl+A + Delete,
+                                                            #     [bat] load 13.28; other saves <= 1.712 s
+# The delete's commit is measured at 1.013 s quiet ([AC] load 2.34) but waits behind the same
+# UI-thread caret follow as the save after Ctrl+A + Delete, which the 49.408 s save includes: in
+# the quiet ctl.delete timeline the commit lands 0.013 s before the rename (v2-he7.15).
+DELETE_JOURNAL_S = SAVE_RENAME_S
+UNDO_JOURNAL_S = math.ceil(2.21 * WATCHDOG_FACTOR)          # (M) Ctrl+Z -> undo group commit, twin,
+                                                            #     AC "Not charging", load 4.77
+EDITOR_EXIT_S = math.ceil(0.273 * WATCHDOG_FACTOR)          # (M) Ctrl+Z -> exit on the pin;
+                                                            #     Ctrl+Q -> exit <= 0.125 s
+DRIVER_PIPE_S = 2 * WINDOW_MAP_MS // 1000  # (P) above xdriver's longest command, find (WINDOW_MAP_MS)
 
+IN_MODIFY = 0x00000002
 IN_CLOSE_WRITE = 0x00000008
 IN_MOVED_FROM = 0x00000040
 IN_MOVED_TO = 0x00000080
@@ -93,6 +117,15 @@ IN_CREATE = 0x00000100
 IN_DELETE = 0x00000200
 IN_Q_OVERFLOW = 0x00004000
 _EVENT = struct.Struct("iIII")
+# v1 journal record (6fec2e8 journal.c valid_record, journal.h:29): a 32 B header of magic,
+# length, type, crc, sequence and buffer id; a DELETE payload is offset and length (u64 LE).
+V1_JOURNAL_MAGIC = 0x314C4E4A
+V1_JOURNAL_INSERT, V1_JOURNAL_DELETE = 2, 3
+V1_JOURNAL_GROUP_BEGIN, V1_JOURNAL_GROUP_COMMIT = 9, 10
+# Where a scored exit happened, by what the case observed before it (classify).
+BEFORE_UNDO = "before-undo"  # before the delete fence held or Ctrl+Z was acknowledged
+IN_UNDO = "in-undo"          # after Ctrl+Z was acknowledged, before the undo's journal group
+AFTER_UNDO = "after-undo"    # after the undo's journal group (Ctrl+S may have been sent)
 _STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid", "st_size",
                 "st_mtime_ns", "st_ctime_ns")  # atime excluded: reading a file may advance it
 
@@ -146,7 +179,9 @@ class DirWatch:
         self._labels = {}
         mask = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
         for label, directory in directories.items():
-            wd = self._libc.inotify_add_watch(self.fd, os.fsencode(directory), mask)
+            # v1 appends journal records in place: only the journal needs IN_MODIFY.
+            extra = IN_MODIFY if label == "journal" else 0
+            wd = self._libc.inotify_add_watch(self.fd, os.fsencode(directory), mask | extra)
             if wd < 0:
                 err = ctypes.get_errno()
                 os.close(self.fd)
@@ -341,6 +376,74 @@ def journal_commit(label, mask, name):
     return label == "journal" and bool(mask & IN_MOVED_TO) and name.startswith("session-")
 
 
+def journal_deletes(path, size):
+    """Whether the v1 session journal at `path` holds a DELETE(0, size) record."""
+    try:
+        data = Path(path).read_bytes()
+    except FileNotFoundError:  # already replaced by a later commit, which a later event names
+        return False
+    header = struct.pack("<III", V1_JOURNAL_MAGIC, 48, V1_JOURNAL_DELETE)  # 32 B header + 16 B payload
+    pattern = re.escape(header) + b".{20}" + re.escape(struct.pack("<QQ", 0, size))
+    return re.search(pattern, data, re.DOTALL) is not None
+
+
+class JournalTail:
+    """The records of one v1 session journal file, read incrementally as v1 appends to it; a
+    new inode (a rename commit) is read from its start. Each record is (type, offset, length)
+    for INSERT and DELETE, (type, None, None) otherwise. An unparsable tail is left unread."""
+
+    def __init__(self):
+        self.inode, self.offset, self.records = None, 0, []
+
+    def read(self, path):
+        try:
+            stream = open(path, "rb")
+        except FileNotFoundError:
+            return self.records
+        with stream:
+            inode = os.fstat(stream.fileno()).st_ino
+            if inode != self.inode:
+                self.inode, self.offset, self.records = inode, 0, []
+            stream.seek(self.offset)
+            data = stream.read()
+        at = 0
+        while len(data) - at >= 32:
+            magic, length, kind = struct.unpack_from("<III", data, at)
+            if (magic != V1_JOURNAL_MAGIC or length < 32 or length > len(data) - at
+                    or (kind == V1_JOURNAL_INSERT and length < 40)
+                    or (kind == V1_JOURNAL_DELETE and length != 48)):
+                break
+            if kind == V1_JOURNAL_INSERT:
+                self.records.append((kind, struct.unpack_from("<Q", data, at + 32)[0], length - 40))
+            elif kind == V1_JOURNAL_DELETE:
+                self.records.append((kind, *struct.unpack_from("<QQ", data, at + 32)))
+            else:
+                self.records.append((kind, None, None))
+            at += length
+        self.offset += at
+        return self.records
+
+
+def undo_journaled(records, size):
+    """Whether, after DELETE(0, size), a committed group of INSERTs restores [0, size) in order."""
+    deleted, group = False, None
+    for kind, offset, length in records:
+        if kind == V1_JOURNAL_DELETE and (offset, length) == (0, size):
+            deleted, group = True, None
+        elif kind == V1_JOURNAL_GROUP_BEGIN:
+            group = []
+        elif kind == V1_JOURNAL_INSERT and group is not None:
+            group.append((offset, length))
+        elif kind == V1_JOURNAL_GROUP_COMMIT and group is not None:
+            end = 0
+            for offset, length in group:
+                end = end + length if offset == end else -1
+            if deleted and end == size:
+                return True
+            group = None
+    return False
+
+
 class Session:
     def __init__(self, run, box, child, driver, watch, path, label, before):
         self.run, self.box, self.child, self.driver = run, box, child, driver
@@ -369,23 +472,31 @@ class Session:
         self.run.step("exited", label=self.label, assertion=assertion, status=self.exit_status)
         return self.exit_status
 
-    def edits_applied(self, assertion, *actions):
+    def send(self, assertion, actions):
+        """Inject `actions`: True when every one was acknowledged, False when the editor exited
+        first. A live editor that refuses a key raises."""
+        sent, error = self.inject(actions)
+        if sent == len(actions):
+            return True
+        if self.wait_exit(assertion) is None:
+            raise error or HarnessError(assertion, "editor alive but not injectable", {"injected": sent},
+                                        {"injected": len(actions)})
+        return False
+
+    def edits_applied(self, assertion, actions, what="journal commit", matches=journal_commit,
+                      deadline_s=JOURNAL_COMMIT_S):
         """Send edit keys and wait for the journal commit they cause (load fence).
-        Returns ("event" or "exited", number of keys injected)."""
+        Returns "event" or "exited"."""
         self.watch.drain()
         started = time.monotonic()
-        sent, error = self.inject(actions)
-        if sent < len(actions):
-            if self.wait_exit(assertion) is None:
-                raise error or HarnessError(assertion, "editor alive but not injectable", {"injected": sent},
-                                            {"injected": len(actions)})
-            return "exited", sent
-        result = self.watch.wait("journal commit", journal_commit, JOURNAL_COMMIT_S, assertion)
+        if not self.send(assertion, actions):
+            return "exited"
+        result = self.watch.wait(what, matches, deadline_s, assertion)
         if result == "exited":
             self.reap(assertion)
         self.run.step("journaled" if result == "event" else "exit-before-commit", label=self.label,
-                      assertion=assertion, seconds=round(time.monotonic() - started, 3))
-        return result, sent
+                      assertion=assertion, fence=what, seconds=round(time.monotonic() - started, 3))
+        return result
 
     def wait_exit(self, assertion):
         """After the driver lost the window: exit status if the editor exits in time."""
@@ -398,11 +509,7 @@ class Session:
         """Ctrl+S, then the save fence. Returns ("saved", describe, seconds) or ("exited", ...)."""
         self.watch.drain()
         started = time.monotonic()
-        try:
-            self.driver.chord("Control_L", "s")
-        except XDriverError:
-            if self.wait_exit(assertion) is None:
-                raise
+        if not self.send(assertion, [("Control_L", "s")]):
             return "exited", None, None
         result = self.watch.wait(f"IN_MOVED_TO {self.path.name}",
                                  lambda label, mask, name: label == "work" and bool(mask & IN_MOVED_TO)
@@ -484,7 +591,8 @@ def classify(original, outcome, input_after):
     """Return (status, predicate, expected, signature) for a scored assertion, on any target.
 
     outcome is {"kind": "saved", "output": describe(), "quit_exit": int} or
-    {"kind": "exited", "undo_injected": bool, "exit": int, "stderr": str, "journal_dir": str,
+    {"kind": "exited", "stage": BEFORE_UNDO | IN_UNDO | AFTER_UNDO, "exit": int, "stderr": str,
+     "journal_dir": str,
      "before": identity(), "after": identity()}.
     signature is SIGNATURE_EXIT_105 for exactly the A8 failure mode, otherwise None.
     """
@@ -492,8 +600,12 @@ def classify(original, outcome, input_after):
     if {k: input_after.get(k) for k in want} != want:
         return "ERROR", "input fixture changed during the run", {"input": want}, None
     if outcome["kind"] == "exited":
-        if not outcome["undo_injected"]:
+        if outcome["stage"] == BEFORE_UNDO:
             return "ERROR", "editor exited before the scored Ctrl+Z was injected", want, None
+        if outcome["stage"] == AFTER_UNDO:
+            return "ERROR", "editor exited after its Undo was journaled", want, None
+        if outcome["stage"] != IN_UNDO:
+            raise ValueError(f"unknown scored exit stage {outcome['stage']!r}")
         if (outcome["exit"] == 1 and capacity_exit(outcome["stderr"], outcome["journal_dir"])
                 and outcome["after"] == outcome["before"]):
             return ("FAIL", "editor exited 1 with error -105 before saving, destination untouched",
@@ -510,7 +622,7 @@ def variant_run(run, x, variant):
     source = run.fixtures[variant]
     original = (source["bytes"], source["sha256"])
     with run.editor(x, f"{variant}-control", variant) as s:
-        if s.edits_applied(f"X3.{variant}.ctl.load_save", "x")[0] == "exited":
+        if s.edits_applied(f"X3.{variant}.ctl.load_save", ["x"]) == "exited":
             raise HarnessError(f"X3.{variant}.ctl.load_save", "editor exited during a control",
                                {"exit": s.exit_status, "stderr": s.stderr()[-400:]}, "running")
         control(run, s, f"X3.{variant}.ctl.load_save", s.save(f"X3.{variant}.ctl.load_save"),
@@ -527,12 +639,29 @@ def variant_run(run, x, variant):
                    {"exit": 0}, kind="control")
     assertion = f"X3.{variant}.roundtrip"
     with run.editor(x, f"{variant}-scored", variant) as s:
-        result, sent = s.edits_applied(assertion, *SCORED_KEYS)
-        kind, output, took = s.save(assertion) if result == "event" else ("exited", None, None)
+        size, data = source["bytes"], s.box.data_dir
+        deleted = s.edits_applied(assertion, SCORED_KEYS[:2], "journal commit holding DELETE(0, L)",
+                                  lambda label, mask, name: journal_commit(label, mask, name)
+                                  and journal_deletes(data / name, size), DELETE_JOURNAL_S)
+        stage = BEFORE_UNDO
+        if deleted == "event" and s.send(assertion, SCORED_KEYS[2:]):
+            # Ctrl+S waits for the undo's journal group, so an exit before it is an exit in Undo.
+            stage, tails = IN_UNDO, {}
+            undone = s.watch.wait("journal group restoring [0, L)", lambda label, mask, name:
+                                  label == "journal" and name.startswith("session-")
+                                  and undo_journaled(tails.setdefault(name, JournalTail()).read(data / name),
+                                                     size), UNDO_JOURNAL_S, assertion)
+            if undone == "exited":
+                s.reap(assertion)
+            else:
+                stage = AFTER_UNDO
+            s.run.step("undo-journaled" if undone == "event" else "exit-in-undo", label=s.label,
+                       assertion=assertion)
+        kind, output, took = s.save(assertion) if stage == AFTER_UNDO else ("exited", None, None)
         if kind == "saved":
             outcome = {"kind": "saved", "output": output, "quit_exit": s.quit(assertion)}
         else:
-            outcome = {"kind": "exited", "undo_injected": sent == len(SCORED_KEYS),
+            outcome = {"kind": "exited", "stage": stage,
                        "exit": s.exit_status, "stderr": s.stderr(), "journal_dir": str(s.box.data_dir),
                        "before": s.before, "after": identity(s.path)}
         input_after = describe(source["path"])

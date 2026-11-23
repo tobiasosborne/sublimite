@@ -64,8 +64,8 @@
     "{display}"
    ],
    "displays": 1,
-   "timeout_s": 900,
-   "timeout_derivation": "(E) the stub run stops at its first control: Xvfb 15 + map 30 + journal 120 + save 400 + exit 60 s (P, large_undo.py hang detectors) = 625 s, rounded up"
+   "timeout_s": 116,
+   "timeout_derivation": "(M) slowest X3 self-test invocation 11.55 s (2026-11-23 W0.7-B2, cold fixtures, BAT0 Charging, load 5.71) x 10 (R4 precedent) = 115.5 s, rounded up; the current self-test (three stub runs) measured 6.70 s cold and 7.09 s warm (M) [AC, BAT0 Not charging, load 5.5] (docs/decisions/v2-he7.15.md Deadlines)"
   },
   "adapter": {
    "argv": [
@@ -128,8 +128,8 @@
     "{display}"
    ],
    "displays": 1,
-   "timeout_s": 4500,
-   "timeout_derivation": "(P) sum of its serial hang detectors: 2 variants x (3 control saves + 1 scored save) x 400 s + 2 x 2 journal commits x 120 s + 4 maps x 30 s + 4 exits x 60 s + Xvfb 15 s = 4055 s; plus fixture writing (E)"
+   "timeout_s": 801,
+   "timeout_derivation": "(M) slowest complete X3 invocation 75.79 s (run 20261123T075412Z-114350, BAT0 Discharging, load 13.28, before the fences) plus the fences' slowest measured waits 1.028 + 2.21 + 1.004 s (twin delete, twin undo, over delete; W0.7-B4 runs) = 80.03 s, x 10 (R4 precedent) = 800.3 s, rounded up; invocations with the fences measured 15.86-16.56 s (M) [AC, BAT0 Not charging, load 4.8-7.4]. Each inner wait is its own measurement x 10 (large_undo.py, docs/decisions/v2-he7.15.md Deadlines)"
   },
   "capacity": {
    "argv": [

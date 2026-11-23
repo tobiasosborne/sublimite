@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import json
 import os
+import struct
 import subprocess
 from pathlib import Path
 import sys
@@ -48,8 +49,8 @@ STUB_BYTES = b"stub bytes\n"
 STUB_SAVED = {"bytes": len(STUB_BYTES), "sha256": hashlib.sha256(STUB_BYTES).hexdigest()}
 
 
-def exited(status=1, stderr=A8_STDERR, after=UNTOUCHED, undo_injected=True):
-    return {"kind": "exited", "undo_injected": undo_injected, "exit": status, "stderr": stderr,
+def exited(status=1, stderr=A8_STDERR, after=UNTOUCHED, stage=case.IN_UNDO):
+    return {"kind": "exited", "stage": stage, "exit": status, "stderr": stderr,
             "journal_dir": JOURNAL, "before": UNTOUCHED, "after": after}
 
 
@@ -92,7 +93,42 @@ def drive(driver, alive):
     sent, _error = case.inject(driver, case.SCORED_KEYS, alive)
     if driver.sent != list(case.SCORED_KEYS[:sent]):
         raise AssertionError(f"receipts {sent} but the driver saw {driver.sent}")
-    return sent, verdict(exited(undo_injected=sent == len(case.SCORED_KEYS)))
+    stage = case.IN_UNDO if sent == len(case.SCORED_KEYS) else case.BEFORE_UNDO
+    return sent, verdict(exited(stage=stage))
+
+
+def v1_record(kind, payload=b""):
+    return struct.pack("<IIIIQQ", case.V1_JOURNAL_MAGIC, 32 + len(payload), kind, 0, 1, 1) + payload
+
+
+def undo_group_checks(test):
+    """The undo fence's journal reading: v1's appended group of INSERTs restoring [0, L) after
+    DELETE(0, L), read in increments; anything short of that is not the undo."""
+    deleted = (case.V1_JOURNAL_DELETE, 0, 8)
+    begin, commit = (case.V1_JOURNAL_GROUP_BEGIN, None, None), (case.V1_JOURNAL_GROUP_COMMIT, None, None)
+    insert = lambda offset, length: (case.V1_JOURNAL_INSERT, offset, length)  # noqa: E731
+    for name, journal, expected in (
+            ("restored in two slices", [deleted, begin, insert(0, 4), insert(4, 4), commit], True),
+            ("group not committed", [deleted, begin, insert(0, 4), insert(4, 4)], False),
+            ("a gap", [deleted, begin, insert(0, 4), insert(5, 3), commit], False),
+            ("short", [deleted, begin, insert(0, 4), commit], False),
+            ("no delete before it", [begin, insert(0, 8), commit], False)):
+        with test.subTest(f"undo group: {name}"):
+            test.assertEqual(case.undo_journaled(journal, 8), expected)
+    path = private_dir("journal") / "session-x"
+    path.write_bytes(v1_record(case.V1_JOURNAL_DELETE, struct.pack("<QQ", 0, 8)) + v1_record(9)
+                     + v1_record(2, struct.pack("<Q", 0) + b"abcd")[:20])
+    tail = case.JournalTail()
+    with test.subTest("undo group: appended in increments"):
+        test.assertFalse(case.undo_journaled(tail.read(path), 8))
+        with open(path, "r+b") as stream:  # complete the torn INSERT, then append the rest
+            stream.seek(len(path.read_bytes()) - 20)
+            stream.write(v1_record(2, struct.pack("<Q", 0) + b"abcd")
+                         + v1_record(2, struct.pack("<Q", 4) + b"efgh"))
+        test.assertFalse(case.undo_journaled(tail.read(path), 8))
+        with open(path, "ab") as stream:
+            stream.write(v1_record(10))
+        test.assertTrue(case.undo_journaled(tail.read(path), 8))
 
 
 def fixture_dir(test):
@@ -178,7 +214,8 @@ class ClassifyTests(unittest.TestCase):
             "another profile's journal": (exited(stderr=A8_STDERR.replace(JOURNAL, "/q/sublimite")),
                                           "ERROR"),
             "no stderr": (exited(stderr=""), "ERROR"),
-            "undo not injected": (exited(undo_injected=False), "ERROR"),
+            "undo not injected": (exited(stage=case.BEFORE_UNDO), "ERROR"),
+            "exit after the undo was journaled": (exited(stage=case.AFTER_UNDO), "ERROR"),
             "destination rewritten": (exited(after={**UNTOUCHED, "st_ino": 8}), "ERROR"),
             "destination ctime": (exited(after={**UNTOUCHED, "st_ctime_ns": 2}), "ERROR"),
             "0 B save": (saved(EMPTY), "FAIL"),
@@ -193,6 +230,7 @@ class ClassifyTests(unittest.TestCase):
         with self.subTest("editor dies on Delete"):
             self.assertEqual(drive(dies_on_delete, lambda: dies_on_delete.sent[-1:] != ["Delete"]),
                              (2, "ERROR"))
+        undo_group_checks(self)
         with self.subTest("final chord refused"):
             self.assertEqual(drive(FakeDriver(refuse=case.SCORED_KEYS[-1]), lambda: True), (2, "ERROR"))
 
@@ -264,6 +302,129 @@ exec {client} "$DISPLAY" window
 """
 
 
+DYING_STUB = r"""#!@PYTHON@ -I
+# Self-test stub editor: a correct editor of one file, except on a file larger than the twin.
+# There it prints v1's terminal diagnostic and exits 1 while still processing one key: Delete,
+# when DIES is "Delete" and Delete is the session's first edit, before journaling it; or
+# Ctrl+S, when DIES is "Save" and the session undid an edit, after journaling the undo.
+# Either way it is not an editor that dies in Undo. It maps a window through
+# xdriver-test-client, points _NET_WM_PID at itself and journals as v1 does: an edit by a
+# rename of session-stub, a delete as DELETE(0, size), an undo of it appended as a group of
+# INSERTs restoring [0, size).
+import os, struct, subprocess, sys, time
+CLIENT, XPROP, XMODMAP, TWIN, DIES = "@CLIENT@", "/usr/bin/xprop", "/usr/bin/xmodmap", @TWIN@, "@DIES@"
+PROCESSING_S = 1.0  # (E) a key's work: the case sends its next key within ms of an acknowledgement
+target, display = sys.argv[1], os.environ["DISPLAY"]
+journal = os.path.join(os.environ["XDG_DATA_HOME"], "sublimite")
+os.makedirs(journal, exist_ok=True)
+names = {}
+for row in subprocess.run([XMODMAP, "-display", display, "-pke"], capture_output=True, text=True,
+                          check=True).stdout.splitlines():
+    code, _, syms = row.partition("=")
+    if syms.split():
+        names[int(code.split()[1])] = syms.split()[0]
+client = subprocess.Popen([CLIENT, display, "window"], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True)
+window = client.stdout.readline().split()[1]
+subprocess.run([XPROP, "-display", display, "-id", window, "-f", "_NET_WM_PID", "32c",
+                "-set", "_NET_WM_PID", str(os.getpid())], check=True)
+with open(target, "rb") as stream:
+    text = stream.read()
+cursor, selected, edited, undone, history = 0, False, False, False, []
+
+
+def commit(records=b""):
+    partial = os.path.join(journal, ".session-stub")
+    with open(partial, "wb") as stream:
+        stream.write(records)
+    os.replace(partial, os.path.join(journal, "session-stub"))
+
+
+def record(kind, payload):
+    return struct.pack("<IIIIQQ", 0x314C4E4A, 32 + len(payload), kind, 0, 1, 1) + payload
+
+
+def die(key):
+    time.sleep(PROCESSING_S)
+    sys.stderr.write(f"sublimite: error -105; journal: {journal}/session-stub\n")
+    sys.stderr.flush()
+    leave(1)
+
+
+def leave(status):
+    client.terminate()
+    client.wait()
+    sys.exit(status)
+
+
+for line in client.stdout:
+    kind, code, state = (line.split() + ["", "", ""])[:3]
+    key, ctrl = names.get(int(code)) if kind == "down" else None, int(state or 0) & 4
+    if key is None or key.startswith("Control"):
+        continue
+    if ctrl and key == "q":
+        leave(0)
+    elif ctrl and key == "a":
+        selected = True
+    elif ctrl and key == "s":
+        if DIES == "Save" and undone and len(text) > TWIN:
+            die(key)
+        with open(target + ".stub", "wb") as stream:
+            stream.write(text)
+        os.replace(target + ".stub", target)
+    elif ctrl and key == "z" and history:
+        text, cursor, undone = history.pop(), 0, True
+        with open(os.path.join(journal, "session-stub"), "ab") as stream:  # GROUP_BEGIN, INSERT, COMMIT
+            stream.write(record(9, b"") + record(2, struct.pack("<Q", 0) + text) + record(10, b""))
+    elif key == "Delete" and selected:
+        if DIES == "Delete" and not edited and len(text) > TWIN:
+            die(key)
+        history.append(text)
+        commit(record(3, struct.pack("<QQ", 0, len(text))))
+        text, cursor, selected, edited = b"", 0, False, True
+    elif key in ("x", "BackSpace") and not ctrl:
+        history.append(text)
+        if key == "x":
+            text, cursor = text[:cursor] + b"x" + text[cursor:], cursor + 1
+        elif cursor:
+            text, cursor = text[:cursor - 1] + text[cursor:], cursor - 1
+        edited = True
+        commit()
+"""
+
+
+def run_stub(directory, source):
+    """Run the case on a stub editor written from `source` into `directory`; (exit, transcript).
+    A child process, as the runner invokes it: the case's own RECORD lines and exit status
+    stay in its transcript instead of joining this self-test's records."""
+    stub = directory / "stub-editor"
+    stub.write_text(source, encoding="ascii")
+    stub.chmod(0o700)
+    transcript = directory / "stub-run.stdout"
+    with transcript.open("wb") as out:
+        status = subprocess.run([sys.executable, "-B", case.__file__, "--target", str(stub),
+                                 "--display", DISPLAY, "--runs", str(directory / "runs")],
+                                stdin=subprocess.DEVNULL, stdout=out, check=False).returncode
+    return status, transcript.read_text()
+
+
+def dying_stub_is_not_signed(test, dies, predicate):
+    """An editor that exits 1 with v1's diagnostic while processing `dies` (Delete, or Ctrl+S
+    after a journaled undo), after the case's next key could already be acknowledged, must not
+    carry the A8 signature: that names an exit in Undo."""
+    source = (DYING_STUB.replace("@PYTHON@", sys.executable).replace("@CLIENT@", str(CLIENT))
+              .replace("@TWIN@", str(fixture.TWIN_BYTES)).replace("@DIES@", dies))
+    status, transcript = run_stub(private_dir(f"dies-in-{dies.lower()}"), source)
+    printed = {r["assertion_id"]: (r["status"], r.get("signature"), r["predicate"]) for r in
+               (json.loads(line[len(records.PREFIX):]) for line in transcript.splitlines()
+                if line.startswith(records.PREFIX))}
+    passed = [f"{v}.{a}" for v in ("twin", "over")
+              for a in ("ctl.load_save", "ctl.restore", "ctl.delete", "ctl.exit")] + ["twin.roundtrip"]
+    test.assertEqual(printed, {**{a: ("PASS", None, printed.get(a, (0, 0, None))[2]) for a in passed},
+                               "over.roundtrip": ("ERROR", None, predicate)}, transcript[-3000:])
+    test.assertEqual(status, records.EXIT["ERROR"])
+
+
 class StubControlTest(unittest.TestCase):
     def test_failing_control_reports_error(self):
         with self.subTest("a foreign receipt cannot vouch"):
@@ -273,20 +434,14 @@ class StubControlTest(unittest.TestCase):
         for tool in (case.DRIVER, CLIENT):
             self.assertTrue(os.access(tool, os.X_OK), f"build {tool} first (make xdriver)")
         directory = private_dir("stub")
-        stub = directory / "stub-editor"
-        stub.write_text(STUB.format(client=CLIENT), encoding="ascii")
-        stub.chmod(0o700)
-        runs = directory / "runs"
-        # A child process, as the runner invokes it: the case's own RECORD lines and exit status
-        # stay in its transcript instead of joining this self-test's records.
-        transcript = directory / "stub-run.stdout"
-        with transcript.open("wb") as out:
-            status = subprocess.run([sys.executable, "-B", case.__file__, "--target", str(stub),
-                                     "--display", DISPLAY, "--runs", str(runs)],
-                                    stdin=subprocess.DEVNULL, stdout=out, check=False).returncode
-        artifacts = check_stub_run(self, status, transcript.read_text(), runs)
+        status, transcript = run_stub(directory, STUB.format(client=CLIENT))
+        artifacts = check_stub_run(self, status, transcript, directory / "runs")
         # The failing destination stays for diagnosis (finding 27).
         self.assertEqual((artifacts / "twin-control.destination").read_bytes(), STUB_BYTES)
+        with self.subTest("an editor that dies in Delete is not signed"):
+            dying_stub_is_not_signed(self, "Delete", "editor exited before the scored Ctrl+Z was injected")
+        with self.subTest("an editor that dies in Save after a journaled Undo is not signed"):
+            dying_stub_is_not_signed(self, "Save", "editor exited after its Undo was journaled")
 
 
 if __name__ == "__main__":

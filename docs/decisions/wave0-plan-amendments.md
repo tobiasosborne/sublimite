@@ -73,6 +73,27 @@ The X3 XFAIL now names exactly this failure: exit status 1, stderr contains "err
 harness ERROR) is not the expected failure. v2 expectation unchanged: undo succeeds, bytes round-trip (PASS).
 X3 stays the sole XFAIL.
 
+*Key sequence, amended 2026-11-23 (W0.7-B3/B4, bd-v2-he7.28).* The expected failure is an exit in Undo:
+1. Select All, then Delete.
+2. **Delete fence.** The session journal commit whose checkpoint holds `DELETE(0, 33,619,968)` for the buffer
+   (v1 `checkpoint.c:124`).
+3. Ctrl+Z.
+4. **Undo fence, or exit.** The editor exits before v1's appended undo group (GROUP_BEGIN, INSERTs restoring
+   [0, L), GROUP_COMMIT; `input.c` `replay_slice` `stage_tree`) appears, and before any Ctrl+S is sent. Exit status
+   is 1, and the last stderr line is `sublimite: error -105; journal: <its session journal>`.
+
+Ctrl+S goes only to a live editor after the undo group.
+- *Why the two fences.* An acknowledged key proves delivery, not that the editor finished the key before it. Two
+  stubs that were signed before their fence are now ERROR:
+  - one dies processing Delete (signed at 2abe1cf);
+  - one journals the undo and dies on Ctrl+S (signed with the Delete fence alone).
+- *Re-measured on the pin.* Runs `20261123T200354Z-512694`, `20261123T200410Z-513344` and
+  `20261123T200427Z-513937` (BAT0 Not charging [AC], load 4.8-7.4):
+  - the over's delete commit came 0.997-1.004 s (M) after Delete;
+  - the exit, status 1 with that line, came 21-23 ms (M) after Ctrl+Z, during the undo wait;
+  - no Ctrl+S was sent, and the destination identity was unchanged;
+  - the twin's undo group committed 2.03-2.21 s (M) after Ctrl+Z, and the twin round-tripped (PASS).
+
 ## A9. Wave 2 acceptance line for the input path: events apply in the order sent, across an in-progress open
 
 Observed in W0.6h's red run on the pinned build: while a file is still opening, Ctrl+S can overtake keys v1 holds
