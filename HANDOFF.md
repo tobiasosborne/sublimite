@@ -21,6 +21,10 @@ Open, not started: v2-he7.12 W0.6e navigation R1 + R6 (needs the adapter) · W0.
 v2-he7.16 W0.6i runner + gate (wire all contract self-tests into make check; registry slash-row fixture) ·
 v2-he7.17 W0.6j R4 over-capacity restore (last, with its stop condition).
 
+### Wave 1 started (amendment A10)
+Epic v2-0fv; L0 beads v2-0fv.1 os (dispatched, Sol), .2 fault ids (signed spec), .3 base (Law-2 guard), .4 trace,
+.5 work, .6 ipc. L2/L5 wait for the Wave 0 gate.
+
 ### Next session, in order
 1. Land whatever the in-flight lanes left (each worker's worktree is committed on its branch; see the list above or
    the final session-end note below if one was written).
