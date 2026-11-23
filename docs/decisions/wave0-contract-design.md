@@ -208,4 +208,4 @@ Order: sandbox, then driver and inspect client in parallel, then adapter, then t
 Every case with an input-to-submit window carries the passive allocation count. On v2 it is **asserted to be 0**
 (Law 2). On the v1 reference build it is **recorded, not asserted**, unless v1 shows 0 for that case, in which case
 it is asserted there too, so the adapter's window is proven correct on at least one case. (R1 recorded 4 on v1 at
-0.48; attribution in bead W0.9.)
+0.48; attribution: docs/decisions/v2-he7.23.md — all four are a real v1 typing-path allocation, libxcb read_packet under xcb_flush in cpu_paint_margins during backend submit; R1 stays recorded on v1.)
