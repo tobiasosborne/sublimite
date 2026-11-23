@@ -181,3 +181,10 @@ under Astra review until frozen). Consequences:
   the 513-chunk delete and its undo, with line queries checked against the model before, between and after".
 - `lineidx` (v2-0fv.18) is rescoped to the off-path chunk counter and the estimate used while a prefix is unknown; v2-0fv.9
   follows it.
+- After Astra's review (docs/reviews/wave1-piece-lines-astra.md; advisor rulings the same day): counts travel with
+  spans in an optional 8 B (head, tail) record kept by undo, never inside the 16 B piece_span; piece_replace_spans reads
+  no byte; edit-path cuts scan only the shorter half of a counted descriptor. A13's bound is tightened: one replace reads
+  at most 2 × 32,768 = 65,536 B of mapped text (P), and a one-span delete plus its undo together at most 65,536 B (the
+  131,072 B figure stays true). The text length is held at or below a named maximum 2^60 by an ASSERT at every edit
+  (the 2^47-byte address-space argument holds only on 4-level paging). Undo literal threshold stays 16 × spans > length;
+  the in-memory inverse entry is 24 B.
