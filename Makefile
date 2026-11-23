@@ -175,6 +175,11 @@ check-contract-files: $(B)/xdriver
 	@PYTHONPATH=tests/contract python3 -B -m cases.files \
 	    --oracle "$(ORACLE)" --display "$(CONTRACT_DISPLAY)"
 
+.PHONY: check-contract-navigation
+check-contract-navigation: $(B)/xdriver
+	@test -n "$(ORACLE_TREE)" && test -n "$(CONTRACT_DISPLAY)" || { echo "Set ORACLE_TREE and CONTRACT_DISPLAY (:170 through :179)" >&2; exit 2; }
+	python3 -B tests/contract/cases/navigation.py --build-dir "$(abspath $(ORACLE_TREE))/build/contract-oracle" --display "$(CONTRACT_DISPLAY)"
+
 check-lints: check-layout check-includes
 	python3 tools/check_isolation.py
 	python3 -B tests/isolation/run.py --build-dir "$(B)"
