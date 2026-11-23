@@ -30,21 +30,19 @@ Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream +
 (1.10, 1.12, 1.15), ASSERT migration (1.14), no test env vars + dead exports (1.20). Landed L1: scan (1.6), utf8 (1.7),
 indent (1.9, 1.13), piece 7a = frozen piece.h incl. Lines + flat model + model-run suite (1.16–1.18, erratum d028acf,
 piece_span_nl_join with undo), find (1.19), undo (1.21). lineidx removed (A19). Early leaves (A21): dnd (4.1).
-In flight (state at 23:45 CET 2026-11-23):
-- 7b real piece tree (v2-0fv.17) on Opus xhigh, continuing the Sol wip (build/review/7b-sol-wip.diff); landing gate =
-  piece/find/undo suites green on the real tree; exact memory gate 25,950 slots (A20); landing read split (Astra on the
-  production source only, a fresh Claude/Muse reviewer runs the suites and fault traces).
-- L2-0a os watch object + metadata/xattr copy (Opus): green, one send-back round for a fuzz harness (Law 1).
-- LF-2 TOML parser (Muse), no pool (A21).
-- Q2 save protocol: advisor rules 1–7 (no retention; synced PREPARED with the temp's identity and S; by-value restores
-  from snapshot capture; peer and kept-state self-contained checkpoints before rename; one buffer per file identity);
-  Astra's pass: T1–T4 hold, T5 (foreign rename after our rename, then crash before the conflict checkpoint) breaks;
-  advisor ruling on T5 pending (option: keep the new file reachable by a private hard link until FINISHED, or accept
-  as product contract). Then Q2/Q4/Q11 rewritten, L2-2/L2-3 briefs.
-L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md (beads L2-0..L2-6, L5-1..L5-3), derivations wave1-L2-derivations.md,
-wave1-L2-q2-crash-consistency.md, wave1-L2-q2-protocol.md; amendments A19–A22. Provisional brief for v2-0fv.15 (edit):
-build/briefs/v2-0fv.15-edit.md (untracked; rewrite after undo landed: done — undo_begin/replace/commit/abort, join flag,
-burst policy in edit, one maintenance function incl. undo_maintain). Filed: v2-0fv.21 os export deletion + nm gate.
+In flight (state at 00:45 CET 2026-11-24):
+- 7b real piece tree (v2-0fv.17): merged on branch review/7b (6269bed), all lanes green; landing read split: Astra
+  (source) HOLD with A–G, Muse (suites) LAND with 3 should-fix; ONE fix round on the Opus thread (A24 rulings + the
+  advisor's items 1–4: admission-order invariants, base reset function, delete the unused model wrapper, scan's
+  nth-newline in piece_lines_start); then Astra re-reads its own findings (source only), then land. Empty-tab footprint
+  is v2-0fv.22.
+- L2-2a journal wire + codec (Muse): wire approved with amendments A–F; codec, tests, fuzz in progress.
+- Briefs ready, not dispatched (docs/briefs/): L2-2b journal runtime (Opus when Claude is > 3 behind), L2-3 save
+  transaction (advisor reads it after L2-2b lands), L2-1 file (Opus after 7b), v2-0fv.15 edit (provisional).
+- Filed: v2-0fv.21 os export deletion + nm gate (incl. os_file_clone, A23), v2-0fv.22 empty-tab footprint.
+L2/L5 decisions: A19–A24; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
+L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md, wave1-L2-derivations.md, wave1-L2-q2-crash-consistency.md,
+wave1-L2-q2-protocol.md. Briefs live in docs/briefs/ named by bead and are committed with their dispatch.
 
 ### Next session, in order
 1. Land whatever lanes left (each worktree is committed on its branch as "wip ..." or reported with a path).
