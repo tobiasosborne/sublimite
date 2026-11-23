@@ -186,3 +186,34 @@ Challenges (refute with a counter-example by symbol, or cut):
 **Response to the advisor.** The refill contract and FSM answer challenge 1. The occupied-slots formula removes the revision multiplier and service cap for challenge 2. The v2 ownership table identifies the retained text and the fd identity for challenge 3. The process-reserve comparison gives both bare and published empty-tab costs for challenge 4. The public prepend/trim fixture supplies the root-split lower bound and address-space witness for challenge 5. The pinned class arithmetic remains comparison evidence. Challenge 6 replaces vector admission with a single slot count, retains the private boundary and removes the per-node-type allocation failure permutations.
 
 VERDICT: Adopt a single 400 B process-pool slot for 24-entry leaves, 16-child branches and snapshot headers. Admit on one scalar peak, fund the ADD boundary separately, and refill before reporting allocator exhaustion. Verify the changed geometry and memory fixtures before sign-off.
+
+## Advisor review, round 2 (2026-11-23, of 2ac1c97)
+
+SIGNED: one 400 B slot for leaf, branch and header; leaf capacity 24 and branch fanout 16 with the stated layouts and
+the version_headers counter-example; scalar admission and the scalar reserve table for single operations; W(h); one
+UI-owned process reserve and zero per-tab working reserve; removal of the per-revision credit and of any piece-wide
+service cap; the v2 holder table and the list of v1 holders v2 does not have; the refill invariant (after submit,
+before the next input; "memory is full" only on a base refusal of storage the command needs); the private ADD
+boundary prepay; the corrections; the mechanism table as a form.
+
+NOT SIGNED (counter-example by symbol, or cut):
+7. Height gate at H = 31 instead of repack: prove or refute the lemma that a net extra child at a parent requires
+   eight net-gaining splits among its children under all public operations (delete thinning, maybe_merge, bulk
+   reference insertion, builders). If it holds: ≥ 15 × 8^30 × 12 ≈ 2.2 × 10^29 descriptor insertions (P) to pass
+   height 31; gate = one comparison, ASSERT in debug, atomic PIECE_ERR_RANGE in release, no repack. Rule on whether
+   "count is (P), fallback is a defined refusal" is sound (at H = 16 the count is ≈ 6.3 × 10^15, reachable).
+8. Synchronous refill: admission as a function, top-up to W after submit on the UI thread outside the guard, base
+   extents taken synchronously at admission or PIECE_ERR_NOMEM for this command. Give the case where this breaks
+   Law 2, loses input, or costs latency an async refill avoids (page-touch cost of W(h) ≤ 104 slots = 41,600 B and
+   of an exact bulk claim), or cut PIECE_POOL_REFILL_PENDING / EXHAUSTED and the pending path.
+9. Memory retained after closing a tab in a slot-granular process pool: bound as a function of extent size and
+   surviving tabs' slot counts, and the extent size chosen from it; or extent-granular ownership (cores own whole
+   extents; reserve hands over whole free extents; close returns extents in bulk). Which is simpler, cost per empty tab.
+10. Bulk operations. (a) Over-reservation of the n-segment bound n × (2·min(H, h+n−1)+3) for n = 513, 16,384, 163,840
+    (advisor: last ≈ 163,840 × 35 × 400 B ≈ 2.3 GB touched for a ≈ 3 MB tree) and the tight amortised claim for the
+    batch algorithm. (b) Split and join as bulk primitives (range delete returns the removed subtree by reference;
+    undo/redo join in O(h); paste builds a packed subtree and joins) versus v1's batch + whole-range ADD append
+    above PIECE_REF_SPANS = 8: what each removes and costs (split/join code, nodes pinned by undo records and O,
+    journal encoding of a removed run, "ordinary history retains zero roots", the single-key fast path).
+    Recommend one, argued from invariants. L1 piece/undo beads wait for this; PLAN_V2's Wave 1 exit line on
+    ">32 MiB delete+undo with lineidx regrowth" may be superseded and amended.
