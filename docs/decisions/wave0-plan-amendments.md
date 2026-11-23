@@ -139,3 +139,13 @@ Expensive checks use a second macro compiled only in the sanitizer lanes, each u
 removed or becomes this one; only os imports abort (the per-module allowlist expresses it). Consequence for the fault
 spec: generation overflow is one comparison returning OS_E_NOSPC in every build (no ASSERT), testable at full width
 through a test-build-only setter for the next generation (one registration at UINT64_MAX − 1).
+
+## A16. Wave 2 acceptance line for font and layout: text presentation by default for Emoji_Presentation=No
+
+From L1 utf8 (v2-0fv.11): v2 now classifies © U+00A9 and ® U+00AE as Extended_Pictographic. That is a segmentation
+property, not a presentation property; both have Emoji_Presentation = No, so their default presentation is text.
+Acceptance for the Wave 2 font and layout beads: a bare © or ® (no U+FE0F) is drawn from the text font at width 1;
+it takes the emoji font and width 2 only when followed by U+FE0F. The same rule holds for every Extended_Pictographic
+code point whose Emoji_Presentation is No (❤ and ‼ among them), and the test enumerates that set from the tables,
+not from a hand list. If v1 at the pin sends bare ❤ or ‼ to the emoji font, that is a v1 rendering difference to
+record, not a behaviour to carry.
