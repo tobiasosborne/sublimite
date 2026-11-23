@@ -98,6 +98,11 @@ $(B):
 check-xdriver: $(B)/xdriver $(B)/xdriver-test-client
 	python3 -B tests/contract/test_xdriver.py
 
+.PHONY: check-contract-recovery
+check-contract-recovery: $(B)/xdriver
+	python3 -B tests/contract/cases/recovery.py --oracle "$$ORACLE" \
+		--display "$$RECOVERY_DISPLAY" --case "$${RECOVERY_CASE:-pre-ack}"
+
 # ---- objects (one tree per configuration) ----
 define CFG_COMPILE
 $(B)/$(1)/%.o: %.c
