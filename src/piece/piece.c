@@ -106,10 +106,11 @@ bool piece_lines_count(const piece_backing *b, uint64_t first, uint32_t *counts,
     ASSERT(STUB_NO_OBJECT);
     return false;
 }
-void piece_lines_adopt(piece_tree *t, uint64_t first, const uint32_t *counts, size_t n)
+bool piece_lines_adopt(piece_tree *t, os_fault_id source, uint64_t first, const uint32_t *counts, size_t n)
 {
-    (void)t, (void)first, (void)counts, (void)n;
+    (void)t, (void)source, (void)first, (void)counts, (void)n;
     ASSERT(STUB_NO_OBJECT);
+    return false;
 }
 piece_err piece_lines_resolve(piece_tree *t, size_t budget, bool *more)
 {

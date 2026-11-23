@@ -63,6 +63,24 @@ int os_native_error(void);
 #define ASSERT(x) ((x) ? (void)0 : os_assert_fail(__FILE__, __LINE__, #x))
 _Noreturn void os_assert_fail(const char *file, int line, const char *expr);
 
+/* The second check (CLAUDE.md, A15), for checks too expensive to ship.
+ * OS_SAN_CHECKS is 1 exactly in a translation unit built with
+ * AddressSanitizer or ThreadSanitizer (the san, tsan and fuzz lanes), else 0.
+ * OS_SAN_ASSERT(x) is ASSERT(x) there; elsewhere x is still compiled, so it
+ * stays type-checked, but never evaluated. Each use says why it does not
+ * ship. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define OS_SAN_CHECKS 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define OS_SAN_CHECKS 1
+#endif
+#endif
+#ifndef OS_SAN_CHECKS
+#define OS_SAN_CHECKS 0
+#endif
+#define OS_SAN_ASSERT(x) (OS_SAN_CHECKS ? ASSERT(x) : (void)0)
+
 /* (P) Linux PATH_MAX includes the NUL. Name storage includes NAME_MAX
  * bytes plus the NUL (linux/limits.h). */
 #define OS_PATH_MAX 4096u

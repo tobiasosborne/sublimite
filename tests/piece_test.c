@@ -2,7 +2,8 @@
  * of the frozen sections is checked against the flat model
  * (tests/piece_model.h) through tests/piece_harness.h; the directed cases
  * also carry literal expectations, which check the model itself. The Lines
- * section is a draft and is not exercised here.
+ * section (a draft) has its own part at the end, checked against the truth
+ * of the reference bytes.
  *
  * Until v2-0fv.7b the suite links the model as the implementation (the
  * Makefile names build/<cfg>/tests/piece_model.o for it); 7b drops that line
@@ -800,6 +801,287 @@ static void t_deaths(void)
         CHECK(dies_by_assert(cases[i].fn, cases[i].what), "%s is not an ASSERT", cases[i].what);
 }
 
+/* ==== Lines (draft section, docs/decisions/v2-0fv.7.md §9) ================
+ * Kept apart from the frozen sections above. Which answers are exact depends
+ * on the implementation's hidden shape, so these cases check the contract
+ * against the truth of the reference bytes (soundness, private-copy
+ * exactness, carried exactness, healing, completeness, faults, snapshot
+ * stability) and never compare exactness flags with the model's. */
+
+static uint8_t *lines_ops(size_t n, uint64_t seed)
+{
+    uint8_t *ops = malloc(n);
+    ASSERT(ops != NULL);
+    for (size_t i = 0; i < n; i++) ops[i] = (uint8_t)ph_rand(&seed);
+    for (size_t i = 0; i < n; i += 9) /* refuse base on one operation in eight */
+        if (ph_rand(&seed) % 8u) ops[i] &= 0x7f;
+    return ops;
+}
+
+static void lines_check_all(ph_state *st, uint64_t seed, bool want_exact, const char *tag)
+{
+    ph_check_lines(piece_tree_view(st->t), pm_tree_view(st->m), seed, 3, want_exact, tag);
+    for (unsigned i = 0; i < PH_SNAPS; i++)
+        if (st->s[i]) ph_check_lines(piece_snapshot_view(st->s[i]), pm_snapshot_view(st->ms[i]), seed + i, 2,
+                                     want_exact && !st->map, tag);
+}
+
+/* A private-copy tree is exact from open on, through every operation. */
+static void t_lines_private(void)
+{
+    enum { N = 2 * PIECE_CHUNK + 999 };
+    uint8_t *init = malloc(N), *scratch = malloc(PH_SCRATCH), *ops = lines_ops(9 * 150, 41);
+    ASSERT(init != NULL && scratch != NULL);
+    ph_fill(init, N, 21);
+    ph_state st;
+    if (ph_open(&st, init, N, 0, NULL)) {
+        lines_check_all(&st, 1, true, "private open");
+        ph_in in = {ops, 9 * 150};
+        unsigned k = 0;
+        while (ph_step(&st, &in, scratch)) lines_check_all(&st, k++, true, "private edit");
+    }
+    ph_close(&st);
+    free(ops);
+    free(scratch);
+    free(init);
+}
+
+/* Mapped: sound throughout, with partial adoption and resolve between
+ * operations; complete after every chunk is adopted and the sweep drained. */
+static void t_lines_mapped(void)
+{
+    enum { N = 3 * PIECE_CHUNK + 4321 };
+    uint8_t *init = malloc(N), *scratch = malloc(PH_SCRATCH), *ops = lines_ops(9 * 150, 43);
+    ASSERT(init != NULL && scratch != NULL);
+    ph_fill(init, N, 31);
+    ph_mapping map;
+    ph_state st;
+    if (ph_open(&st, init, N, 1, &map)) {
+        lines_check_all(&st, 2, false, "mapped open");
+        uint32_t c1;
+        CHECK(piece_lines_count(&map.b, 1, &c1, 1), "count chunk 1");
+        CHECK(piece_lines_adopt(st.t, map.b.fault, 1, &c1, 1), "adopt chunk 1");
+        ph_in in = {ops, 9 * 150};
+        unsigned k = 0;
+        while (ph_step(&st, &in, scratch)) {
+            if (k % 10 == 0) {
+                bool more;
+                CHECK(piece_lines_resolve(st.t, 8, &more) == PIECE_OK, "resolve step");
+            }
+            lines_check_all(&st, k++, false, "mapped edit");
+        }
+        ph_op_end(&st, false);
+        if (ph_lines_complete(st.t, &map, "mapped")) {
+            ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 7, 16, true, "mapped complete");
+            ph_op_take(&st, 0, false);
+            if (st.s[0]) ph_check_lines(piece_snapshot_view(st.s[0]), pm_snapshot_view(st.ms[0]), 8, 8, true,
+                                        "snapshot after completion");
+        }
+    }
+    ph_close(&st);
+    free(ops);
+    free(scratch);
+    free(init);
+}
+
+/* Undo with the records described before the delete keeps counted text
+ * exact at once; without them (NULL, as journal replay) it heals by resolve. */
+static void t_lines_carried(bool with_nl)
+{
+    const char *tag = with_nl ? "carried counts" : "NULL counts";
+    enum { N = 4 * PIECE_CHUNK + 77 };
+    uint8_t *init = malloc(N);
+    ASSERT(init != NULL);
+    ph_fill(init, N, 51);
+    ph_mapping map;
+    ph_state st;
+    uint64_t rng = with_nl ? 5u : 6u;
+    if (ph_open(&st, init, N, 1, &map) && ph_lines_complete(st.t, &map, tag)) {
+        ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 1, 8, true, tag);
+        for (int round = 0; round < 6; round++) {
+            uint64_t len = piece_length(piece_tree_view(st.t));
+            uint64_t off = ph_rand(&rng) % len, del = 1u + ph_rand(&rng) % (len - off < 3u * PIECE_CHUNK ? len - off : 3u * PIECE_CHUNK);
+            ph_spans inv = {0};
+            ph_describe(piece_tree_view(st.t), off, del, true, &inv);
+            ph_op_replace(&st, off, del, NULL, 0, false);
+            ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 2, 4, true, "after the delete");
+            ph_op_replace_spans(&st, off, 0, &inv, with_nl, false);
+            if (with_nl) {
+                ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 3, 8, true, "undo with counts");
+            } else {
+                ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 3, 8, false, "undo without counts");
+                if (ph_lines_complete(st.t, &map, tag))
+                    ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 4, 8, true, "healed by resolve");
+            }
+            ph_spans_free(&inv);
+        }
+    }
+    ph_close(&st);
+    free(init);
+}
+
+/* Astra Q2.2: a counted slice A and its source-contiguous neighbour B added
+ * without counts form one span whose head mixes knowledge. Described, deleted
+ * and undone before resolve, then cut back to A: exact again after resolve. */
+static void t_lines_mixed_end(void)
+{
+    enum { N = 2 * PIECE_CHUNK };
+    uint8_t *init = malloc(N);
+    ASSERT(init != NULL);
+    ph_fill(init, N, 61);
+    init[150] = '\n'; /* A holds a newline */
+    ph_mapping map;
+    ph_state st;
+    if (ph_open(&st, init, N, 1, &map) && ph_lines_complete(st.t, &map, "mixed end")) {
+        ph_op_replace(&st, PIECE_CHUNK, PIECE_CHUNK, NULL, 0, false); /* the known prefix ORIGINAL [0, C) */
+        ph_spans a = {0}, b = {0}, ab = {0};
+        ph_describe(piece_tree_view(st.t), 100, 100, true, &a); /* A = [100, 200), counted */
+        ph_spans_push(&b, SPAN(200, 100), (piece_span_nl){PIECE_NL_UNKNOWN, PIECE_NL_UNKNOWN});
+        ph_op_replace_spans(&st, PIECE_CHUNK, 0, &a, true, false);         /* A at EOF with its record */
+        ph_op_replace_spans(&st, PIECE_CHUNK + 100u, 0, &b, false, false); /* B at EOF without counts */
+        ph_describe(piece_tree_view(st.t), PIECE_CHUNK, 200, true, &ab);
+        CHECK(ab.n == 1 && ph_span_eq(ab.s[0], SPAN(100, 200)), "A.B is one span");
+        lines_check_all(&st, 1, false, "mixed: before the round trip");
+        ph_op_replace(&st, PIECE_CHUNK, 200, NULL, 0, false);
+        ph_op_replace_spans(&st, PIECE_CHUNK, 0, &ab, true, false); /* undo before resolve */
+        lines_check_all(&st, 2, false, "mixed: after undo");
+        ph_op_replace(&st, PIECE_CHUNK + 100u, 100, NULL, 0, false); /* cut away B */
+        lines_check_all(&st, 3, false, "mixed: A alone, before resolve");
+        if (ph_lines_complete(st.t, &map, "mixed end"))
+            ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 4, 16, true, "mixed: exact after resolve");
+        ph_spans_free(&a);
+        ph_spans_free(&b);
+        ph_spans_free(&ab);
+    }
+    ph_close(&st);
+    free(init);
+}
+
+/* A snapshot keeps its answers while its backing is trusted. */
+static void t_lines_snapshot_stable(void)
+{
+    enum { N = 2 * PIECE_CHUNK + 300 };
+    uint8_t *init = malloc(N);
+    ASSERT(init != NULL);
+    ph_fill(init, N, 71);
+    ph_mapping map;
+    ph_state st;
+    if (ph_open(&st, init, N, 1, &map)) {
+        ph_op_take(&st, 0, false);
+        const piece_view *sv = st.s[0] ? piece_snapshot_view(st.s[0]) : NULL;
+        if (sv) {
+            uint64_t c0, o0, b0, c1, o1, b1;
+            bool e0 = piece_lines_before(sv, N, &c0), f0 = piece_lines_start(sv, 3, &o0, &b0);
+            if (ph_lines_complete(st.t, &map, "snapshot stable")) {
+                bool e1 = piece_lines_before(sv, N, &c1), f1 = piece_lines_start(sv, 3, &o1, &b1);
+                CHECK(e0 == e1 && c0 == c1 && f0 == f1 && o0 == o1 && b0 == b1, "a snapshot's answers changed");
+                ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 9, 8, true, "live after completion");
+            }
+        }
+    }
+    ph_close(&st);
+    free(init);
+}
+
+/* Faults: a tainted batch is discarded at adoption, a disagreeing or foreign
+ * one too; a nonzero epoch or a failing poll makes every dependent answer
+ * inexact with lower bound 0, line 0 excepted. */
+static void lines_fault_answers(ph_state *st, ph_mapping *map, ph_poll mode, const char *tag)
+{
+    const piece_view *v = piece_tree_view(st->t);
+    uint64_t c = 7, o = 7, b = 7;
+    uint32_t cnt;
+    ph_poll_set(mode);
+    bool r = piece_lines_before(v, piece_length(v), &c);
+    bool s1 = piece_lines_start(v, 1, &o, &b);
+    uint64_t o0 = 7, b0 = 7;
+    bool s0 = piece_lines_start(v, 0, &o0, &b0);
+    bool counted = piece_lines_count(&map->b, 0, &cnt, 1);
+    ph_poll_set(PH_POLL_REAL);
+    CHECK(!r && c == 0, "%s: rank (%d, %llu), want (false, 0)", tag, (int)r, PH_U(c));
+    CHECK(!s1 && o == 0 && b == 0, "%s: select(1) (%d, %llu, %llu), want (false, 0, 0)", tag, (int)s1, PH_U(o), PH_U(b));
+    CHECK(s0 && o0 == 0 && b0 == 0, "%s: select(0) must stay (true, 0, 0)", tag);
+    CHECK(!counted, "%s: the counter must refuse", tag);
+}
+
+static void t_lines_faults(void)
+{
+    enum { N = 2 * PIECE_CHUNK + 5 };
+    uint8_t *init = malloc(N);
+    ASSERT(init != NULL);
+    ph_fill(init, N, 81);
+    ph_mapping map;
+    ph_state st;
+    if (ph_open(&st, init, N, 1, &map)) {
+        uint32_t counts[3];
+        CHECK(piece_lines_count(&map.b, 0, counts, 3), "count");
+        ph_poll_set(PH_POLL_FAULTED);
+        bool tainted = piece_lines_adopt(st.t, map.b.fault, 0, counts, 3);
+        ph_poll_set(PH_POLL_ERROR);
+        bool failed = piece_lines_adopt(st.t, map.b.fault, 0, counts, 3);
+        ph_poll_set(PH_POLL_REAL);
+        CHECK(!tainted && !failed, "a tainted batch was adopted");
+        os_fault_id foreign = map.b.fault;
+        foreign.gen++;
+        CHECK(!piece_lines_adopt(st.t, foreign, 0, counts, 3), "a foreign batch was adopted");
+        bool more;
+        CHECK(piece_lines_resolve(st.t, 64, &more) == PIECE_OK, "resolve");
+        ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 1, 4, false, "nothing adopted");
+        CHECK(piece_lines_adopt(st.t, map.b.fault, 0, counts, 3), "a clean batch");
+        CHECK(piece_lines_adopt(st.t, map.b.fault, 0, counts, 3), "an identical batch again");
+        uint32_t other = counts[0] ? counts[0] - 1u : 1u;
+        CHECK(!piece_lines_adopt(st.t, map.b.fault, 0, &other, 1), "a disagreeing batch was adopted");
+        if (ph_lines_complete(st.t, &map, "faults")) {
+            ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 2, 8, true, "before the fault");
+            lines_fault_answers(&st, &map, PH_POLL_FAULTED, "nonzero epoch");
+            lines_fault_answers(&st, &map, PH_POLL_ERROR, "failing poll");
+            ph_check_lines(piece_tree_view(st.t), pm_tree_view(st.m), 3, 8, true, "trusted again");
+        }
+    }
+    ph_close(&st);
+    free(init);
+}
+
+/* B's debug check: a record that is not the true count of its bytes dies by
+ * OS_SAN_ASSERT in the sanitizer lanes; the shipped build reads nothing. */
+static void v_record_wrong_count(void)
+{
+    piece_reserve *r;
+    piece_tree *t = child_tree(&r); /* "abc\ndef" */
+    piece_iter it;
+    piece_span sp;
+    piece_span_nl nl;
+    piece_iter_init(&it, piece_tree_view(t), 0);
+    if (!piece_iter_next_span(&it, 4, &sp, &nl) || nl.head != 1) _exit(3);
+    nl.head = 0;
+    (void)piece_replace_spans(t, 7, 0, &sp, &nl, 1);
+}
+static void v_record_add_lineage(void)
+{
+    piece_reserve *r;
+    piece_tree *t = child_tree(&r);
+    piece_snapshot *in;
+    if (piece_checkpoint_begin(t) != PIECE_OK || piece_replace(t, 7, 0, str("\n"), 1) != PIECE_OK ||
+        piece_snapshot_take(t, &in) != PIECE_OK) _exit(3);
+    piece_checkpoint_abort(t);
+    if (piece_replace(t, 7, 0, str("y"), 1) != PIECE_OK) _exit(3); /* regrows ADD [0, 1) with 'y' */
+    piece_iter it;
+    piece_span sp;
+    piece_span_nl nl;
+    piece_iter_init(&it, piece_snapshot_view(in), 7);
+    if (!piece_iter_next_span(&it, 8, &sp, &nl) || nl.head != 1) _exit(3);
+    (void)piece_replace_spans(t, 0, 0, &sp, &nl, 1);
+}
+
+static void t_lines_deaths(void)
+{
+    bool want = OS_SAN_CHECKS != 0;
+    CHECK(dies_by_assert(v_record_wrong_count, "wrong record count") == want,
+          "a wrong record count: died %d, want %d", (int)!want, (int)want);
+    CHECK(dies_by_assert(v_record_add_lineage, "ADD record after an abort") == want,
+          "an ADD record across an abort: died %d, want %d", (int)!want, (int)want);
+}
+
 /* ---- the differential random walk ----------------------------------------- */
 
 static void t_random(void)
@@ -838,6 +1120,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     t_deaths(); /* forks: before any thread starts */
+    t_lines_deaths();
     t_open_copy();
     t_replace();
     t_rejoin();
@@ -851,6 +1134,16 @@ int main(void)
     t_indent();
     t_threads();
     t_random();
+    /* Lines (draft section) */
+    t_lines_private();
+    t_lines_mapped();
+    t_lines_carried(true);
+    t_lines_carried(false);
+    t_lines_mixed_end();
+    t_lines_snapshot_stable();
+    t_lines_faults();
+    printf("Lines: %lu exact and %lu inexact answers checked\n", ph_lines_exact, ph_lines_inexact);
+    CHECK(ph_lines_exact > 0 && ph_lines_inexact > 0, "the Lines cases must see both kinds of answer");
     if (ph_failures) {
         printf("piece_test: %d failures\n", ph_failures);
         return 1;

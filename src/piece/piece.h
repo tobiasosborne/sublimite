@@ -53,7 +53,7 @@
  * (the signed leaf entry); with 4-level paging the 2^47-byte address space
  * keeps L below 2^47 / 16 x 2^16 = 2^59. 5-level paging would allow about
  * 2^56 / 16 x 2^16 = 2^68, so there the ASSERT is what holds it. Every
- * newline sum is then below 2^60 too (Lines). ADD's bytes are all stored, so
+ * newline sum is then at most 2^60 too (Lines: one newline per byte). ADD's bytes are all stored, so
  * its length stays below the address space, far under bit 63.
  *
  * STORAGE. Tree nodes, snapshot headers and checkpoint restore points occupy
@@ -120,14 +120,25 @@ typedef struct piece_span {
 
 /* Newline counts carried beside a span: an optional parallel array that
  * only undo keeps. It never reaches disk; piece_span alone is the
- * description's and the journal's unit. Descriptors follow their store's
- * chunk grid, so a span from chunk i to chunk j is a head in chunk i, whole
- * chunks i + 1 .. j - 1 (counted from the store's chunk totals) and a tail
- * in chunk j. head and tail are their newline counts, each at most
- * PIECE_CHUNK, or PIECE_NL_UNKNOWN; a span inside one chunk uses head, and
- * its tail is 0. 8 B (P), so an undo inverse entry is 24 B. A known count
- * was true when it was described and stays true while the backing is
- * trusted: a count belongs to its coordinates. */
+ * description's and the journal's unit. For a span [a, b) of one store, i =
+ * floor(a / PIECE_CHUNK) and j = floor((b - 1) / PIECE_CHUNK) are its first
+ * and last occupied chunks. When i == j, head counts the whole span and tail
+ * is 0. Otherwise head counts its part in chunk i, tail its part in chunk j
+ * (a chunk ends at its store's logical end), and whole chunks i + 1 .. j - 1
+ * count from the store's chunk totals. Each field is at most PIECE_CHUNK, or
+ * PIECE_NL_UNKNOWN: a part is described with a count only when all of it is
+ * counted, so a part that mixes counted and unknown text is unknown (Lines,
+ * CARRIED EXACTNESS). 8 B (P): an in-memory undo inverse entry is 24 B, the
+ * figure undo admits per span; the literal threshold stays 16 x spans >
+ * length (A13's copy cap and the journal's choice).
+ * Provenance, the precondition of piece_replace_spans: a record is valid only
+ * for the exact span it was described with by piece_iter_next_span on a view
+ * of the same tree (a caller that clips a span describes it again with end);
+ * for ORIGINAL in the same validated source generation; for ADD by byte
+ * lineage, so invalid once a checkpoint abort has lowered the ADD length below
+ * the span's end, also when described after the abort from a snapshot that
+ * survived it. A true count stays true while the backing is trusted: it
+ * belongs to its coordinates. */
 typedef struct piece_span_nl {
     uint32_t head;
     uint32_t tail;
@@ -195,7 +206,8 @@ uint64_t piece_add_length(const piece_tree *t);
 
 /* Every read is total on its view: no allocation, no error, no write to any
  * shared state, so readers on several threads never contend. Reading mapped
- * bytes may fault them in; piece_iter_next_span never reads a byte. */
+ * bytes may fault them in; piece_iter_next_span with nl == NULL never reads
+ * a byte. */
 
 uint64_t piece_length(const piece_view *v); /* O(1) */
 /* O(h). ASSERT: off < piece_length(v). */
@@ -252,11 +264,14 @@ bool piece_iter_next_span(piece_iter *it, uint64_t end, piece_span *out,
  * changes nothing, claims nothing and returns PIECE_OK. Any other successful
  * replace ends the live view's revision (live iterators need a seek) and
  * invalidates the snapshot cache; snapshots are unaffected. An edit reads
- * text bytes only to count the newlines of what it creates: one
- * piece_replace reads at most 2 x 32,768 = 65,536 B of mapped text (P, a
- * scan of the shorter half of each of the two descriptors it cuts), and
- * piece_replace_spans none (Lines). h is the tree's current number of branch
- * levels. Slot claims are the spec's scalar table (P). */
+ * mapped text only to count the newlines of what it creates (P): none of its
+ * inserted source, and at most 2 x 32,768 = 65,536 B for the at most two
+ * destination descriptors it cuts (the shorter half of each counted one; an
+ * unknown one is not read). A replace splices its insertion at the seam its
+ * deletion made before it merges neighbours, so it never cuts again what it
+ * has just joined (that order would read 3 x 32,768 B). h is the tree's
+ * current number of branch levels. Slot claims are the spec's scalar table
+ * (P). */
 
 /* Replaces [off, off + del) with a copy of bytes[0, n). The bytes are
  * appended to ADD at [a, a + n), a = piece_add_length(t), and the text
@@ -277,12 +292,20 @@ piece_err piece_replace(piece_tree *t, uint64_t off, uint64_t del,
                         const uint8_t *bytes, size_t n);
 
 /* Replaces [off, off + del) with the bytes that spans[0, count) name, by
- * reference: their coordinates are inserted as given, and no mapped byte is
- * copied or read. nl is NULL or count records carried with the spans
- * (piece_span_nl), which keep the inserted text exactly as counted as it
- * was; without them the spans' mapped ends are inserted unknown and
- * piece_lines_resolve heals them (Lines). The undo and redo primitive;
- * journal replay passes NULL. A span is valid for t when it lies
+ * reference: their coordinates are inserted as given, and no byte of the
+ * inserted source is copied or read; its destination cuts read as the Editing
+ * preamble states. nl is NULL or count records carried with the spans
+ * (piece_span_nl; its provenance rule is a precondition of this call). A
+ * counted part goes in counted; a whole chunk whose count the core's table
+ * holds is counted from the table whatever the record says; private storage
+ * (ADD, a private-copy ORIGINAL) is always counted; any other mapped part,
+ * every one when nl is NULL, goes in unknown and is eligible for
+ * piece_lines_resolve at once (Lines). The undo and redo primitive; journal
+ * replay passes NULL. Debug check of the provenance precondition: in the
+ * sanitizer lanes only (OS_SAN_ASSERT, os.h), each known head and tail is
+ * recounted from the bytes it names and compared, unless a poll shows the
+ * backing faulted; the shipped build reads nothing. A span is valid for t
+ * when it lies
  * inside ORIGINAL, or inside ADD below piece_add_length(t) and came from t
  * (described from t's live view or a snapshot of t, returned by
  * piece_capture, or the coordinates of a piece_replace) with no checkpoint
@@ -296,7 +319,8 @@ piece_err piece_replace(piece_tree *t, uint64_t off, uint64_t del,
  * PIECE_ERR_NOMEM; PIECE_ERR_RANGE.
  * ASSERT: off <= length, del <= length - off, spans != NULL when count > 0,
  * every span has len >= 1 and lies inside its store, and length - del plus
- * the spans' lengths is at most PIECE_MAX_LENGTH. */
+ * the spans' lengths is at most PIECE_MAX_LENGTH (checked span by span against
+ * the remaining capacity, so no sum wraps). */
 piece_err piece_replace_spans(piece_tree *t, uint64_t off, uint64_t del,
                               const piece_span *spans, const piece_span_nl *nl,
                               size_t count);
@@ -375,7 +399,7 @@ piece_err piece_replenish(piece_tree *t);
  * before it reports PIECE_ERR_NOMEM, and close drains the rest. */
 bool piece_reclaim(piece_tree *t, size_t budget);
 
-/* ---- Lines (DRAFT for review, not frozen) ------------------------------- */
+/* ---- Lines (DRAFT for the freeze read) ---------------------------------- */
 
 /* A line break is '\n'. Lines are numbered from 0: a text with k newlines
  * has k + 1 lines, line i > 0 starts one past the i-th newline, and a text
@@ -383,108 +407,141 @@ bool piece_reclaim(piece_tree *t, size_t budget);
  *
  * ANNOTATION. Every leaf entry and branch entry carries (bytes, newlines,
  * unknown); a branch entry sums its subtree's counted newlines and ORs its
- * unknown flag. Every sum is below PIECE_MAX_LENGTH = 2^60 (SIZES), so bit
- * 63 of a branch sum is free for the flag by construction; a leaf count is
- * at most PIECE_CHUNK, so UINT32_MAX is free as the leaf's sentinel.
+ * unknown flag. A sum is at most the text's length, so at most
+ * PIECE_MAX_LENGTH = 2^60 (SIZES; one newline per byte at most), and bit 63
+ * of a branch sum is free for the flag by construction; a leaf count is at
+ * most PIECE_CHUNK, so UINT32_MAX is free as the leaf's sentinel.
  *
- * EXACTNESS. A newline count belongs to source coordinates, so every edit,
- * undo and redo keeps exact text exact. Unknown text is only mapped ORIGINAL
- * never counted, or spans inserted without counts. What an edit creates is
- * counted then:
+ * KNOWLEDGE. A newline count belongs to source coordinates. Private storage
+ * (ADD, and a private-copy ORIGINAL, which keeps the chunk totals it counted
+ * while copying) is always counted; only mapped ORIGINAL can be unknown. What
+ * an edit creates is counted then:
  *  - bytes piece_replace or piece_capture copies, while copying them;
- *  - a span inserted by reference: from its carried piece_span_nl; without
- *    one, whole chunks from the store's chunk totals and partial ends in
- *    private storage (ADD, a private-copy ORIGINAL) by scanning the shorter
- *    part, at most PIECE_CHUNK / 2; a mapped end without a record is
- *    unknown, and so is a whole mapped chunk with no table entry;
+ *  - a span inserted by reference: known carried counts; whole chunks from
+ *    the core's chunk table, which overrides an UNKNOWN record; in private
+ *    storage the store's chunk totals and prefix counts, scanning at most
+ *    PIECE_CHUNK / 2 per end; any other mapped part goes in unknown;
  *  - the halves of a cut: a counted descriptor by scanning its shorter half
  *    (at most PIECE_CHUNK / 2 = 32,768 B (P)) and subtracting; the halves of
  *    an unknown descriptor stay unknown and nothing is read.
- * An unknown entry becomes counted only through piece_lines_resolve, once
- * its chunk's table entry is present: a whole chunk from the table, a
- * partial one by a UI scan of at most PIECE_CHUNK. Chunk k of a mapped
- * ORIGINAL is [k x PIECE_CHUNK, min((k + 1) x PIECE_CHUNK, len)); the last,
- * possibly short, is whole for open, adoption and replay, and any
- * subinterval of a chunk is a slice. A private-copy tree counts every chunk
- * while it copies and keeps the totals: it is exact from open on.
+ * An unknown entry becomes counted only through piece_lines_resolve once its
+ * chunk's table entry is present: a whole chunk from the table, a partial one
+ * by a UI scan of at most PIECE_CHUNK. Every counted mapped entry descends
+ * from a table entry, so an unknown piece of a chunk that also holds counted
+ * text is eligible at once. Chunk k of a mapped ORIGINAL is
+ * [k x PIECE_CHUNK, min((k + 1) x PIECE_CHUNK, len)); the last, possibly
+ * short, is whole for open, adoption and replay, and any subinterval of a
+ * chunk is a slice.
  *
- * READS OF MAPPED TEXT (P), counted per call: piece_replace at most 65,536 B;
- * piece_replace_spans none; piece_iter_next_span with a record at most
- * 32,768 B per span end inside a counted descriptor; a query at most
- * PIECE_CHUNK; piece_lines_resolve at most PIECE_CHUNK per partial entry.
+ * CARRIED EXACTNESS. An edit, undo or redo keeps exact every piece whose
+ * record was counted when it was described. A record's head or tail that
+ * mixes counted and unknown text (a counted slice and a source-contiguous
+ * neighbour inserted without counts, joined into one span) is described
+ * unknown, goes back in unknown, and is eligible for resolve at once.
  *
- * FAULTS. Every scan of mapped bytes is bracketed by two polls of the
- * backing's fault id; a count from a scan that saw a nonzero epoch is
- * discarded and its entry stays unknown. A query polls once more itself
- * and, at a nonzero epoch, answers inexact with lower bound 0: soundness
- * does not wait for the file owner to notice. Exactness is promised for a
- * trusted backing only; L0 repairs addressability after a fault, and the
- * file owner reloads onto a fresh backing.
+ * READS OF MAPPED TEXT (P), counted per call, query reads apart from edit
+ * reads. An edit: none of its inserted source, at most 65,536 B of
+ * destination cuts (Editing). piece_iter_next_span: none with nl == NULL;
+ * with nl, at most 32,768 B per span end inside a counted descriptor. A
+ * one-span delete, its description with counts and its undo read at most
+ * 4 x 32,768 = 131,072 B together (A13): description and deletion each scan
+ * the k <= 2 interior endpoint cuts once; with k = 2 the survivors' sources
+ * have a gap, so they cannot have merged and the undo cuts nothing; with
+ * k <= 1 an undo that splits a merged seam reads at most 32,768 B more. A
+ * query reads at most PIECE_CHUNK; piece_lines_resolve at most PIECE_CHUNK
+ * per partial entry.
+ *
+ * FAULTS. Every scan of mapped bytes (a cut, a resolve scan, a scanning
+ * query) is enclosed by an opening and a closing poll of the backing's fault
+ * id, in the fault service's order (os.h), the closing poll after every load
+ * the result depends on; the result is used only when both report epoch 0.
+ * A query that reads no mapped byte linearises at one poll. A nonzero epoch
+ * or a failed poll makes a query answer inexact with lower bound 0 (line 0
+ * excepted) and leaves a cut's or a resolve's entry unknown. A batch is
+ * revalidated at adoption (source identity and epoch) and discarded if
+ * tainted. Exactness is promised for a trusted backing only: L0 repairs
+ * addressability after a fault, the file owner reloads onto a fresh backing,
+ * and an unsignalled overwrite falls under the file owner's validation.
  *
  * GUARANTEES (the suite's contract; which answers are exact depends on the
  * hidden shape, like the height limit): soundness, an exact answer is the
- * true count; private-copy trees are always exact; carried counts keep undo
- * and redo exact; completeness, once every chunk of a trusted backing is
- * adopted and piece_lines_resolve reports nothing more, every query on the
- * live view, and on snapshots taken after that, is exact. A snapshot's
- * answers never change. */
+ * true count; private-copy trees are always exact; carried exactness as
+ * above; completeness, once every chunk of a trusted backing is adopted and
+ * piece_lines_resolve reports no work left, every query on the live view,
+ * and on snapshots taken after that, is exact. A snapshot's answers do not
+ * change while its backing is trusted. */
 
 /* Rank: newlines in [0, off). An offset on an entry boundary excludes the
  * entry that follows, even an unknown one; an offset inside an entry scans
- * that entry, at most PIECE_CHUNK bytes. True when *count is exact: no
- * unknown entry lies wholly before off and the epoch is 0. Otherwise false,
- * and *count is a lower bound: the counted part, or 0 at a nonzero epoch.
- * O(h). ASSERT: off <= piece_length(v), count != NULL. */
+ * that entry's part before off, at most PIECE_CHUNK bytes, within the FAULTS
+ * polls; a rank that scans nothing polls once. True when *count is exact:
+ * no unknown entry lies wholly before off and every poll reports epoch 0.
+ * Otherwise false, and *count is a lower bound: the counted part, or 0 when
+ * a poll reports a nonzero epoch or fails. O(h).
+ * ASSERT: off <= piece_length(v), count != NULL. */
 bool piece_lines_before(const piece_view *v, uint64_t off, uint64_t *count);
 
 /* Select: the start of line `line` in *off, and in *before the newlines in
  * [0, *off). Past the last line, *off = piece_length(v) and *before is the
  * total. Descends through an unknown-marked ancestor's exact leading
  * children; locating the newline inside its entry is one pass of at most
- * PIECE_CHUNK bytes (P). True when *off is exact. False when an unknown
- * entry before the line's start blocks the search, which then reads no
- * further unknown entry: *off is that entry's start, *before the exact count
- * before it (less than line), and the line starts after *off. At a nonzero
- * epoch: false with *off = *before = 0, except that line 0 is always
- * (0, 0, true). O(h). ASSERT: off, before != NULL. */
+ * PIECE_CHUNK bytes (P) within the FAULTS polls. True when *off is exact.
+ * False when an unknown entry before the line's start blocks the search,
+ * which then reads no further unknown entry: *off is that entry's start,
+ * *before the exact count before it (less than line), and the line starts
+ * after *off. When a poll reports a nonzero epoch or fails: false with
+ * *off = *before = 0; line 0 is always (0, 0, true) and reads nothing.
+ * O(h). ASSERT: off, before != NULL. */
 bool piece_lines_start(const piece_view *v, uint64_t line, uint64_t *off,
                        uint64_t *before);
 
 /* Off-path counter. Counts the newlines of chunks [first, first + n) of b
- * into counts[0, n) between two polls of b->fault; false, counts discarded,
- * unless both report epoch 0. Any thread while the caller owns a backing
- * reference; touches no tree, allocates nothing, reads at most
- * n x PIECE_CHUNK bytes. ASSERT: b, counts != NULL;
+ * into counts[0, n) between an opening and a closing poll of b->fault; false,
+ * counts discarded, unless both report epoch 0. Any thread while the caller
+ * owns a backing reference; touches no tree, allocates nothing, reads at
+ * most n x PIECE_CHUNK bytes. ASSERT: b, counts != NULL;
  * first + n <= ceil(b->len / PIECE_CHUNK). */
 bool piece_lines_count(const piece_backing *b, uint64_t first,
                        uint32_t *counts, size_t n);
 
-/* Stores counts from a true piece_lines_count of t's backing in the core's
- * chunk table (4 B per chunk (P), allocated by piece_open_mapped: 65,536 B
- * for 1 GiB) and restarts the resolve sweep. Rewrites no entry. UI only,
- * O(n), allocates nothing. ASSERT: ORIGINAL is mapped; first + n <= its
- * chunk count; each count is at most its chunk's length; a chunk adopted
- * again gets the same count. */
-void piece_lines_adopt(piece_tree *t, uint64_t first, const uint32_t *counts,
-                       size_t n);
+/* Revalidates a batch that piece_lines_count produced on the backing whose
+ * fault id is source, then stores it in t's core chunk table (4 B per chunk
+ * (P), allocated by piece_open_mapped: 65,536 B for 1 GiB). Returns false and
+ * stores nothing when the batch is tainted: source is not t's backing (a
+ * batch for a closed or reloaded buffer), a poll of it reports a nonzero
+ * epoch or fails, or a count disagrees with one the table holds (the source
+ * changed; the file owner's validation decides). A batch that adds a chunk
+ * invalidates the resolve cursor; an identical re-adoption changes nothing.
+ * Rewrites no entry. UI only, O(n), allocates nothing.
+ * ASSERT: ORIGINAL is mapped; first + n <= its chunk count; each count is at
+ * most its chunk's length. */
+bool piece_lines_adopt(piece_tree *t, os_fault_id source, uint64_t first,
+                       const uint32_t *counts, size_t n);
 
-/* The resolve sweep: walks the live tree in document order from its saved
- * cursor, visiting at most budget nodes and entries (misses included), and
- * rewrites each unknown entry its chunk table can count. It copies each
- * shared path before rewriting it, so snapshots keep their answers,
- * inexact ones included: up to one copy of every node, e.g. 730 x 400 =
- * 292,000 B for a packed 1 GiB tree whose old root a snapshot pins (P,
- * 683 leaves + 47 branches). The copies are admitted like an edit's:
- * PIECE_ERR_NOMEM changes nothing and the call can be retried; run it
- * before piece_replenish, whose top-up it would otherwise spend. A call
+/* The resolve sweep: walks the live tree in document order from its cursor
+ * and rewrites each unknown entry the chunk table can count, copying each
+ * shared path before it publishes, so snapshots keep their answers, inexact
+ * ones included. One call visits at most budget nodes, ancestors walked for
+ * a copy and misses included, whatever the tree holds: a tree of unknown
+ * entries whose chunks are not yet adopted costs a bounded amount per call
+ * and nothing on the typing path. The copies cost up to one copy of every
+ * node, e.g. 730 x 400 = 292,000 B for a packed 1 GiB tree whose old root a
+ * snapshot pins (P, 683 leaves + 47 branches), and are admitted like an
+ * edit's: PIECE_ERR_NOMEM changes nothing, cursor included, and can be
+ * retried; run it before piece_replenish, whose top-up it would otherwise
+ * spend. On PIECE_OK the cursor moves past the entries it rewrote, now
+ * published, and past the ineligible ones it visited. Any successful live
+ * edit, any abort, and an adoption that adds a chunk invalidate the cursor,
+ * so no eligible entry is skipped forever; an identical re-adoption does not.
+ * *more is false when no eligible work remains for the current root and
+ * table (a later batch can make more eligible). Liveness: with root and
+ * table unchanged and admission succeeding, a call with budget >= h + 1 (one
+ * root-to-leaf walk) reports *more false or moves the cursor forward. A call
  * that replaces the root invalidates the snapshot cache and ends the live
- * view's revision (live iterators need a seek; the text is unchanged).
- * *more is false once the sweep has passed the end with nothing left to
- * count. Adopting a batch, an abort and a reinsertion without counts
- * restart it, so no entry is skipped forever. An abort may restore an
- * unknown root: the table stays, and the restart makes that root eligible
- * without allocating. UI only, outside the input-to-submit window.
- * ASSERT: more != NULL. */
+ * view's revision (live iterators need a seek; the text is unchanged). An
+ * abort may restore an unknown root: the table stays, and the invalidated
+ * cursor makes that root eligible without allocating. UI only, outside the
+ * input-to-submit window. ASSERT: more != NULL. */
 piece_err piece_lines_resolve(piece_tree *t, size_t budget, bool *more);
 
 /* ---- Transitional (not part of the frozen API) -------------------------- */

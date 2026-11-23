@@ -209,6 +209,84 @@ The draft header implements the ruling and Astra's accepted findings:
 **My first draft wrote resolved counts into shared nodes in place, as atomics.** That was superseded by F3. With
 copy-on-write, snapshots keep their answers, and nodes stay immutable once shared.
 
+### Round 2: Astra's second read and the advisor's rulings A–E
+
+Review: `docs/reviews/wave1-piece-lines-astra-2.md`. Rulings: `docs/decisions/wave1-piece-lines.md`, "Second review
+rulings". Each is written into the header.
+
+- **A. Carried exactness, narrowed.**
+  - Invariant: an edit, undo or redo keeps exact every piece whose record was counted when it was described.
+  - A head or tail that mixes counted and unknown text is described unknown and reinserted unknown. It is eligible for
+    resolve at once: every counted mapped entry descends from a table entry, so its chunk is in the table.
+  - Simplest alternative: keep counted sub-ranges across canonical coalescing, or add a source-range newline index.
+  - Counter-example (Astra Q2.2): the record has no field for the counted part's length or count. Either alternative adds
+    state for a case that only a NULL-count insertion creates.
+  - Test: `t_lines_mixed_end` runs the Q2.2 trace and requires exactness after resolve.
+- **B. Provenance and its debug check.**
+  - Precondition: a record is valid for the exact span it was described with, on a view of the same tree. ORIGINAL must
+    be the same validated generation. ADD is checked by byte lineage, so a record described after an abort from a
+    surviving snapshot is invalid. A table-known whole chunk overrides an UNKNOWN record.
+  - Debug check: `OS_SAN_ASSERT`, new in `os.h`. It is 1 exactly under ASan or TSan, detected from the compiler's own
+    macros, so no build flag can drift. In other builds x is compiled but never evaluated.
+  - In the sanitizer lanes, `piece_replace_spans` recounts each known head and tail and compares. The check is skipped
+    when a poll shows a fault.
+  - Simplest alternative: an always-on ASSERT. Counter-example: it reads up to 2 × 65,536 B per span on the undo path,
+    against "replace reads nothing of its inserted source".
+  - The model implements the check, so undo's suite catches provenance bugs now. `t_lines_deaths` requires death under
+    the sanitizers and survival in the release build.
+- **C. Resolve progress.**
+  - One call visits at most `budget` nodes, ancestors and misses included.
+  - On NOMEM the cursor stays where it was.
+  - On OK the cursor moves past the entries the call rewrote (now published) and the ineligible ones it visited.
+  - The cursor is invalidated by any successful live edit, any abort, and an adoption that adds a chunk. An identical
+    re-adoption does not invalidate it (Astra Q2.5 starvation).
+  - "Done" is relative to the current root and table.
+  - Liveness: with root and table unchanged and admission succeeding, a call with budget ≥ h + 1 either reports done or
+    moves the cursor forward.
+  - Deviation from the ruling's wording, "the cursor advances only with a successful publication": a run of leaves with
+    nothing to rewrite publishes nothing and would stall the sweep. So an OK call also moves past the entries it found
+    ineligible.
+- **D. Faults.**
+  - `piece_lines_adopt` takes the batch's `os_fault_id` and revalidates source identity and epoch.
+  - A disagreeing count is a *result* (false), not an ASSERT. An unsignalled in-place overwrite can produce it, and that
+    is input (A15).
+  - Scanning queries put an opening and a closing poll around their mapped loads; a query that reads no mapped byte
+    linearizes at one poll. A poll error fails closed.
+  - A snapshot's answers are stable only while its backing is trusted.
+- **E. Wording.**
+  - An edit reads none of its inserted source and at most 65,536 B of destination cuts. It splices at its own seam
+    before merging; the other order reads 3 × 32,768 B (Q2.4).
+  - `next_span` with `nl == NULL` reads nothing.
+  - The newline sum is at most 2^60. The length check runs span by span against the remaining capacity.
+  - The read-bound text includes the undo-seam rule (Q3.2), ending at 131,072 B.
+  - Undo admits 24 B per span; the literal threshold stays 16 (Q4).
+
+**The model's Lines.**
+
+- Knowledge is per chunk. The table lives in the core, with atomic entries that the UI writes once. A chunk is known to a
+  view once its count is adopted and then published by `piece_lines_resolve`. A snapshot keeps the publication it was
+  taken at. Private storage is always known.
+- The model is therefore at least as exact as the contract asks, never less sound.
+- Every answer is recounted from the bytes, between two polls.
+- Publishing stands in for the real tree's root replacement: it invalidates the cache and ends the live view's revision.
+
+**The suite's Lines part** (separate from the frozen sections; checked against the truth of the reference bytes, never
+against the model's exactness flags):
+
+- `t_lines_private`: exact through 150 random operations.
+- `t_lines_mapped`: sound throughout partial adoption and resolve steps; complete after full adoption and a drained
+  sweep, also for a snapshot taken afterwards.
+- `t_lines_carried(true)`: exact at once after an undo with counts.
+- `t_lines_carried(false)`: an undo with NULL counts heals after resolve.
+- `t_lines_mixed_end`: the Q2.2 trace.
+- `t_lines_snapshot_stable`: a snapshot's answers do not change across adoption and resolve.
+- `t_lines_faults`: tainted, foreign and disagreeing batches are refused. A nonzero epoch and a failing poll each give
+  (false, 0) for rank and (false, 0, 0) for select(1), keep select(0) = (true, 0, 0), and make the counter refuse.
+- `t_lines_deaths`: the provenance debug check.
+
+The fault injection is `-Wl,--wrap=os_fault_poll`. It simulates a nonzero epoch or a failing poll, armed only around the
+call under test.
+
 ### lineidx: a module, or functions beside their callers?
 
 **Functions.** After this ruling, lineidx has no state and no invariant of its own:
@@ -270,7 +348,8 @@ bead for the job and the estimate, inside those owners.
   `ph_spans`, so a change to the record stays local.
 - `tests/piece_test.c` and `fuzz/piece_fuzz.c`, with seeds in `fuzz/corpus/piece/`.
 - `tests/lanes.mk`: `tests/piece_test.c := san tsan`, `fuzz/piece_fuzz.c := fuzz`.
-- `Makefile`: the link rules also take `%_model.o`; the refusal wrap; the two model lines that 7b deletes.
+- `src/os/os.h` (round 2): `OS_SAN_CHECKS` and `OS_SAN_ASSERT`, the sanitizer-lanes-only check that A15 names.
+- `Makefile`: the link rules also take `%_model.o`; the refusal wrap and the fault-poll wrap (`-Wl,--wrap=os_vm_reserve,--wrap=os_fault_poll`); the two model lines that 7b deletes.
 
 ## 12. Evidence (2026-11-23, [bat] Discharging, load 2.6–3.1, `nice`, `-j2`)
 
@@ -291,3 +370,25 @@ bead for the job and the estimate, inside those owners.
 - **Fuzz.** 8 seeds. An exploratory `-max_total_time=60` run made 10,557 runs with no crash. That is a check, not a
   budget.
 - **Lanes.** `make check`, `make check-tsan` (7 threaded suites) and `make fuzz-smoke` (9 fuzzers) all exit 0.
+
+### Round 2: Lines A–E (2026-11-23, [bat] Discharging, load 6–9 from a second project on the box, `nice`, `-j2`)
+
+- **Red.** I wrote the Lines tests before modelling Lines and ran them against a model whose Lines calls still ASSERTed.
+  The run exited 134:
+  - both provenance death cases failed, because no debug check existed yet;
+  - the first rank call aborted at the model's ASSERT.
+- **Green.** The san, tsan and rel builds all exit 0. The Lines part checked 7,051 exact and 4,395 inexact answers, and
+  the suite requires that both kinds occur. In rel the debug check is absent, which `t_lines_deaths` requires.
+- **Lines mutations.** Seven broken copies of the model were linked as the implementation:
+  - rank off by one when exact;
+  - adoption ignoring taint;
+  - queries ignoring the fault (both polls removed);
+  - resolve publishing nothing;
+  - select's inexact count wrong;
+  - no debug check;
+  - snapshots following live knowledge.
+
+  Each fails the suite. Removing only the opening poll is not observable against a persistent simulated fault, because
+  the closing poll still catches it. I record that as a limit of the simulation, not as a gap in the contract.
+- **Lanes.** `make check CONTRACT_CHECK_DISPLAYS=:170-:179`, `make check-tsan` (7 suites) and `make fuzz-smoke`
+  (9 fuzzers) all exit 0.

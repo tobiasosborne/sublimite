@@ -684,4 +684,140 @@ static inline bool ph_step(ph_state *st, ph_in *in, uint8_t *scratch)
 /* scratch holds at least PH_LARGE bytes. */
 #define PH_SCRATCH PH_LARGE
 
+/* ---- Lines (draft section): fault polls and the truth ------------------- */
+
+/* -Wl,--wrap=os_fault_poll: a test arms a simulated fault (a nonzero epoch)
+ * or a failing poll around a call under test, never around the reference. */
+typedef enum ph_poll { PH_POLL_REAL, PH_POLL_FAULTED, PH_POLL_ERROR } ph_poll;
+static atomic_int ph_poll_mode;
+
+os_err __real_os_fault_poll(os_fault_id id, uint64_t *epoch);
+os_err __wrap_os_fault_poll(os_fault_id id, uint64_t *epoch);
+
+os_err __wrap_os_fault_poll(os_fault_id id, uint64_t *epoch)
+{
+    ph_poll mode = (ph_poll)atomic_load(&ph_poll_mode);
+    switch (mode) {
+    case PH_POLL_REAL:
+        return __real_os_fault_poll(id, epoch);
+    case PH_POLL_FAULTED: {
+        os_err e = __real_os_fault_poll(id, epoch);
+        if (e == OS_OK) *epoch += 1u;
+        return e;
+    }
+    case PH_POLL_ERROR:
+        return OS_E_NOENT;
+    }
+    return OS_E_NOENT;
+}
+
+static inline void ph_poll_set(ph_poll m) { atomic_store(&ph_poll_mode, (int)m); }
+
+/* Newline positions of the reference text: the truth for rank and select. */
+typedef struct ph_lines_truth {
+    uint8_t *bytes;
+    uint64_t n, total;
+    uint64_t *pos; /* offsets of the newlines, ascending */
+} ph_lines_truth;
+
+static inline void ph_truth_init(ph_lines_truth *tr, const pm_view *m)
+{
+    tr->bytes = ph_bytes_model(m, &tr->n);
+    tr->total = 0;
+    for (uint64_t i = 0; i < tr->n; i++) tr->total += tr->bytes[i] == '\n';
+    tr->pos = malloc((size_t)(tr->total ? tr->total : 1u) * sizeof *tr->pos);
+    ASSERT(tr->pos != NULL);
+    for (uint64_t i = 0, k = 0; i < tr->n; i++)
+        if (tr->bytes[i] == '\n') tr->pos[k++] = i;
+}
+
+static inline void ph_truth_free(ph_lines_truth *tr)
+{
+    free(tr->bytes);
+    free(tr->pos);
+}
+
+static inline uint64_t ph_truth_rank(const ph_lines_truth *tr, uint64_t off)
+{
+    uint64_t lo = 0, hi = tr->total; /* newlines before off */
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (tr->pos[mid] < off) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static inline uint64_t ph_truth_start(const ph_lines_truth *tr, uint64_t line)
+{
+    if (line == 0) return 0;
+    return line <= tr->total ? tr->pos[line - 1u] + 1u : tr->n;
+}
+
+/* Answers seen, for the suite's summary: both kinds must occur. */
+static unsigned long ph_lines_exact, ph_lines_inexact;
+
+/* Checks rank and select on v against the truth: an exact answer is true,
+ * an inexact one is a sound bound; want_exact also demands exactness. */
+static inline void ph_check_lines(const piece_view *v, const pm_view *m, uint64_t seed, unsigned probes,
+                                  bool want_exact, const char *tag)
+{
+    ph_lines_truth tr;
+    ph_truth_init(&tr, m);
+    PH_CHECK(piece_length(v) == tr.n, "%s: length", tag);
+    for (unsigned i = 0; i < probes + 2u; i++) {
+        uint64_t off = i == 0 ? tr.n : i == 1 ? 0 : ph_rand(&seed) % (tr.n + 1u), count = UINT64_MAX;
+        bool exact = piece_lines_before(v, off, &count);
+        uint64_t truth = ph_truth_rank(&tr, off);
+        if (exact) ph_lines_exact++;
+        else ph_lines_inexact++;
+        if (exact) PH_CHECK(count == truth, "%s: rank(%llu) %llu, true %llu", tag, PH_U(off), PH_U(count), PH_U(truth));
+        else PH_CHECK(count <= truth, "%s: rank(%llu) bound %llu above %llu", tag, PH_U(off), PH_U(count), PH_U(truth));
+        if (want_exact) PH_CHECK(exact, "%s: rank(%llu) inexact", tag, PH_U(off));
+
+        uint64_t line = i == 0 ? tr.total : i == 1 ? tr.total + 1u : ph_rand(&seed) % (tr.total + 3u);
+        uint64_t at = UINT64_MAX, before = UINT64_MAX, want = ph_truth_start(&tr, line);
+        exact = piece_lines_start(v, line, &at, &before);
+        if (exact) ph_lines_exact++;
+        else ph_lines_inexact++;
+        if (exact) {
+            PH_CHECK(at == want && before == (line <= tr.total ? line : tr.total), "%s: select(%llu) (%llu, %llu), "
+                     "true (%llu, %llu)", tag, PH_U(line), PH_U(at), PH_U(before), PH_U(want),
+                     PH_U(line <= tr.total ? line : tr.total));
+        } else {
+            PH_CHECK(at <= tr.n && before == ph_truth_rank(&tr, at) && before < line && (line > tr.total || want > at),
+                     "%s: select(%llu) inexact (%llu, %llu) unsound, true start %llu", tag, PH_U(line), PH_U(at),
+                     PH_U(before), PH_U(want));
+        }
+        if (want_exact) PH_CHECK(exact, "%s: select(%llu) inexact", tag, PH_U(line));
+    }
+    ph_truth_free(&tr);
+}
+
+/* Counts and adopts every chunk of the mapped ORIGINAL, then drains the
+ * resolve sweep; false (with a failure) if that does not finish. */
+static inline bool ph_lines_complete(piece_tree *t, const ph_mapping *map, const char *tag)
+{
+    uint64_t chunks = (map->b.len + PIECE_CHUNK - 1u) / PIECE_CHUNK;
+    uint32_t counts[16];
+    for (uint64_t first = 0; first < chunks; first += 16u) {
+        size_t n = (size_t)(chunks - first < 16u ? chunks - first : 16u);
+        PH_CHECK(piece_lines_count(&map->b, first, counts, n), "%s: count chunks %llu", tag, PH_U(first));
+        PH_CHECK(piece_lines_adopt(t, map->b.fault, first, counts, n), "%s: adopt chunks %llu", tag, PH_U(first));
+    }
+    /* A guard, not a budget (P): a tree of d descriptors has fewer than 2d
+     * nodes (a leaf holds one or more, a branch two or more children), these
+     * fixtures stay under 32,000 descriptors, so one pass of the sweep takes
+     * fewer than 64,000 visits: 1,000 calls of budget 64. */
+    for (unsigned call = 0; call < 1000u; call++) {
+        bool more = true;
+        piece_err e = piece_lines_resolve(t, 64, &more);
+        PH_CHECK(e == PIECE_OK, "%s: resolve %d", tag, (int)e);
+        if (e != PIECE_OK) return false;
+        if (!more) return true;
+    }
+    PH_CHECK(0, "%s: the resolve sweep did not finish", tag);
+    return false;
+}
+
 #endif

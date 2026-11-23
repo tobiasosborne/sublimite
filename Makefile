@@ -186,12 +186,13 @@ $(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
 # (tests/ipc_peer_seam.h); the shipped binary has no override (v2-0fv.13).
 IPC_PEER_SEAM := -Wl,--wrap=os_stream_peer_uid
 $(foreach c,rel san tsan,$(B)/$(c)/tests/ipc_test) $(B)/fuzz/ipc_fuzz: private LDLIBS += $(IPC_PEER_SEAM)
-# piece (v2-0fv.7): base refusal is injected at its one reservation path. The
+# piece (v2-0fv.7): base refusal is injected at its one reservation path, and
+# a fault (nonzero epoch) or a failing poll at os_fault_poll (Lines tests). The
 # flat model (tests/piece_model.c defines every piece.h symbol) stands in for
 # src/piece until v2-0fv.7b, which deletes the two model lines below and links
 # $(B)/<cfg>/src/piece/piece_test_hooks.o into piece_test instead.
-LDFLAGS_piece_test := -Wl,--wrap=os_vm_reserve
-$(B)/fuzz/piece_fuzz: private LDLIBS += -Wl,--wrap=os_vm_reserve
+LDFLAGS_piece_test := -Wl,--wrap=os_vm_reserve,--wrap=os_fault_poll
+$(B)/fuzz/piece_fuzz: private LDLIBS += -Wl,--wrap=os_vm_reserve,--wrap=os_fault_poll
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/piece_test: $(B)/$(c)/tests/piece_model.o))
 $(B)/fuzz/piece_fuzz: $(B)/fuzz/tests/piece_model.o
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).

@@ -14,8 +14,15 @@
  * All storage comes from base_arena (os_vm_reserve underneath), so a test
  * that refuses os_vm_reserve refuses the model exactly as it refuses base.
  * Snapshot owners are atomic: snapshots may be read, retained and released
- * on any thread. The Lines section is not modelled yet; its functions
- * ASSERT.
+ * on any thread.
+ *
+ * Lines: a mapped ORIGINAL's chunk table lives in the core; the model knows
+ * a chunk's text once its count is adopted and published by
+ * piece_lines_resolve, and private storage always. Knowledge is per chunk,
+ * so the model is at least as exact as the contract asks (never less sound):
+ * a snapshot keeps the publication it was taken at, every count it reports
+ * is recounted from the bytes, and every mapped scan sits between two polls.
+ * With records, piece_replace_spans runs the provenance debug check.
  *
  * Two uses:
  *  - pm_*: the reference, called directly by tests/piece_test.c and
@@ -64,6 +71,13 @@ typedef struct pm_reserve {
     base_arena self;
 } pm_reserve;
 
+/* A chunk table entry: seq 0 is absent; otherwise the adoption that set it.
+ * The UI writes each entry once; snapshot readers on other threads load it. */
+typedef struct pm_line_chunk {
+    atomic_uint_least32_t count;
+    atomic_uint_least64_t seq;
+} pm_line_chunk;
+
 typedef struct pm_core {
     atomic_size_t owners; /* the open tree, plus one per live snapshot */
     pm_reserve *reserve;
@@ -71,7 +85,10 @@ typedef struct pm_core {
     uint64_t orig_len;
     bool mapped;
     piece_backing backing;
-    base_arena orig_mem, self;
+    pm_line_chunk *table; /* mapped only: one entry per ORIGINAL chunk */
+    uint64_t nchunks;
+    uint64_t adopt_seq; /* UI only: the last adoption */
+    base_arena orig_mem, table_mem, self;
 } pm_core;
 
 typedef struct pm_text {
@@ -97,6 +114,7 @@ typedef struct pm_snap {
     pm_text text;
     uint8_t *add; /* flat copy of the tree's ADD [0, add_len) at take */
     uint64_t add_len;
+    uint64_t lines_seq; /* the publication it was taken at */
     base_arena add_mem, self;
 } pm_snap;
 
@@ -116,6 +134,7 @@ typedef struct pm_tree {
     base_arena dir_mem;
     uint64_t add_len;
     uint64_t rev; /* the live view's revision */
+    uint64_t lines_seq; /* the last adoption piece_lines_resolve published */
     pm_snap *cache;
     pm_cp cp;
     pm_text cp_text;
@@ -165,6 +184,15 @@ static inline const uint8_t *pm_at(const pm_view *v, uint64_t src, uint64_t *roo
 }
 
 static inline uint64_t pm_min(uint64_t a, uint64_t b) { return a < b ? a : b; }
+
+/* Is chunk k of the mapped ORIGINAL known to view v? Private storage always is. */
+static inline bool pm_chunk_known(const pm_view *v, uint64_t k)
+{
+    const pm_core *c = pm_view_core(v);
+    if (!c->mapped) return true;
+    uint64_t seq = atomic_load(&c->table[k].seq);
+    return seq != 0 && seq <= (v->tree ? v->tree->lines_seq : v->snap->lines_seq);
+}
 
 /* Newlines of the coordinates [src, src + len), byte by byte. */
 static inline uint64_t pm_count_nl(const pm_view *v, uint64_t src, uint64_t len)
@@ -280,6 +308,7 @@ static inline void pm_core_release(pm_core *c)
     if (atomic_fetch_sub(&c->owners, 1) != 1) return;
     if (c->mapped) c->backing.release(c->backing.ctx);
     else pm_mem_put(&c->orig_mem);
+    pm_mem_put(&c->table_mem);
     pm_reserve *r = c->reserve;
     pm_mem_put(&c->self);
     atomic_fetch_sub(&r->cores, 1);
@@ -361,7 +390,19 @@ static inline piece_err pm_open_mapped(pm_reserve *r, const piece_backing *b, pm
     c->orig_len = b->len;
     c->mapped = true;
     c->backing = *b;
+    c->nchunks = (b->len + PIECE_CHUNK - 1u) / PIECE_CHUNK;
+    void *tp;
+    if (!pm_mem_get(&c->table_mem, (size_t)c->nchunks * sizeof(pm_line_chunk), &tp)) {
+        pm_mem_put(&c->self);
+        return PIECE_ERR_NOMEM;
+    }
+    c->table = tp;
+    for (uint64_t k = 0; k < c->nchunks; k++) {
+        atomic_init(&c->table[k].count, 0);
+        atomic_init(&c->table[k].seq, 0);
+    }
     if (pm_tree_new(r, c, out) != PIECE_OK) {
+        pm_mem_put(&c->table_mem);
         pm_mem_put(&c->self);
         return PIECE_ERR_NOMEM;
     }
@@ -445,12 +486,14 @@ static inline size_t pm_iter_next(pm_iter *it, const uint8_t **p)
 }
 
 /* The record of coordinates [src, src + len): head and tail per piece.h. A
- * mapped part read while the backing's epoch is nonzero is unknown. */
+ * mapped part is unknown when its chunk is unknown to the view, or when a
+ * poll around its scan fails or shows a fault. */
 static inline uint32_t pm_nl_part(const pm_view *v, uint64_t src, uint64_t len)
 {
     const pm_core *c = pm_view_core(v);
     uint64_t e0 = 0, e1 = 0;
     bool mapped = c->mapped && !pm_is_add(src);
+    if (mapped && !pm_chunk_known(v, pm_off(src) / PIECE_CHUNK)) return PIECE_NL_UNKNOWN;
     if (mapped && (os_fault_poll(c->backing.fault, &e0) != OS_OK || e0 != 0)) return PIECE_NL_UNKNOWN;
     uint64_t n = pm_count_nl(v, src, len);
     if (mapped && (os_fault_poll(c->backing.fault, &e1) != OS_OK || e1 != 0)) return PIECE_NL_UNKNOWN;
@@ -593,6 +636,24 @@ static inline piece_err pm_replace_spans(pm_tree *t, uint64_t off, uint64_t del,
         if (nl) ASSERT((nl[i].head <= PIECE_CHUNK || nl[i].head == PIECE_NL_UNKNOWN) &&
                        (nl[i].tail <= PIECE_CHUNK || nl[i].tail == PIECE_NL_UNKNOWN));
     }
+    /* The provenance debug check (piece.h): sanitizer lanes only, because it
+     * reads every carried end piece, up to 2 x PIECE_CHUNK per span, which
+     * the shipped build must not. A poll showing a fault skips it. */
+    if (OS_SAN_CHECKS && nl) {
+        for (size_t i = 0; i < count; i++) {
+            uint64_t o = pm_off(spans[i].src), tag = spans[i].src & PIECE_SPAN_ADD;
+            uint64_t ci = o / PIECE_CHUNK, cj = (o + spans[i].len - 1u) / PIECE_CHUNK;
+            bool mapped = t->core->mapped && !tag;
+            uint64_t e0 = 1, e1 = 1;
+            if (mapped && (os_fault_poll(t->core->backing.fault, &e0) != OS_OK || e0 != 0)) continue;
+            uint64_t head_len = ci == cj ? spans[i].len : (ci + 1u) * PIECE_CHUNK - o;
+            uint64_t head = pm_count_nl(&t->view, spans[i].src, head_len);
+            uint64_t tail = ci == cj ? 0 : pm_count_nl(&t->view, tag | (cj * PIECE_CHUNK), o + spans[i].len - cj * PIECE_CHUNK);
+            if (mapped && (os_fault_poll(t->core->backing.fault, &e1) != OS_OK || e1 != 0)) continue;
+            OS_SAN_ASSERT(nl[i].head == PIECE_NL_UNKNOWN || nl[i].head == head);
+            OS_SAN_ASSERT(nl[i].tail == PIECE_NL_UNKNOWN || nl[i].tail == tail);
+        }
+    }
     if (del == 0 && count == 0) return PIECE_OK;
     pm_text nt;
     if (!pm_splice(&t->text, off, del, spans, count, &nt)) return PIECE_ERR_NOMEM;
@@ -656,6 +717,7 @@ static inline piece_err pm_snapshot_take(pm_tree *t, pm_snap **out)
     s->add_len = t->add_len;
     s->text = text;
     s->core = t->core;
+    s->lines_seq = t->lines_seq;
     s->view.snap = s;
     atomic_init(&s->owners, 2); /* the caller and the cache */
     atomic_fetch_add(&t->core->owners, 1);
@@ -733,6 +795,145 @@ static inline bool pm_reclaim(pm_tree *t, size_t budget)
     ASSERT(t != NULL);
     (void)budget;
     return false;
+}
+
+/* ---- Lines --------------------------------------------------------------- */
+
+/* Both polls report epoch 0 (mapped only; private storage needs none). */
+static inline bool pm_poll_ok(const pm_core *c)
+{
+    uint64_t e = 1;
+    return !c->mapped || (os_fault_poll(c->backing.fault, &e) == OS_OK && e == 0);
+}
+
+static inline bool pm_lines_before(const pm_view *v, uint64_t off, uint64_t *count)
+{
+    ASSERT(count != NULL && off <= pm_length(v));
+    const pm_core *c = pm_view_core(v);
+    *count = 0;
+    if (!pm_poll_ok(c)) return false;
+    const pm_text *t = pm_view_text(v);
+    uint64_t pos = 0, n = 0;
+    bool exact = true;
+    for (size_t i = 0; i < t->n && pos < off; i++) {
+        piece_span s = t->s[i];
+        uint64_t len = pm_min(s.len, off - pos);
+        uint64_t o = pm_off(s.src);
+        while (len) {
+            uint64_t part = pm_is_add(s.src) || !c->mapped ? len : pm_min(len, PIECE_CHUNK - o % PIECE_CHUNK);
+            if (pm_is_add(s.src) || pm_chunk_known(v, o / PIECE_CHUNK))
+                n += pm_count_nl(v, (s.src & PIECE_SPAN_ADD) | o, part);
+            else
+                exact = false;
+            o += part;
+            pos += part;
+            len -= part;
+        }
+    }
+    if (!pm_poll_ok(c)) return false;
+    *count = n;
+    return exact;
+}
+
+static inline bool pm_lines_start(const pm_view *v, uint64_t line, uint64_t *off, uint64_t *before)
+{
+    ASSERT(off != NULL && before != NULL);
+    *off = 0;
+    *before = 0;
+    if (line == 0) return true;
+    const pm_core *c = pm_view_core(v);
+    if (!pm_poll_ok(c)) return false;
+    const pm_text *t = pm_view_text(v);
+    uint64_t pos = 0, n = 0, at = UINT64_MAX;
+    bool exact = true;
+    for (size_t i = 0; i < t->n && at == UINT64_MAX; i++) {
+        piece_span s = t->s[i];
+        uint64_t len = s.len, o = pm_off(s.src);
+        while (len && at == UINT64_MAX) {
+            uint64_t part = pm_is_add(s.src) || !c->mapped ? len : pm_min(len, PIECE_CHUNK - o % PIECE_CHUNK);
+            if (!pm_is_add(s.src) && !pm_chunk_known(v, o / PIECE_CHUNK)) {
+                at = pos; /* the first unknown part blocks: n < line here */
+                exact = false;
+                break;
+            }
+            for (uint64_t k = 0; k < part; k++) {
+                uint64_t room;
+                const uint8_t *p = pm_at(v, (s.src & PIECE_SPAN_ADD) | (o + k), &room);
+                if (*p == '\n' && ++n == line) {
+                    at = pos + k + 1u;
+                    break;
+                }
+            }
+            o += part;
+            pos += part;
+            len -= part;
+        }
+    }
+    if (!pm_poll_ok(c)) return false;
+    *off = at == UINT64_MAX ? pm_length(v) : at;
+    *before = n;
+    return exact;
+}
+
+static inline bool pm_lines_count(const piece_backing *b, uint64_t first, uint32_t *counts, size_t n)
+{
+    ASSERT(b != NULL && counts != NULL);
+    uint64_t chunks = (b->len + PIECE_CHUNK - 1u) / PIECE_CHUNK;
+    ASSERT(first <= chunks && n <= chunks - first);
+    uint64_t e = 1;
+    if (os_fault_poll(b->fault, &e) != OS_OK || e != 0) return false;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t lo = (first + i) * PIECE_CHUNK, hi = pm_min(lo + PIECE_CHUNK, b->len);
+        uint32_t k = 0;
+        for (uint64_t at = lo; at < hi; at++) k += b->bytes[at] == '\n';
+        counts[i] = k;
+    }
+    e = 1;
+    return os_fault_poll(b->fault, &e) == OS_OK && e == 0;
+}
+
+static inline bool pm_lines_adopt(pm_tree *t, os_fault_id source, uint64_t first, const uint32_t *counts, size_t n)
+{
+    ASSERT(t != NULL && (n == 0 || counts != NULL));
+    pm_core *c = t->core;
+    ASSERT(c->mapped);
+    ASSERT(first <= c->nchunks && n <= c->nchunks - first);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t lo = (first + i) * PIECE_CHUNK;
+        ASSERT(counts[i] <= pm_min(PIECE_CHUNK, c->orig_len - lo));
+    }
+    if (source.slot != c->backing.fault.slot || source.gen != c->backing.fault.gen) return false;
+    if (!pm_poll_ok(c)) return false;
+    bool adds = false;
+    for (size_t i = 0; i < n; i++) {
+        pm_line_chunk *e = &c->table[first + i];
+        if (atomic_load(&e->seq) == 0) adds = true;
+        else if (atomic_load(&e->count) != counts[i]) return false;
+    }
+    if (!adds) return true;
+    uint64_t seq = ++c->adopt_seq;
+    for (size_t i = 0; i < n; i++) {
+        pm_line_chunk *e = &c->table[first + i];
+        if (atomic_load(&e->seq) != 0) continue;
+        atomic_store(&e->count, counts[i]);
+        atomic_store(&e->seq, seq);
+    }
+    return true;
+}
+
+/* Publishing new knowledge stands in for the tree's root replacement: it
+ * invalidates the snapshot cache and ends the live view's revision. */
+static inline piece_err pm_lines_resolve(pm_tree *t, size_t budget, bool *more)
+{
+    ASSERT(t != NULL && more != NULL);
+    (void)budget;
+    if (t->lines_seq < t->core->adopt_seq) {
+        t->lines_seq = t->core->adopt_seq;
+        t->rev++;
+        pm_drop_cache(t);
+    }
+    *more = false;
+    return PIECE_OK;
 }
 
 /* ---- piece.h on top of the model (one TU: tests/piece_model.c) ----------- */
@@ -856,36 +1057,26 @@ void piece_checkpoint_abort(piece_tree *t) { pm_checkpoint_abort(PM_T(t)); }
 piece_err piece_replenish(piece_tree *t) { return pm_replenish(PM_T(t)); }
 bool piece_reclaim(piece_tree *t, size_t budget) { return pm_reclaim(PM_T(t), budget); }
 
-/* Lines: a draft under review, not modelled (v2-0fv.7 §9). */
-#define PM_LINES_NOT_MODELLED 0
+/* Lines (draft section). */
 bool piece_lines_before(const piece_view *v, uint64_t off, uint64_t *count)
 {
-    (void)v, (void)off, (void)count;
-    ASSERT(PM_LINES_NOT_MODELLED);
-    return false;
+    return pm_lines_before(PM_V(v), off, count);
 }
 bool piece_lines_start(const piece_view *v, uint64_t line, uint64_t *off, uint64_t *before)
 {
-    (void)v, (void)line, (void)off, (void)before;
-    ASSERT(PM_LINES_NOT_MODELLED);
-    return false;
+    return pm_lines_start(PM_V(v), line, off, before);
 }
 bool piece_lines_count(const piece_backing *b, uint64_t first, uint32_t *counts, size_t n)
 {
-    (void)b, (void)first, (void)counts, (void)n;
-    ASSERT(PM_LINES_NOT_MODELLED);
-    return false;
+    return pm_lines_count(b, first, counts, n);
 }
-void piece_lines_adopt(piece_tree *t, uint64_t first, const uint32_t *counts, size_t n)
+bool piece_lines_adopt(piece_tree *t, os_fault_id source, uint64_t first, const uint32_t *counts, size_t n)
 {
-    (void)t, (void)first, (void)counts, (void)n;
-    ASSERT(PM_LINES_NOT_MODELLED);
+    return pm_lines_adopt(PM_T(t), source, first, counts, n);
 }
 piece_err piece_lines_resolve(piece_tree *t, size_t budget, bool *more)
 {
-    (void)t, (void)budget, (void)more;
-    ASSERT(PM_LINES_NOT_MODELLED);
-    return PIECE_ERR_NOMEM;
+    return pm_lines_resolve(PM_T(t), budget, more);
 }
 
 size_t piece_app_id_len(void) { return strlen(os_app_id()); }
