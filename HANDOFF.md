@@ -14,7 +14,9 @@ branches: push each at every pause or session end; delete the remote branch once
   - Muse's 5-hour window counts. If it is ahead of pace at a Muse event, wip-commit the worker, push the wip branch,
     and resume it at the first event after the window is at or behind pace. No polling.
   - Serial chains:
-    - Codex: N2 (v2-zh6), then EDIT-CORE (developed after N2, v2-bkz and the piece reader land; it lands after 2b-1,
+    - Codex: N2 (LANDED 1.27), then Astra's N2 landing read (docs/reviews/wave1-N2-astra.md), then Astra's minimal
+      L5 spec (docs/decisions/wave1-app-spec.md; PLAN 4.7: app_loop, app_buffers, app_save, app_session, the headless
+      command surface), then EDIT-CORE (developed after N2, v2-bkz and the piece reader land; it lands after 2b-1,
       with reads on the wip).
     - Claude, when room allows: the piece reader bead (reader + erratum (i) + the D1' deletion + the undo_commit
       change; after the advisor signs Astra's D1' text), then 2b-1, 2b-2, 2b-3.
