@@ -13,6 +13,14 @@ branches: push each at every pause or session end; delete the remote branch once
     and decisions; send one message per event that needs the advisor; no acknowledgements.
   - Muse's 5-hour window counts. If it is ahead of pace at a Muse event, wip-commit the worker, push the wip branch,
     and resume it at the first event after the window is at or behind pace. No polling.
+  - Routing (advisor, 2026-11-24): a source-only Astra read of the pure journal reader (N2: journal corruption, witness
+    CRCs) was cut at its last line by the Codex filter. The subject is enough; execution is not needed. Reads of journal
+    recovery, repair and file fault paths go to Claude or Muse from the start.
+  - Current jobs:
+    - Muse: one job for the N2 fixes v2-c42/o0t/kbj/23u (Astra's inputs are the tests; the oracle is taught each case).
+      Then a FRESH Muse thread does the adversarial L2-1 source read (mutation reds by name). Then the advisor's owner
+      read of L2-1, and L2-1 lands (review/l2-1 1ce753a, lanes green).
+    - Astra: the L5 spec. Next on Codex after L2-1 lands: v2-677 permission bits (Sol; fix in os_file_copy_metadata).
   - Serial chains:
     - Codex: N2 (LANDED 1.27), then Astra's N2 landing read (docs/reviews/wave1-N2-astra.md), then Astra's minimal
       L5 spec (docs/decisions/wave1-app-spec.md; PLAN 4.7: app_loop, app_buffers, app_save, app_session, the headless
