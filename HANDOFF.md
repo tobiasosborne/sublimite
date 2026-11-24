@@ -36,7 +36,7 @@ to). The run takes ~137 s (parallel displays :190–:195): ask the Paris-talk th
    reds M4–M6. Wire unchanged (no amendment). Built on the piece model; after 7b lands it moves to the real tree
    (tests/piece_model.c is deleted in 7b round 2: the harness drives the pm_* model side by side).
 3. v2-0fv.21 os export deletion + nm gate (Sol thread "v2-0fv.21 os export deletion + nm gate (Sol)", worktree
-   /home/tobias/.t3/worktrees/sublimite-v2/t3-f672f5f8-c90c59b8e9d757d9, branch t3/audit-os-exports): paused; see its
+   /home/tobias/.t3/worktrees/sublimite-v2/t3-f672f5f8-c90c59b8e9d757d9, branch t3/audit-os-exports, wip 17bb383): paused; see its
    decision file docs/decisions/v2-0fv.21.md in that checkout for done/missing (gate check_exports: ok on its tree).
 
 ### Owed, in order
