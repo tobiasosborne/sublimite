@@ -18,6 +18,7 @@
  *     issues only valid calls. */
 #include "os/os.h"
 
+#include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -298,7 +299,7 @@ static void op_read(void)
             must_read = false;
             break;
         case OS_E_IO:
-            CHECK(ref_malformed && next == ref_n && os_native_error() == 0);
+            CHECK(ref_malformed && next == ref_n && errno == 0);
             must_read = true; /* drained */
             break;
         case OS_E_AGAIN:

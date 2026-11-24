@@ -5,6 +5,7 @@
 #include "base/base.h"
 #include "os/os.h"
 
+#include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -118,8 +119,7 @@ int main(void)
     rc = os_unlink_at(&dir, "dst");
     ASSERT(rc == OS_OK);
     os_dir_close(&dir);
-    rc = os_rmdir(root);
-    ASSERT(rc == OS_OK);
+    ASSERT(rmdir(root) == 0);
     puts(all_ok ? "law2_os_persist_test: ok" : "law2_os_persist_test: FAIL");
     return all_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

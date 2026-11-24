@@ -1,5 +1,6 @@
 #include "trace/trace.h"
 
+#include <unistd.h>
 #include <stdlib.h>
 
 static void count_event(const trace_input_rec *rec, void *arg) {
@@ -12,7 +13,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     char path[] = "build/trace-fuzz-XXXXXX";
     int fd = mkstemp(path);
-    ASSERT(fd >= 0 && os_unlink(path) == OS_OK);
+    ASSERT(fd >= 0 && unlink(path) == 0);
     os_file f = os_file_from_fd(fd);
     for (size_t copied = 0; copied < size;) {
         size_t written;

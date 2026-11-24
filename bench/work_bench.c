@@ -2,6 +2,7 @@
 #include "work/work.h"
 #include "trace/trace.h"
 
+#include <sched.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,7 +32,7 @@ static void publish(work_ctx *ctx)
 static void hold_bulk(work_ctx *ctx)
 {
     publish(ctx);
-    while (!work_should_stop(ctx)) os_yield();
+    while (!work_should_stop(ctx)) (void)sched_yield();
 }
 
 static void capture_start(const work_msg *msg, void *arg)
@@ -65,7 +66,7 @@ static bool finish(const work_pool *p, work_handle h)
     uint64_t deadline = os_now_ns() + WAIT_NS;
     while (!work_handle_finished(p, h)) {
         if (os_now_ns() >= deadline) return false;
-        os_yield();
+        (void)sched_yield();
     }
     return true;
 }

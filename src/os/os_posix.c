@@ -1,11 +1,8 @@
 #include "os/os.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/fs.h>
-#include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <stddef.h>
@@ -17,10 +14,7 @@
 #include <sys/eventfd.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/random.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
@@ -73,19 +67,6 @@ static os_err fail(void) { return map_errno(errno); }
 /* An error the layer itself detects: no native code. */
 static os_err fail_with(os_err e) { errno = 0; return e; }
 
-const char *os_err_name(os_err e)
-{
-    /* A char matrix keeps the names in .rodata without pointer relocations. */
-    static const char names[][sizeof "OS_E_NAMETOOLONG"] = {
-        "OS_OK", "OS_E_NOENT", "OS_E_EXIST", "OS_E_ACCESS", "OS_E_BUSY", "OS_E_LOOP",
-        "OS_E_NOTDIR", "OS_E_ISDIR", "OS_E_XDEV", "OS_E_NOSPC", "OS_E_NAMETOOLONG",
-        "OS_E_INVAL", "OS_E_NOTSUP", "OS_E_AGAIN", "OS_E_TIMEDOUT", "OS_E_NOMEM",
-        "OS_E_RANGE", "OS_E_IO", "OS_E_INTR", "OS_E_REFUSED", "OS_E_OVERFLOW"};
-    unsigned i = (unsigned)e;
-    return i < sizeof names / sizeof names[0] ? names[i] : "OS_E_?";
-}
-int os_native_error(void) { return errno; }
-
 _Noreturn void os_assert_fail(const char *file, int line, const char *expr)
 {
     /* Async-signal-safe: digits by hand, then write(2) and abort(3). */
@@ -130,23 +111,12 @@ static uint64_t clock_ns(clockid_t id)
     return (uint64_t)ts.tv_sec * NS_PER_SEC + (uint64_t)ts.tv_nsec;
 }
 uint64_t os_now_ns(void) { return clock_ns(CLOCK_MONOTONIC); }
-uint64_t os_thread_cpu_ns(void) { return clock_ns(CLOCK_THREAD_CPUTIME_ID); }
-uint64_t os_thread_cpu_resolution_ns(void)
-{
-    struct timespec r;
-    if (clock_getres(CLOCK_THREAD_CPUTIME_ID, &r) != 0 || r.tv_sec < 0) return 1;
-    uint64_t ns = (uint64_t)r.tv_sec * NS_PER_SEC + (uint64_t)r.tv_nsec;
-    return ns ? ns : 1;
-}
-uint64_t os_slice_ns(void) { return os_thread_cpu_ns(); }
-uint64_t os_wall_ns(void) { return clock_ns(CLOCK_REALTIME); }
 void os_sleep_ns(uint64_t ns)
 {
     /* nanosleep writes the time left on EINTR: restart with it. */
     struct timespec t = {(time_t)(ns / NS_PER_SEC), (long)(ns % NS_PER_SEC)};
     while (nanosleep(&t, &t) != 0 && errno == EINTR) {}
 }
-void os_yield(void) { (void)sched_yield(); }
 
 /* ---- threads, mutex, condition, once ----------------------------------- */
 static void *thread_main(void *arg)
@@ -181,21 +151,6 @@ os_err os_mutex_init(os_mutex *m)
 void os_mutex_destroy(os_mutex *m) { (void)pthread_mutex_destroy(&m->m); }
 void os_mutex_lock(os_mutex *m) { (void)pthread_mutex_lock(&m->m); }
 void os_mutex_unlock(os_mutex *m) { (void)pthread_mutex_unlock(&m->m); }
-
-os_err os_rmutex_init(os_rmutex *m)
-{
-    pthread_mutexattr_t attr;
-    int rc = pthread_mutexattr_init(&attr);
-    if (rc) { errno = rc; return fail(); }
-    rc = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    if (!rc) rc = pthread_mutex_init(&m->m, &attr);
-    (void)pthread_mutexattr_destroy(&attr);
-    if (rc) { errno = rc; return fail(); }
-    return OS_OK;
-}
-void os_rmutex_destroy(os_rmutex *m) { (void)pthread_mutex_destroy(&m->m); }
-void os_rmutex_lock(os_rmutex *m) { (void)pthread_mutex_lock(&m->m); }
-void os_rmutex_unlock(os_rmutex *m) { (void)pthread_mutex_unlock(&m->m); }
 
 os_err os_cond_init(os_cond *c)
 {
@@ -322,10 +277,6 @@ static os_err file_open_at(os_file *out, int dirfd, const char *path, unsigned f
     out->fd = fd;
     return OS_OK;
 }
-os_err os_file_open(os_file *out, const char *path, unsigned flags)
-{
-    return file_open_at(out, AT_FDCWD, path, flags);
-}
 os_err os_file_open_at(os_file *out, const os_dir *dir, const char *name, unsigned flags)
 {
     if (bad_name(name)) {
@@ -349,13 +300,6 @@ void os_file_close(os_file *f)
     /* Never retried: Linux releases the descriptor even on EINTR. */
     if (f && f->fd >= 0) { int e = errno; (void)close(f->fd); errno = e; }
     if (f) f->fd = -1;
-}
-os_err os_file_dup(os_file *out, const os_file *f)
-{
-    int fd;
-    RETRY(fd, fcntl(f->fd, F_DUPFD_CLOEXEC, 0));
-    out->fd = fd;
-    return fd < 0 ? fail() : OS_OK;
 }
 
 os_err os_file_read(os_file *f, void *buf, size_t n, size_t *got)
@@ -433,32 +377,6 @@ os_err os_file_sync_data(os_file *f)
     RETRY(rc, fdatasync(f->fd));
     return rc ? fail() : OS_OK;
 }
-os_err os_file_set_mode(os_file *f, uint32_t perm)
-{
-    int rc;
-    RETRY(rc, fchmod(f->fd, (mode_t)(perm & 07777u)));
-    return rc ? fail() : OS_OK;
-}
-os_err os_file_clone(os_file *dst, const os_file *src)
-{
-    int rc;
-    RETRY(rc, ioctl(dst->fd, FICLONE, src->fd));
-    if (!rc) return OS_OK;
-    /* No reflink here: different filesystems, or one without the feature. */
-    if (errno == EOPNOTSUPP || errno == EXDEV || errno == EINVAL || errno == ENOTTY ||
-        errno == ENOSYS) return OS_E_NOTSUP;
-    return fail();
-}
-os_err os_file_to_stdio(os_file *f, const char *mode, FILE **out)
-{
-    *out = NULL;
-    if (!mode || f->fd < 0) return fail_with(OS_E_INVAL);
-    FILE *fp = fdopen(f->fd, mode);
-    if (!fp) return fail();
-    *out = fp;
-    f->fd = -1;   /* the FILE owns the descriptor now */
-    return OS_OK;
-}
 
 static os_err lock_fd(int fd, os_lock kind)
 {
@@ -482,7 +400,6 @@ static void unlock_fd(int fd)
 }
 os_err os_file_try_lock(os_file *f, os_lock kind) { return lock_fd(f->fd, kind); }
 void os_file_unlock(os_file *f) { unlock_fd(f->fd); }
-int os_file_fd(const os_file *f) { return f->fd; }
 os_file os_file_from_fd(int fd) { os_file f = {fd}; return f; }
 
 /* ---- directories -------------------------------------------------------- */
@@ -494,7 +411,7 @@ static os_err dir_open_at(os_dir *out, int dirfd, const char *path)
     int fd;
     RETRY(fd, openat(dirfd, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     /* Anonymous creation only needs search/create permission. Keep the usual
-     * readable reference whenever possible, so sync and flock stay unchanged. */
+     * readable reference whenever possible, so sync can use it directly. */
     if (fd < 0 && errno == EACCES)
         RETRY(fd, openat(dirfd, path, O_PATH | O_DIRECTORY | O_CLOEXEC));
     if (fd < 0) return fail();
@@ -504,14 +421,6 @@ static os_err dir_open_at(os_dir *out, int dirfd, const char *path)
 os_err os_dir_open(os_dir *out, const char *path)
 {
     return dir_open_at(out, AT_FDCWD, path);
-}
-os_err os_dir_open_at(os_dir *out, const os_dir *dir, const char *name)
-{
-    if (bad_name(name)) {
-        out->fd = -1;
-        return fail_with(OS_E_INVAL);
-    }
-    return dir_open_at(out, dir->fd, name);
 }
 void os_dir_close(os_dir *d)
 {
@@ -539,14 +448,6 @@ os_err os_dir_sync(os_dir *d)
     RETRY(synced, fsync(d->fd));
     return synced ? fail() : OS_OK;
 }
-/* flock on the directory inode itself (journal_retire_directory's guard). */
-os_err os_dir_try_lock(os_dir *d, os_lock kind)
-{
-    os_err rc = readable_directory(d);
-    return rc != OS_OK ? rc : lock_fd(d->fd, kind);
-}
-void os_dir_unlock(os_dir *d) { unlock_fd(d->fd); }
-int os_dir_fd(const os_dir *d) { return d->fd; }
 
 os_err os_stat_at(const os_dir *dir, const char *name, unsigned flags, os_stat *st)
 {
@@ -568,39 +469,11 @@ os_err os_stat_path(const char *path, unsigned flags, os_stat *st)
     from_stat(st, &s);
     return OS_OK;
 }
-os_err os_mkdir_at(const os_dir *dir, const char *name)
-{
-    if (bad_name(name)) return fail_with(OS_E_INVAL);
-    int rc;
-    RETRY(rc, mkdirat(dir->fd, name, 0700));
-    return rc ? fail() : OS_OK;
-}
-os_err os_mkdir(const char *path)
-{
-    if (!path) return fail_with(OS_E_INVAL);
-    int rc;
-    RETRY(rc, mkdir(path, 0700));
-    return rc ? fail() : OS_OK;
-}
-os_err os_rmdir(const char *path)
-{
-    if (!path) return fail_with(OS_E_INVAL);
-    int rc;
-    RETRY(rc, rmdir(path));
-    return rc ? fail() : OS_OK;
-}
 os_err os_unlink_at(const os_dir *dir, const char *name)
 {
     if (bad_name(name)) return fail_with(OS_E_INVAL);
     int rc;
     RETRY(rc, unlinkat(dir->fd, name, 0));
-    return rc ? fail() : OS_OK;
-}
-os_err os_unlink(const char *path)
-{
-    if (!path) return fail_with(OS_E_INVAL);
-    int rc;
-    RETRY(rc, unlink(path));
     return rc ? fail() : OS_OK;
 }
 static os_err rename_fds(int from_fd, const char *from, int to_fd, const char *to, os_rename_mode mode)
@@ -626,45 +499,6 @@ os_err os_rename_at(const os_dir *from_dir, const char *from, const os_dir *to_d
     if (bad_name(from) || bad_name(to)) return fail_with(OS_E_INVAL);
     return rename_fds(from_dir->fd, from, to_dir->fd, to, mode);
 }
-os_err os_rename(const char *from, const char *to, os_rename_mode mode)
-{
-    if (!from || !to) return fail_with(OS_E_INVAL);
-    return rename_fds(AT_FDCWD, from, AT_FDCWD, to, mode);
-}
-
-os_err os_dir_iter_open(os_dir_iter *it, const os_dir *dir)
-{
-    it->dir = NULL;
-    /* A fresh description of the same directory: its own cursor. */
-    int fd;
-    RETRY(fd, openat(dir->fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (fd < 0) return fail();
-    DIR *d = fdopendir(fd);
-    if (!d) { int e = errno; (void)close(fd); errno = e; return fail(); }
-    it->dir = d;
-    return OS_OK;
-}
-os_err os_dir_next(os_dir_iter *it, const char **name)
-{
-    *name = NULL;
-    for (;;) {
-        errno = 0;
-        struct dirent *e = readdir(it->dir);
-        if (!e) {
-            if (errno == EINTR) continue;
-            return errno ? fail() : OS_OK;
-        }
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        *name = e->d_name;
-        return OS_OK;
-    }
-}
-void os_dir_rewind(os_dir_iter *it) { rewinddir(it->dir); }
-void os_dir_iter_close(os_dir_iter *it)
-{
-    if (it->dir) (void)closedir(it->dir);
-    it->dir = NULL;
-}
 
 /* ---- paths and well-known directories ---------------------------------- */
 bool os_path_is_absolute(const char *path) { return path && path[0] == '/'; }
@@ -674,13 +508,6 @@ os_err os_path_canonical(const char *path, char *out, size_t cap)
     if (!path) return fail_with(OS_E_INVAL);
     if (!realpath(path, tmp)) return fail();
     return copy_out(out, cap, tmp, strlen(tmp));
-}
-os_err os_host_name(char *out, size_t cap)
-{
-    if (!out || !cap) return fail_with(OS_E_INVAL);
-    if (gethostname(out, cap)) return errno == ENAMETOOLONG ? OS_E_RANGE : fail();
-    if (!memchr(out, 0, cap)) return fail_with(OS_E_RANGE);
-    return OS_OK;
 }
 os_err os_cwd(char *out, size_t cap)
 {
@@ -719,14 +546,6 @@ os_err os_app_dir(os_app_dir_kind kind, char *out, size_t cap)
     if (!os_path_is_absolute(root)) return fail_with(OS_E_NOENT);
     return root_join(out, cap, root, fallback);
 }
-os_err os_temp_dir(char *out, size_t cap)
-{
-    const char *t = getenv("TMPDIR");
-    if (!os_path_is_absolute(t)) t = "/tmp";
-    size_t len = strlen(t);
-    while (len > 1 && t[len - 1] == '/') len--;
-    return copy_out(out, cap, t, len);
-}
 os_err os_env_get(const char *name, char *out, size_t cap)
 {
     if (!name) return fail_with(OS_E_INVAL);
@@ -737,7 +556,6 @@ os_err os_env_get(const char *name, char *out, size_t cap)
 
 /* ---- memory ------------------------------------------------------------- */
 size_t os_page_size(void) { return (size_t)getpagesize(); }
-size_t os_map_granularity(void) { return os_page_size(); }
 uint64_t os_phys_mem_bytes(void)
 {
     long pages = sysconf(_SC_PHYS_PAGES);
@@ -748,7 +566,7 @@ os_err os_map_file(os_map *out, const os_file *f, uint64_t offset, size_t len)
     out->addr = NULL;
     out->len = 0;
     if (!len || len > (uint64_t)INT64_MAX || offset > (uint64_t)INT64_MAX - len ||
-        offset % os_map_granularity())
+        offset % os_page_size())
         return fail_with(OS_E_INVAL);
     void *p = mmap(NULL, len, PROT_READ, MAP_PRIVATE, f->fd, (off_t)offset);
     if (p == MAP_FAILED) return fail();
@@ -763,41 +581,16 @@ void os_unmap(os_map *m)
     m->addr = NULL;
     m->len = 0;
 }
-void os_map_prefetch(const os_map *m, size_t off, size_t len)
-{
-    if (!m->addr || !len || off >= m->len) return;
-    if (len > m->len - off) len = m->len - off;
-    uintptr_t page = os_page_size(), at = (uintptr_t)m->addr + off;
-    uintptr_t start = at & ~(page - 1u);
-    int e = errno;
-    (void)madvise((void *)start, len + (at - start), MADV_WILLNEED);
-    errno = e;
-}
-static bool page_range(const void *addr, size_t len)
-{
-    size_t page = os_page_size();
-    return addr && len && ((uintptr_t)addr % page) == 0 && len % page == 0;
-}
 os_err os_vm_reserve(void **out, size_t len)
 {
     *out = NULL;
     if (!len || len % os_page_size()) return fail_with(OS_E_INVAL);
     void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return fail();
-    /* Decommit is page-granular. Opt out of transparent huge pages at map
-     * time so MADV_DONTNEED can return the backing at that granularity. */
+    /* Keep lazy backing page-granular by opting out of transparent huge pages. */
     (void)madvise(p, len, MADV_NOHUGEPAGE);
     *out = p;
     return OS_OK;
-}
-os_err os_vm_commit(void *addr, size_t len)
-{
-    return page_range(addr, len) ? OS_OK : fail_with(OS_E_INVAL);
-}
-os_err os_vm_decommit(void *addr, size_t len)
-{
-    if (!page_range(addr, len)) return fail_with(OS_E_INVAL);
-    return madvise(addr, len, MADV_DONTNEED) ? fail() : OS_OK;
 }
 void os_vm_release(void *addr, size_t len)
 {
@@ -1134,31 +927,6 @@ void os_fault_test_next_gen(uint64_t next)
 }
 #endif
 
-/* ---- random ------------------------------------------------------------- */
-os_err os_random(void *buf, size_t n)
-{
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = getrandom((unsigned char *)buf + got, n - got, 0);
-        if (r < 0) { if (errno == EINTR) continue; return fail(); }
-        got += (size_t)r;
-    }
-    return OS_OK;
-}
-
-/* ---- descriptor limit ---------------------------------------------------- */
-os_err os_fd_limit_raise(uint64_t *soft)
-{
-    struct rlimit now;
-    if (getrlimit(RLIMIT_NOFILE, &now)) return fail();
-    if (soft) *soft = (uint64_t)now.rlim_cur;
-    if (now.rlim_cur == now.rlim_max) return OS_OK;
-    /* Linux already applies the kernel ceiling to the hard limit. */
-    now.rlim_cur = now.rlim_max;
-    if (setrlimit(RLIMIT_NOFILE, &now)) return fail();
-    if (soft) *soft = (uint64_t)now.rlim_cur;
-    return OS_OK;
-}
 
 /* ---- local streams (v2-0fv.13) ----------------------------------------- */
 uint32_t os_user_id(void) { return (uint32_t)getuid(); }

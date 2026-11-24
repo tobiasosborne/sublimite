@@ -7,6 +7,7 @@
 #include "base/base.h"
 #include "os/os.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 /* The OS_TEST_HOOKS variant of os_posix.c (A15; tests/lanes.mk). */

@@ -1,4 +1,4 @@
-#include <stdio.h>
+#include <stdlib.h>
 
-/* fdopen carries two grants (os and vendor_ts); each module passes on its own line. */
-FILE *ts_probe_stream(int fd) { return fdopen(fd, "a"); }
+/* Each module imports abort through its own grant. */
+void ts_probe_abort(void) { abort(); }

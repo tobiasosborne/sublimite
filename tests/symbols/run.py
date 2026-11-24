@@ -53,7 +53,7 @@ CASES = (
          ('{a}/layer1.a(src/piece/piece.o): error: [restricted] piece imports read, granted only to os',
           '{a}/layer5.a(src/app/app.o): error: [restricted] app imports malloc, granted only to vendor_ts')),
     Case('granted', {0: ('os',), 4: ('vendor/tree-sitter/lib/src',)}, (),
-         {'src/os/os.o': ('read', 'fdopen'), 'vendor/tree-sitter/lib/src/lib.o': ('fdopen',)}),
+         {'src/os/os.o': ('read', 'abort'), 'vendor/tree-sitter/lib/src/lib.o': ('abort',)}),
     Case('hl_heap', {4: ('hl',)},
          ('{a}/layer4.a(src/hl/hl.o): error: [restricted] hl imports malloc, granted only to vendor_ts',)),
     Case('vendor', {4: ('hl', 'vendor/tree-sitter/lib/src', 'vendor/tree-sitter-probe/src')}, (),

@@ -1,0 +1,24 @@
+# One reservation per line: SYMBOL BEAD-OR-BRIEF # reason
+# Use the filename stem of the brief or decision that names the future caller.
+os_app_dir          L2-2b-journal-runtime # Open the journal under the app data root (wave0-contract-design §1).
+os_dir_sync         L2-1-file # Persist the save rename and expose the dirsync failure seam.
+os_fault_register   L2-1-file # Register a mapped backing before publication.
+os_fault_retire     L2-1-file # Retire the mapping's registration before unmapping.
+os_file_copy_metadata L2-1-file # Copy metadata onto the replacement file.
+os_file_open_anon   L2-1-file # File acquisition takes over anonymous reload storage (wave1-L2-L5-harvest §1.3, §3.3).
+os_file_pwrite      L2-2b-journal-runtime # Journal safety suite's positioned-write seam (wave1-L2-L5-harvest §0.3).
+os_file_pwrite_once L2-2b-journal-runtime # One write attempt per record on the typing path.
+os_file_set_size    L2-2b-journal-runtime # Repair a verified torn tail in place.
+os_file_sync        L2-1-file # Flush the save temp before PREPARED and expose the fsync failure seam.
+os_file_sync_data   L2-2b-journal-runtime # Journal safety suite's data-sync seam (wave1-L2-L5-harvest §0.3).
+os_map_file         L2-1-file # Map files at or above the copy threshold.
+os_phys_mem_bytes   L2-1-file # Derive the file copy threshold from physical memory (wave1-L2-L5-harvest §1.2).
+os_rename_at        L2-1-file # Install the save temp atomically with NOREPLACE for an absent target.
+os_unmap            L2-1-file # Release unpublished mappings and final mapped backings.
+os_wake_fd          v2-0fv.13 # Add the work-pool wake descriptor to the application loop's root wait set.
+os_watch_add        L2-1-file # Watch the opened file's parent directory.
+os_watch_close      L2-1-file # Release the owned watch queue.
+os_watch_fd         L2-1-file # Register watch readiness with the wait set.
+os_watch_init       L2-1-file # Initialize the file owner's watch queue.
+os_watch_read       L2-1-file # Consume change notifications for the watched entries.
+os_watch_remove     L2-1-file # Release a file's hold on the parent watch.

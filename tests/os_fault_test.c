@@ -11,6 +11,9 @@
  * wrapper passes through until a case arms it. */
 #include "os/os.h"
 
+#include <stdio.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <errno.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -31,9 +34,9 @@ extern char **environ;
 static void expect(os_err got, os_err want, const char *expression, int line)
 {
     if (got != want) {
-        int native = os_native_error();
-        fprintf(stderr, "%s -> %s (native %d), expected %s\n", expression, os_err_name(got), native,
-                os_err_name(want));
+        int native = errno;
+        fprintf(stderr, "%s -> %d (native %d), expected %d\n", expression, got, native,
+                want);
         os_assert_fail(__FILE__, line, expression);
     }
 }
@@ -474,7 +477,7 @@ static void case_assert(void)
     OK(os_dir_open(&d, work_root));
     os_file f = OS_FILE_INIT;
     OK(os_file_open_at(&f, &d, "stderr", OS_OPEN_WRITE | OS_OPEN_CREATE | OS_OPEN_EXCL));
-    ASSERT(dup2(os_file_fd(&f), STDERR_FILENO) == STDERR_FILENO);
+    ASSERT(dup2(f.fd, STDERR_FILENO) == STDERR_FILENO);
     ASSERT(prior_calls == 1); /* No prior handler ran in this child. */
     exit(EXIT_FAILURE);
 }
@@ -573,7 +576,7 @@ static void retire_body(void *arg)
 static void spin_until_gone(os_fault_id id)
 {
     uint64_t e;
-    while (os_fault_poll(id, &e) == OS_OK) os_yield();
+    while (os_fault_poll(id, &e) == OS_OK) (void)sched_yield();
 }
 
 typedef struct observer {
@@ -612,7 +615,7 @@ static void case_race_reuse(void)
     os_thread t;
     OK(os_thread_start(&t, observe_body, &o));
     barrier_wait(&start);
-    while (atomic_load(&o.hits) == 0 && !atomic_load(&o.bad)) os_yield(); /* polled while live */
+    while (atomic_load(&o.hits) == 0 && !atomic_load(&o.bad)) (void)sched_yield(); /* polled while live */
     os_fault_retire(ia);
     expect_gone(ia); /* After completed invalidation, while the slot is free. */
     os_fault_id ib = registered(&b);
@@ -658,7 +661,7 @@ typedef struct admit_job { const os_map *view; _Atomic bool *ready; unsigned got
 static void admit_body(void *arg)
 {
     admit_job *j = arg;
-    while (!atomic_load_explicit(j->ready, memory_order_relaxed)) os_yield();
+    while (!atomic_load_explicit(j->ready, memory_order_relaxed)) (void)sched_yield();
     j->got = touch(j->view, 1);
 }
 static void case_race_admission(void)
@@ -695,7 +698,7 @@ static void case_race_departure(void)
     depart_job j = {.view = &a, .got = 1};
     os_thread t;
     OK(os_thread_start(&t, depart_body, &j));
-    while (!atomic_load_explicit(&j.done, memory_order_relaxed)) os_yield();
+    while (!atomic_load_explicit(&j.done, memory_order_relaxed)) (void)sched_yield();
     os_fault_retire(ia);             /* Zero count at close. */
     os_fault_id ib = registered(&b); /* Same slot, new base and len. */
     OK(os_thread_join(&t));
@@ -729,7 +732,7 @@ static void start_retire(os_thread *t, retire_job *r, os_fault_id id)
 }
 static void spin_until_waiting(unsigned entries, const retire_job *r)
 {
-    while (atomic_load(&n_wait_entry) < entries && !atomic_load(&r->done)) os_yield();
+    while (atomic_load(&n_wait_entry) < entries && !atomic_load(&r->done)) (void)sched_yield();
     ASSERT(!atomic_load(&r->done));
 }
 
@@ -1058,17 +1061,18 @@ int main(int argc, char **argv)
             char path[OS_PATH_MAX], text[512] = {0};
             n = snprintf(path, sizeof path, "%s/stderr", dir);
             ASSERT(n >= 0 && (size_t)n < sizeof path);
-            os_file f = OS_FILE_INIT;
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            ASSERT(fd >= 0);
+            os_file f = os_file_from_fd(fd);
             size_t got = 0;
-            OK(os_file_open(&f, path, OS_OPEN_READ));
             OK(os_file_pread(&f, text, sizeof text - 1, 0, &got));
             os_file_close(&f);
             fprintf(stderr, "os_fault_test: %s child wrote: %s", cases[i].name, text);
             ASSERT(strncmp(text, "tests/os_fault_test.c:", sizeof "tests/os_fault_test.c:" - 1) == 0);
             ASSERT(strstr(text, cases[i].stderr_has) != NULL);
-            OK(os_unlink(path));
+            ASSERT(unlink(path) == 0);
         }
-        OK(os_rmdir(dir));
+        ASSERT(rmdir(dir) == 0);
     }
     puts("os_fault_test: ok");
     return EXIT_SUCCESS;

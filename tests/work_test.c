@@ -3,6 +3,7 @@
 #include "trace/trace.h"
 #include "assert_death.h"
 
+#include <sched.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -533,7 +534,7 @@ static void job_stream(work_ctx *ctx)
         for (size_t byte = 0; byte < sizeof m.data; byte++) m.data[byte] = payload_byte(f->id, seq, byte);
         while (!work_publish(ctx, &m)) {
             if (work_should_stop(ctx)) return;
-            os_yield();
+            (void)sched_yield();
         }
     }
 }
@@ -601,7 +602,7 @@ static void test_full_wrap(void)
     work_handle h = work_submit(&pool, (work_job){job_full, &f, 0, WORK_BULK});
     CHECK(h.epoch);
     uint64_t end = os_now_ns() + 5000000000ull;
-    while (!atomic_load_explicit(&f.attempted, memory_order_relaxed) && os_now_ns() < end) os_yield();
+    while (!atomic_load_explicit(&f.attempted, memory_order_relaxed) && os_now_ns() < end) (void)sched_yield();
     CHECK(atomic_load_explicit(&f.attempted, memory_order_relaxed));
     CHECK(atomic_load_explicit(&pool.dropped_full, memory_order_relaxed) == 1);
     collection c = {0};
@@ -645,7 +646,7 @@ static void test_state_machine(void)
             handles[index] = work_submit(&pool, (work_job){job_maybe_pub, &fixtures[index], step, (random_step(&rng) & 1u) ? WORK_BULK : WORK_RASTER});
         }
         (void)work_mailbox_drain_bounded(&pool, discard, NULL, random_step(&rng) % 8u, 0);
-        if (!(step % 32u)) os_yield();
+        if (!(step % 32u)) (void)sched_yield();
     }
     work_pool_shutdown(&pool);
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
@@ -676,7 +677,7 @@ static void test_trace_pool_lifetimes(void)
 
     char path[] = "build/work-trace-XXXXXX";
     int fd = mkstemp(path);
-    ASSERT(fd >= 0 && os_unlink(path) == OS_OK);
+    ASSERT(fd >= 0 && unlink(path) == 0);
     os_file file = os_file_from_fd(fd);
     ASSERT(trace_dump(&file) == 0);
     trace_loaded loaded;

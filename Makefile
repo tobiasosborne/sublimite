@@ -370,17 +370,20 @@ check-layers: check-suites $(LAYER_TEST_BINS) $(LAYER_L5_BIN)
 	@$(call run_test_binaries,$(LAYER_TEST_BINS) $(LAYER_L5_BIN)); \
 	echo "check-layers: $(words $(LAYER_TEST_BINS) $(LAYER_L5_BIN)) isolated layer links passed (L0-L4 tests, L5 via main.o)"
 
-# Link-level module DAG. Use the same member order as the archive recipes.
+# Link-level symbol checks. Use the same member order as the archive recipes.
 symbol_layer_libs := $(foreach l,$(LAYERS),$($(l)_LIB))
+symbol_inputs = --nm '$(or $(NM),nm)' --module-map $(LAYER_MODULES) --main $(B)/rel/src/main.o \
+    $(foreach l,$(LAYERS),--archive $(patsubst L%,%,$(l)) $(call lib_of,rel,$(l)) \
+        $(patsubst $(B)/rel/%,%,$($(l)_OBJ_rel)))
 
-.PHONY: check-symbols check-module-ldlibs
-check-lints: check-symbols
+.PHONY: check-symbols check-exports check-module-ldlibs
+check-lints: check-symbols check-exports
 check-symbols: $(call libs_desc,rel) $(B)/rel/src/main.o
-	python3 tools/check_symbols.py --nm '$(or $(NM),nm)' --module-map $(LAYER_MODULES) \
-	    --layer-libs $(symbol_layer_libs) --main $(B)/rel/src/main.o \
-	    $(foreach l,$(LAYERS),--archive $(patsubst L%,%,$(l)) $(call lib_of,rel,$(l)) \
-	        $(patsubst $(B)/rel/%,%,$($(l)_OBJ_rel)))
+	python3 tools/check_symbols.py $(symbol_inputs) --layer-libs $(symbol_layer_libs)
 	+$(MAKE) --no-print-directory -f Makefile -f tests/symbols/fixtures.mk check-symbol-fixtures
+
+check-exports: $(call libs_desc,rel) $(B)/rel/src/main.o
+	python3 -B tools/check_exports.py $(symbol_inputs) --module os
 
 $(LAYER_TEST_BINS) $(LAYER_L5_BIN): | check-module-ldlibs
 check-module-ldlibs:

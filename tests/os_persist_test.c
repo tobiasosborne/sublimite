@@ -7,6 +7,7 @@
 #include "assert_death.h"
 #include "os/os.h"
 
+#include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -28,8 +29,8 @@ static void check(bool ok, const char *expression, int line)
 static void expect(os_err got, os_err want, const char *expression, int line)
 {
     if (got != want) {
-        fprintf(stderr, "os_persist_test.c:%d: FAIL %s -> %s (native %d), expected %s\n", line,
-                expression, os_err_name(got), os_native_error(), os_err_name(want));
+        fprintf(stderr, "os_persist_test.c:%d: FAIL %s -> %d (native %d), expected %d\n", line,
+                expression, got, errno, want);
         exit(EXIT_FAILURE);
     }
 }
@@ -162,7 +163,7 @@ static void make_dir(const char *leaf)
 {
     char p[OS_PATH_MAX];
     path_of(p, leaf);
-    OK(os_mkdir(p));
+    CHECK(mkdir(p, 0700) == 0);
 }
 static void make_file(const char *leaf, const char *bytes)
 {
@@ -179,13 +180,13 @@ static void move(const char *from, const char *to)
     char a[OS_PATH_MAX], b[OS_PATH_MAX];
     path_of(a, from);
     path_of(b, to);
-    OK(os_rename(a, b, OS_RENAME_REPLACE));
+    CHECK(rename(a, b) == 0);
 }
 static void remove_leaf(const char *leaf)
 {
     char p[OS_PATH_MAX];
     path_of(p, leaf);
-    OK(os_unlink(p));
+    CHECK(unlink(p) == 0);
 }
 
 /* ---- the watch: drain and compare per id --------------------------------- */
@@ -457,8 +458,8 @@ static void case_watch_capacity(void)
     remove_leaf("a/1");
     remove_leaf("a/2");
     remove_leaf("b/x");
-    OK(os_rmdir(a));
-    OK(os_rmdir(b));
+    CHECK(rmdir(a) == 0);
+    CHECK(rmdir(b) == 0);
 }
 
 /* A real queue overflow: one more record than the kernel queues
@@ -510,7 +511,7 @@ static void case_watch_overflow(void)
     CHECK(rmdir(sub) == 0);
     os_watch_remove(&w, io);
     os_watch_close(&w);
-    OK(os_rmdir(o));
+    CHECK(rmdir(o) == 0);
 }
 
 static void case_watch_faults(void)
@@ -519,7 +520,7 @@ static void case_watch_faults(void)
     os_watch w = OS_WATCH_INIT;
     inject(W_INIT, EMFILE, 1, -1);
     EXPECT(os_watch_init(&w, slots, 2), OS_E_IO);
-    CHECK(os_native_error() == EMFILE && os_watch_fd(&w) == -1);
+    CHECK(errno == EMFILE && os_watch_fd(&w) == -1);
     FIRED();
     OK(os_watch_init(&w, slots, 2));
     int fd = os_watch_fd(&w);
@@ -541,13 +542,13 @@ static void case_watch_faults(void)
 
     inject(W_READ, EIO, 1, fd);
     EXPECT(os_watch_read(&w, ev, 4, &n), OS_E_IO);
-    CHECK(os_native_error() == EIO && n == 0);
+    CHECK(errno == EIO && n == 0);
     FIRED();
 
     read_forge = 1;
     inject_fd[W_READ] = fd;
     EXPECT(os_watch_read(&w, ev, 4, &n), OS_E_IO);
-    CHECK(os_native_error() == 0 && n == 0 && read_forge == 0);
+    CHECK(errno == 0 && n == 0 && read_forge == 0);
     EXPECT(os_watch_read(&w, ev, 4, &n), OS_E_AGAIN); /* drained */
 
     /* A failed kernel removal leaves nothing for the holder to do. */
@@ -688,7 +689,7 @@ static void case_meta_owner(void)
     fstat_bump_fd = d;
     inject(W_FCHOWN, EPERM, 1, d);
     EXPECT(os_file_copy_metadata(&dst, &src, &scratch), OS_E_ACCESS);
-    CHECK(os_native_error() == EPERM && calls[W_LIST] == 0);
+    CHECK(errno == EPERM && calls[W_LIST] == 0);
     FIRED();
     inject(W_FSTAT, EIO, 1, s);
     EXPECT(os_file_copy_metadata(&dst, &src, &scratch), OS_E_IO);
@@ -715,7 +716,7 @@ static void case_meta_rules(void)
     xset(d, "user.label", "M", 1);
     inject(W_SET, EPERM, 1, d);
     EXPECT(os_file_copy_metadata(&dst, &src, &scratch), OS_E_ACCESS);
-    CHECK(os_native_error() == EPERM);
+    CHECK(errno == EPERM);
     FIRED();
     CHECK(value_is(d, "user.label", "M", 1));
 
@@ -757,12 +758,12 @@ static void case_meta_rules(void)
     FIRED();
     inject(W_GET, EIO, 1, s);
     EXPECT(os_file_copy_metadata(&dst, &src, &scratch), OS_E_IO);
-    CHECK(os_native_error() == EIO);
+    CHECK(errno == EIO);
     FIRED();
     /* A malformed list. */
     list_forge_fd = s;
     EXPECT(os_file_copy_metadata(&dst, &src, &scratch), OS_E_IO);
-    CHECK(os_native_error() == 0 && list_forge_fd == -1);
+    CHECK(errno == 0 && list_forge_fd == -1);
     /* Interrupted calls restart. */
     reset_calls();
     inject(W_SET, EINTR, 1, d);
@@ -799,7 +800,7 @@ int main(int argc, char **argv)
         cases[i].run();
         no_injection_left(__LINE__);
     }
-    OK(os_rmdir(root));
+    CHECK(rmdir(root) == 0);
     puts("os_persist_test: ok");
     return EXIT_SUCCESS;
 }

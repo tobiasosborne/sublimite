@@ -46,21 +46,16 @@ accept4                os # accept a local stream connection, nonblocking and cl
 bind                   os # bind a local stream endpoint name
 chmod                  os # owner-only mode on a pinned socket inode via /proc/self/fd
 abort                  os # the one ASSERT: abort after its fixed message (A15)
-clock_getres           os # POSIX clock resolution
 clock_gettime          os # POSIX clock read
 close                  os # release a file descriptor
-closedir               os # release a directory stream
 connect                os # connect a local stream endpoint
 epoll_create1          os # wait set (the one wait primitive)
 epoll_ctl              os # add, modify and remove wait set members
 epoll_wait             os # wait set readiness with a deadline
 eventfd                os # Linux event counter descriptor
-fchmod                 os # set file permission bits by descriptor
 fchown                 os # give a replacement file the original owner (os_file_copy_metadata)
 fcntl                  os # query descriptor flags or duplicate with close-on-exec
 fdatasync              os # flush file data and required metadata
-fdopen                 os # stdio transfer of an owned descriptor
-fdopendir              os # open an iterator over a directory descriptor
 fgetxattr              os # read an extended attribute value (os_file_copy_metadata)
 flistxattr             os # list extended attribute names (os_file_copy_metadata)
 flock                  os # advisory file or directory lock
@@ -72,21 +67,15 @@ fsync                  os # flush file or directory data and metadata
 ftruncate              os # resize a file
 getcwd                 os # current working directory
 getenv                 os # lookup in the process environment
-gethostname            os # local host name
 getpagesize            os # Linux base page size
-getrandom              os # Linux kernel random bytes
-getrlimit              os # current process resource limits
 getsockopt             os # SO_PEERCRED peer user ID of a local stream
 getuid                 os # real user ID for endpoint names and ownership checks
 inotify_add_watch      os # watch a directory for changes (os_watch_add)
 inotify_init1          os # directory-change watch queue, nonblocking and close-on-exec (os_watch_init)
 inotify_rm_watch       os # end a directory watch at its last hold (os_watch_remove)
-ioctl                  os # Linux FICLONE reflink request
 listen                 os # listen on a bound local stream endpoint
 lstat                  os # path metadata without following the final symlink
 madvise                os # Linux mapping advice
-mkdir                  os # create a directory
-mkdirat                os # directory-relative directory creation
 mmap                   os # create an address space mapping
 munmap                 os # release an address space mapping
 nanosleep              os # relative monotonic sleep
@@ -103,23 +92,15 @@ pthread_mutex_destroy  os # release a mutex
 pthread_mutex_init     os # initialize a mutex
 pthread_mutex_lock     os # acquire a mutex
 pthread_mutex_unlock   os # release a held mutex
-pthread_mutexattr_destroy os # release mutex attributes
-pthread_mutexattr_init os # initialize mutex attributes
-pthread_mutexattr_settype os # select recursive mutex semantics
 pthread_once           os # thread-safe one-time initialization
 pthread_self           os # calling thread identity
 pwrite                 os # positioned file write
 raise                  os # fault chain: re-raise SIGBUS under the default action
 read                   os # sequential read or eventfd drain
-readdir                os # advance a directory stream
 recv                   os # local stream read and peek
 renameat               os # directory-relative atomic rename
 renameat2              os # Linux atomic rename with no replacement
-rewinddir              os # reset a directory stream cursor
-rmdir                  os # remove an empty directory
-sched_yield            os # yield the calling thread
 send                   os # local stream write with MSG_NOSIGNAL
-setrlimit              os # update a process resource limit
 socket                 os # local stream endpoint descriptors
 socketpair             os # connected local stream pair
 stat                   os # path metadata following symlinks
@@ -131,7 +112,6 @@ sem_post               os # last handler leaving a retiring fault slot (async-si
 sem_wait               os # retiring owner waits for admitted fault handlers
 sigaction              os # query, install and reset the SIGBUS action (fault service)
 sigemptyset            os # empty mask for the fault chain's default action
-unlink                 os # remove a non-directory name
 unlinkat               os # directory-relative name removal
 write                  os # sequential write or eventfd signal
 

@@ -4,6 +4,7 @@
  * with a chosen errno before it reaches the kernel. */
 #include "os/os.h"
 
+#include <stdio.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,8 +28,8 @@ static void check(bool ok, const char *expression, int line)
 static void expect(os_err got, os_err want, const char *expression, int line)
 {
     if (got != want) {
-        fprintf(stderr, "os_endpoint_test.c:%d: FAIL %s -> %s (native %d), expected %s\n", line,
-                expression, os_err_name(got), os_native_error(), os_err_name(want));
+        fprintf(stderr, "os_endpoint_test.c:%d: FAIL %s -> %d (native %d), expected %d\n", line,
+                expression, got, errno, want);
         exit(EXIT_FAILURE);
     }
 }
@@ -165,7 +166,7 @@ static void case_sigpipe(void)
     os_stream_close(&b);
     size_t n = 7;
     EXPECT(os_stream_write(&a, "x", 1, &n), OS_E_IO);
-    CHECK(n == 0 && os_native_error() == EPIPE);
+    CHECK(n == 0 && errno == EPIPE);
     CHECK(sigpipes == 0);
     /* The same through a listener-accepted stream. */
     os_listener l = OS_LISTENER_INIT;
@@ -253,7 +254,6 @@ static void case_errors(void)
     char name[64], longname[200];
     os_listener l = OS_LISTENER_INIT, l2 = OS_LISTENER_INIT;
     os_stream c = OS_STREAM_INIT, s = OS_STREAM_INIT;
-    CHECK(strcmp(os_err_name(OS_E_REFUSED), "OS_E_REFUSED") == 0);
     abstract_name(name, sizeof name);
     EXPECT(os_connect_local(&c, NULL, name), OS_E_REFUSED);
     CHECK(os_stream_fd(&c) == -1);
@@ -282,7 +282,7 @@ static void case_errors(void)
     EXPECT(os_stream_peek(&s, buf, 1, &n), OS_E_AGAIN);
     inject(W_RECV, ECONNRESET, 1);
     EXPECT(os_stream_read(&s, buf, sizeof buf, &n), OS_E_IO);
-    CHECK(os_native_error() == ECONNRESET);
+    CHECK(errno == ECONNRESET);
     inject(W_SEND, EAGAIN, 1);
     EXPECT(os_stream_write(&c, "x", 1, &n), OS_E_AGAIN);
     os_stream failed = {123};
@@ -454,7 +454,7 @@ int main(int argc, char **argv)
         printf("os_endpoint_test: %s ok\n", cases[i].name);
         fflush(stdout);
     }
-    OK(os_rmdir(root));
+    CHECK(rmdir(root) == 0);
     puts("os_endpoint_test: ok");
     return EXIT_SUCCESS;
 }

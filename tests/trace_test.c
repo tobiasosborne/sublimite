@@ -1,6 +1,10 @@
 #include "trace/trace.h"
 #include "assert_death.h"
 
+#include <unistd.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +12,7 @@
 static void open_scratch(os_file *f) {
     char path[] = "build/trace-test-XXXXXX";
     int fd = mkstemp(path);
-    ASSERT(fd >= 0 && os_unlink(path) == OS_OK);
+    ASSERT(fd >= 0 && unlink(path) == 0);
     *f = os_file_from_fd(fd);
 }
 
@@ -97,13 +101,13 @@ static void record_first(void *arg) {
     ASSERT(trace_thread_register() == 0);
     trace_record_at(1, TRACE_T0_INGRESS, 1);
     atomic_store_explicit(phase, TRACE_RACE_OCCUPIED, memory_order_relaxed);
-    while (atomic_load_explicit(phase, memory_order_relaxed) != TRACE_RACE_CONTENDED) os_yield();
+    while (atomic_load_explicit(phase, memory_order_relaxed) != TRACE_RACE_CONTENDED) (void)sched_yield();
     trace_thread_release();
 }
 
 static void record_second(void *arg) {
     _Atomic trace_race_phase *phase = arg;
-    while (atomic_load_explicit(phase, memory_order_relaxed) != TRACE_RACE_OCCUPIED) os_yield();
+    while (atomic_load_explicit(phase, memory_order_relaxed) != TRACE_RACE_OCCUPIED) (void)sched_yield();
     ASSERT(trace_thread_register() == 1);
     trace_record_at(2, TRACE_T1_DEQUEUE, 1);
     trace_thread_release();
@@ -112,7 +116,7 @@ static void record_second(void *arg) {
     int slot;
     while ((slot = trace_thread_register()) == 1) {
         trace_thread_release();
-        os_yield();
+        (void)sched_yield();
     }
     ASSERT(slot == 0);
     trace_record_at(3, TRACE_T4_PRESENT_SUBMITTED, 1);
@@ -141,7 +145,7 @@ static void hold_slot(void *arg) {
     ASSERT(trace_thread_register() >= 0);
     atomic_fetch_add_explicit(ready, 1u, memory_order_relaxed);
     /* Hold the slot until the main thread has checked full-pool behavior. */
-    while (atomic_load_explicit(ready, memory_order_relaxed) <= TRACE_MAX_THREADS) os_yield();
+    while (atomic_load_explicit(ready, memory_order_relaxed) <= TRACE_MAX_THREADS) (void)sched_yield();
     trace_thread_release();
 }
 
@@ -152,7 +156,7 @@ static void test_live_capacity(void) {
     for (size_t i = 0; i < TRACE_MAX_THREADS; i++) {
         ASSERT(os_thread_start(&threads[i], hold_slot, &ready) == OS_OK);
     }
-    while (atomic_load_explicit(&ready, memory_order_relaxed) != TRACE_MAX_THREADS) os_yield();
+    while (atomic_load_explicit(&ready, memory_order_relaxed) != TRACE_MAX_THREADS) (void)sched_yield();
     ASSERT(trace_thread_register() == -1);
     atomic_fetch_add_explicit(&ready, 1u, memory_order_relaxed);
     for (size_t i = 0; i < TRACE_MAX_THREADS; i++) {
@@ -294,8 +298,9 @@ enum {
 };
 
 static void test_legacy_v1_loads(char fixture[FIXTURE_SIZE]) {
-    os_file f = OS_FILE_INIT;
-    ASSERT(os_file_open(&f, "fuzz/corpus/trace/v1-6fec2e8.edtrace", OS_OPEN_READ) == OS_OK);
+    int fd = open("fuzz/corpus/trace/v1-6fec2e8.edtrace", O_RDONLY | O_CLOEXEC);
+    ASSERT(fd >= 0);
+    os_file f = os_file_from_fd(fd);
     read_test_bytes(&f, fixture, FIXTURE_SIZE);
     trace_loaded dump;
     ASSERT(trace_fmt_load_dump(&f, &dump) == 0);

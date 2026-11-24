@@ -1,6 +1,7 @@
 #include "base/base.h"
 #include "os/os.h"
 
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,7 +80,7 @@ static void allocate_byte(void)
 static void probe_worker(void *arg)
 {
     guard_probe *probe = arg;
-    while (!atomic_load(&probe->run)) os_yield();
+    while (!atomic_load(&probe->run)) (void)sched_yield();
     if (probe->exempt) base_malloc_guard_exempt_begin();
     allocate_byte();
     if (probe->exempt) base_malloc_guard_exempt_end();
@@ -99,7 +100,7 @@ static size_t guard_worker_window(bool exempt)
     base_malloc_guard_exempt_end();
     allocate_byte();
     atomic_store(&probe.run, true);
-    while (!atomic_load(&probe.done)) os_yield();
+    while (!atomic_load(&probe.done)) (void)sched_yield();
     base_malloc_guard_exempt_end();
     size_t count = base_malloc_guard_end();
     ASSERT(os_thread_join(&worker) == OS_OK);
@@ -132,7 +133,6 @@ static bool test_guard_exempt(void)
 
 typedef struct os_probe {
     os_mutex mutex;
-    os_rmutex recursive;
     os_cond cond;
     _Atomic unsigned ready;
     _Atomic bool stop;
@@ -145,8 +145,6 @@ static void contend(void *arg)
     while (!atomic_load(&probe->stop)) {
         os_mutex_lock(&probe->mutex);
         os_mutex_unlock(&probe->mutex);
-        os_rmutex_lock(&probe->recursive);
-        os_rmutex_unlock(&probe->recursive);
     }
 }
 
@@ -166,24 +164,19 @@ static bool test_os_window(void)
 {
     os_probe probe = {0};
     os_mutex cold_mutex;
-    os_rmutex cold_recursive;
     os_cond cold_cond;
     os_once cold_once = OS_ONCE_INIT;
     os_wake wake;
     ASSERT(os_mutex_init(&probe.mutex) == OS_OK);
-    ASSERT(os_rmutex_init(&probe.recursive) == OS_OK);
     ASSERT(os_cond_init(&probe.cond) == OS_OK);
     ASSERT(os_mutex_init(&cold_mutex) == OS_OK);
-    ASSERT(os_rmutex_init(&cold_recursive) == OS_OK);
     ASSERT(os_cond_init(&cold_cond) == OS_OK);
     ASSERT(os_wake_init(&wake) == OS_OK);
 
     char path[] = "build/law2-os-XXXXXX";
     int fd = mkstemp(path);
-    ASSERT(fd >= 0 && close(fd) == 0);
-    os_file file = OS_FILE_INIT;
-    ASSERT(os_file_open(&file, path, OS_OPEN_RDWR) == OS_OK);
-    ASSERT(os_unlink(path) == OS_OK);
+    ASSERT(fd >= 0 && unlink(path) == 0);
+    os_file file = os_file_from_fd(fd);
 
     os_thread contender, waiter;
     os_mutex_lock(&probe.mutex);
@@ -196,27 +189,18 @@ static bool test_os_window(void)
     base_malloc_guard_begin();
     /* Release the workers inside the window, including the first cond wait. */
     os_mutex_unlock(&probe.mutex);
-    while (atomic_load(&probe.ready) != 2) os_yield();
+    while (atomic_load(&probe.ready) != 2) (void)sched_yield();
     os_mutex_lock(&cold_mutex);
     os_mutex_unlock(&cold_mutex);
-    os_rmutex_lock(&cold_recursive);
-    os_rmutex_lock(&cold_recursive);
-    os_rmutex_unlock(&cold_recursive);
-    os_rmutex_unlock(&cold_recursive);
     os_cond_signal(&cold_cond);
     os_cond_broadcast(&cold_cond);
     os_once_run(&cold_once, once_body);
     for (uint64_t i = 0; i < 1000; i++) {
-        clock_sum += os_now_ns() + os_wall_ns() + os_thread_cpu_ns() +
-                     os_slice_ns() + os_thread_self();
+        clock_sum += os_now_ns() + os_thread_self();
         os_mutex_lock(&probe.mutex);
         os_cond_signal(&probe.cond);
         os_mutex_unlock(&probe.mutex);
         os_cond_broadcast(&probe.cond);
-        os_rmutex_lock(&probe.recursive);
-        os_rmutex_lock(&probe.recursive);
-        os_rmutex_unlock(&probe.recursive);
-        os_rmutex_unlock(&probe.recursive);
         os_wake_signal(&wake);
         os_wake_drain(&wake);
 
@@ -229,7 +213,6 @@ static bool test_os_window(void)
         ASSERT(os_file_pread(&file, back, sizeof back, off, &n) == OS_OK);
         ASSERT(n == sizeof back && memcmp(record, back, n) == 0);
     }
-    os_yield();
     size_t count = base_malloc_guard_end();
 
     os_mutex_lock(&probe.mutex);
@@ -242,10 +225,8 @@ static bool test_os_window(void)
     os_file_close(&file);
     os_wake_close(&wake);
     os_cond_destroy(&cold_cond);
-    os_rmutex_destroy(&cold_recursive);
     os_mutex_destroy(&cold_mutex);
     os_cond_destroy(&probe.cond);
-    os_rmutex_destroy(&probe.recursive);
     os_mutex_destroy(&probe.mutex);
 
     bool active = base_malloc_guard_active();

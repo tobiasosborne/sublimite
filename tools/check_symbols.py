@@ -162,9 +162,7 @@ def owns_symbol(member, module, owner, symbol):
     return owner == module
 
 
-def audit_object(rows, where, member, module, layers, order, allowlist):
-    layer = layers[module]
-    errors = []
+def object_symbols(rows, where):
     for row in rows:
         fields = row.split()
         if len(fields) < 2 or not SYMBOL_NAME.fullmatch(fields[0]) or not re.fullmatch('[A-Za-z]', fields[1]):
@@ -172,6 +170,13 @@ def audit_object(rows, where, member, module, layers, order, allowlist):
         symbol, kind = fields[:2]
         if (kind in UNDEFINED and len(fields) != 2) or (kind not in UNDEFINED and len(fields) not in (3, 4)):
             raise ValueError(f'{where}: malformed nm row {row!r}')
+        yield symbol, kind
+
+
+def audit_object(rows, where, member, module, layers, order, allowlist):
+    layer = layers[module]
+    errors = []
+    for symbol, kind in object_symbols(rows, where):
         owner = symbol_module(symbol, layers)
         violation = None
         if kind in {'w', 'v'}:
