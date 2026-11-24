@@ -4,13 +4,13 @@
 
 | Item | Disposition for signature |
 |---|---|
-| E1 | Adopt owner-committed replay. Undo prepares one group and lends an ordered splice iterator. Edit can still abort after the last mutation. |
-| E2 | Adopt the Q7 amended grant table. A waiting key stays at the FIFO head before RAM mutation. |
-| E3 | Adopt streaming from pinned source stores. A failed mapped read after memory commit suspends emission with the frame and ACK fenced. |
-| E4 | Adopt exact descriptor reservations before commit, with a release test for each abort path. |
+| E1 | Adopt the signed owner-committed replay erratum. Undo retains the provisional group through the caller’s commit or abort. |
+| E2 | A28 gives the UI sole append ownership and fair service to ready producers. |
+| E3 | Stream from pinned stores while rollback remains available. The only postcommit write is the already funded final. |
+| E4 | Reserve exact resources before commit. Release unused claims on abort and account separately for physically accepted records. |
 | E5 | Adopt the caller's configured byte cap. The LP64 default is 17,334,272 B (P, parity depth times charge, derived below). |
-| E6a | Adopt the cut. The layout caller owns the preferred column and resets it on change consumption. |
-| E6b | Adopt REPLAYING with direction. The five phase tags (P, one per transaction-table row) cover both directions. |
+| E6a | Layout owns the preferred column and resets it when consuming a change. |
+| E6b | Keep one REPLAYING phase with direction. FINAL_PENDING identifies the exceptional committed boundary awaiting its final receipt. |
 | E6c | Adopt caller-derived budgets. The edit bead brief must name the host owner responsible for deriving each argument. |
 | E7 | Adopt full sentences for the function contracts. |
 
@@ -46,33 +46,39 @@ struct journal;
  * A generation identifies the original file bytes on which recovery
  * depends. BASE records establish a buffer's starting text in a named
  * journal image (the current physical record stream). A restore may name
- * a verified declared generation. After embargo, journal streams its
- * bytes by value from a pinned source during EMITTING. ADD is piece's
- * append-only byte store. Journal writes ADD and literals by value.
- * Save/file owns the witness, meaning
- * the evidence that the installed target is the output written by save.
+ * a verified declared generation. An embargoed restore carries literal
+ * bytes from the pinned store. ADD is piece's append-only byte store.
+ * Edit owns the provisional mutation, history, selection, identities,
+ * publication pins, change and source-coordinate descriptors. Journal
+ * owns policy, exact record reservations, offsets, sequence and writes.
+ * File validates mapped backing. The session orders save capture and
+ * edit publication on the UI. Only the UI writes the named image.
  *
- * Edit owns the logged piece tree, its undo log, selection including mark,
- * content IDs/bookmarks, revision, burst predecessor, published snapshot,
- * pending change and private journal staging. After undo commit journal
- * takes the sealed batch; edit retains its completion handle. Journal owns file offsets,
- * sequence, generation policy, write progress and exclusive writer grants.
- * File owns source validation. Save owns request outcome and installation
- * of the saved ID. Workers read retained snapshots only.
+ * Before journal_command_begin, size the entire plan with
+ * journal_literal_limit and journal_range_allowed. Reserve edit's exact
+ * descriptors, source holds, change/reply slots and candidate snapshot.
+ * Begin funds every member and the final record including its retry.
+ * Fill journal_command_payload directly. Validate every dependent mapped
+ * load and use journal_command_member for each typed member across turns.
+ * For a singleton fill the final payload directly. journal_command_seal
+ * validates that payload or checks the grouped claim and writer readiness.
+ * Seal, commit and final share one UI dispatch.
+ * For a group all members must reach the named inode before RAM commit.
+ * A source or capacity failure while provisional restores the old text
+ * and history. Abort the journal handle and release unused claims.
+ * Accepted records retain their physical sequence and have no text
+ * effect without the final. A short member write blocks the physical
+ * stream until journal_reconcile accounts for the held record.
  *
- * An exclusive journal grant covers no sync and no write whose
- * size depends on buffer, peer or session content (G, E2). A key needing
- * admission waits at the session FIFO head before any RAM mutation. The
- * UI shows the published text and pending status and pumps completions.
- *
- * Every reservation precedes undo_commit. Each reservation is exact.
- * Every abort path releases all its claims and has its own release test.
- * A reservation holds descriptors and source pins. The sole payload copy
- * needed for emission occupies reusable storage for the current encoded
- * record, bounded by its checked wire size (E3). Journal accepts the
- * sealed plan and its pins after memory commit without a fallible claim.
- * It validates mapped loads before issuing their record. On failure it
- * suspends the batch, retains its position and withholds frame and ACK.
+ * When all sources and claims are ready, call undo_commit once. It can
+ * still abort internally on conflict. On success call journal_command_final
+ * in the same dispatch. The sole remaining write is the standalone record
+ * or the group's empty COMMAND_COMMIT. It needs no source reads. A complete
+ * write opens the publication fence. With a failed final retain its request,
+ * the committed candidate and prior published boundary in FINAL_PENDING.
+ * Expose the journal error and withhold the new frame and matching ACK.
+ * journal_request_result identifies acceptance after reconciliation.
+ * Release the request once adopted. Every abort exit has a release test.
  *
  * A new incarnation starts at content ID 1 (G, first nonzero identity).
  * ID 0 means unknown (G, sole reserved ID). A nonempty forward command
@@ -90,11 +96,11 @@ struct journal;
  * All offsets and lengths are bytes. Required object/output pointers,
  * live owners, valid enum values, nonaliasing valid input storage, UI
  * ownership and nonreentrancy are caller invariants checked with ASSERT.
- * File contents, input bounds, deadlines, lease pressure and resource
+ * File contents, input bounds, deadlines, writer suspension and resource
  * exhaustion are results. All input arrays are borrowed through the call
  * only. All costs below are (P), from the operations named. */
 typedef enum edit_phase {
-    EDIT_IDLE, EDIT_OPEN, EDIT_REPLAYING, EDIT_EMITTING, EDIT_READY
+    EDIT_IDLE, EDIT_OPEN, EDIT_REPLAYING, EDIT_FINAL_PENDING, EDIT_READY
 } edit_phase;
 typedef enum edit_result {
     EDIT_OK, EDIT_WAIT, EDIT_MORE, EDIT_NOMEM, EDIT_RANGE, EDIT_LIMIT,
@@ -142,7 +148,7 @@ typedef enum edit_save_event {
  * caller's history_cap_bytes. Config supplies the default of 32,768
  * records (G, v1 cfg.history_keys at buffers.c:256) times 529 B (P,
  * two 264 B undo slots plus one short input byte on LP64), or
- * 17,334,272 B (P, their product). The implementer places the charge
+ * 17,334,272 B (P, their product). The layout test checks this charge. The implementer places the charge
  * and product beside the config constant. The file owner's live validator
  * and its context outlive the log. Mapped text requires validate. Journal outlives
  * the buffer. buffer_id names its existing recoverable BASE (including an
@@ -195,22 +201,15 @@ edit_result edit_replace(edit_buffer *b, edit_kind kind, edit_splice splice,
  * final text and rebase the mark through the actual splices. Empty sequences
  * can change selection alone. The caller provides a readable array for a
  * nonzero count and storage independent of mutation. Check ranges and
- * acquire ordered append admission. Contention returns WAIT before mutation.
- * Run undo_begin then undo_replace for each nonempty splice. Describe each
- * insertion in ADD coordinates. Stage the ordered DELETEs and INSERTs,
- * bracket multi-record commands with GROUP_BEGIN and GROUP_COMMIT, and
- * take the candidate snapshot. Reserve exact capacity before commit.
- * On replace, staging, reservation or snapshot
- * failure abort the open log and discard staging. undo_commit validates the
- * mapped source last and aborts internally on CONFLICT. On success hand
- * the batch to journal without allocation and attempt its first record.
- * Continue a longer batch across turns. Only page-cache acceptance of
- * the final record opens the fence. A short write preserves the full
- * record at its original offset. Show suspended recovery and keep the
- * committed edit. Do not roll back or issue the command again. Cost is
- * O(count) plus undo mutations, bytes encoded, records and abort cleanup
- * when needed. Progress returns OK, WAIT, MORE or SUSPENDED. A precommit
- * NOMEM, RANGE, LIMIT or CONFLICT preserves the entire starting boundary. */
+ * acquire this buffer's command admission. Execute undo_begin and
+ * undo_replace on the UI. Describe each insertion in ADD coordinates,
+ * even if another splice removes it. Consume borrowed input before
+ * returning. OPEN may yield across turns with owned descriptors and
+ * pins. Emit and close using the common protocol above. The cost is
+ * O(count) plus mutation, encoding and abort cleanup. WAIT preserves
+ * the request for admission, MORE resumes provisional work, and
+ * SUSPENDED exposes an unresolved physical failure. A provisional
+ * refusal preserves the prior published boundary. */
 edit_result edit_apply_plan(edit_buffer *b, const edit_splice *splices,
                             size_t count, edit_selection after);
 
@@ -220,23 +219,21 @@ edit_result edit_apply_plan(edit_buffer *b, const edit_splice *splices,
  * OK without a change. A deadline permits a yield after one available mutation.
  * Once the group is prepared, walk its source-coordinate splices in
  * application order, slicing staging across turns as needed. Seal the
- * descriptors, take the candidate snapshot and commit through undo_commit.
+ * descriptors, take the candidate snapshot and emit every precommit member before calling undo_commit.
  * On staging failure call undo_abort. While yielded, expose the old
  * published snapshot and block mutation, resolve, cap changes and save
  * capture. Only the completed group restores cursor and anchor and rebases
  * the existing mark. Each slice costs its mutations and staging work.
  * The command returns the same results as edit_apply_plan. */
 edit_result edit_replay(edit_buffer *b, edit_direction direction, uint64_t deadline_ns);
-/* Continue the open replay, its prepared iterator or the committed
- * journal batch from its retained position. Use the replay clock.
- * Advance at least one ready unit per call, then honor the deadline between
- * units without waiting or sleeping. Before commit the replay costs and
- * refusals apply. After commit this returns OK, MORE or SUSPENDED. In IDLE
- * and READY it returns OK in O(1). The recovery owner repairs suspension
- * off path. Resume consumes its result. Reentry into OPEN violates the
- * owner contract. */
+/* Resume provisional OPEN or REPLAYING work from owned cursors.
+ * Use the replay clock and honor the deadline between ready units.
+ * For a repaired member inspect journal_command_accepted before advancing.
+ * In FINAL_PENDING inspect the original final request and publish once
+ * it is accepted. This costs O(1) and returns SUSPENDED while the
+ * physical gap persists. In IDLE and READY this returns OK. */
 edit_result edit_continue(edit_buffer *b, uint64_t deadline_ns);
-/* After frame submit or headless delivery to the reply path, consume the single
+/* After submit or headless reply delivery, consume the single
  * pending text change. Success moves READY to IDLE. Otherwise the call
  * returns false and preserves *out. It takes O(1) and cannot fail. The
  * UI consumer distributes the change and resets its preferred column. */
@@ -264,7 +261,7 @@ void edit_save_boundary(edit_buffer *b, edit_save_event event);
  * their bounded walks, the snapshot claim and actual top-up. Attempt all
  * on an eligible turn and return NOMEM if resolve, take or top-up was refused.
  * This is a maintenance observation only. WAIT skips all work during an
- * open command, replay or emission. The caller must be outside the typing window. */
+ * open command, replay or pending final. The caller must be outside the typing window. */
 edit_result edit_maintain(edit_buffer *b, size_t reclaim_steps,
                           size_t resolve_visits, size_t undo_records);
 #endif
@@ -278,26 +275,26 @@ Take an ordinary one-byte insertion into a journaled, writable buffer whose BASE
 
 | Step | RAM effect | Journal bytes / sync calls |
 |---|---|---|
-| UI receives the key | Stamp once on the monotonic clock. Resolve target in FIFO order. Ask the journal owner for uninterrupted command admission. If a save or another buffer holds the grant, leave the key at the head and show the last published text with pending/save status. Continue mailbox and save progress. | 0 / 0 (P, no mutation or append) |
+| UI receives the key | Stamp on the monotonic clock. Resolve its target in FIFO order. A peer checkpoint can keep producing records while the key proceeds. | 0 / 0 (P, no append) |
 | Admit and replace | Validate the input and reserve staging, change slot, reply/publication capacity and checked counters. Compute join. Begin with cursor/anchor, replace at caret. The input contributes one ADD byte (P, length of this insertion), plus tree/history metadata. | 0 / 0 (P, private tree checkpoint) |
-| Prepare and commit | Reserve the exact descriptor and scratch for this INSERT, take the candidate snapshot, close source validation and commit undo. Install the internal next boundary and transfer the sealed plan to journal. | 0 / 0 (P, claims and commit are in RAM) |
+| Prepare and commit | Take the candidate snapshot, fund the singleton with journal_command_begin, encode into journal_command_payload, call journal_command_seal and close source validation in undo_commit. | 0 / 0 (P, the singleton has no precommit record) |
 | Append | Issue one UI `os_file_pwrite_once` (G, A22) on the named image. | **41 B / 0** (P, 32 B record header + 8 B destination + 1 B literal). A lone INSERT needs no markers, PAD, per-key VIEW, sync or worker job. |
 | Publish and submit | After a full write, expose the new snapshot, identity and change, make frame submit and matching success reply eligible. After submit consume the change. | 0 / 0 (P, pointer/scalar publication) |
 
-During a save grant the waiting key stays at the FIFO head. Mailbox routing and presentation of the previous boundary continue. Temp writes, peer-image construction and every sync run off grant. Only bounded control publication or the exact-boundary name and writer switch holds the save grant. Ordinary edit batches use ordered append admission, which excludes a switch until the batch completes. A waiting key runs against the then-current generation policy. Measure ingress-to-submit including queue residence and page faults. The grant table bounds work under the grant. G1 measures elapsed time. [Savectl grant table](wave1-savectl-spec.md#exclusive-writer-grant-and-crash-cuts) · [Q7 amended](wave1-L2-derivations.md#q7-amended-exclusive-grant-requirement)
+A turn serves input first, then at least one ready record per producer class in rotation, then ready barriers (G, A28 fair service). A dependent FIFO head, the buffer's own provisional mutation, physical gap or blocking write can still delay a key. Other buffers' group lengths impose no exclusion. Measure ingress-to-submit including queue residence and faults. [Write model](wave1-journal-write-model.md)
 
 ## Command, publication and failure
 
-- **Admission.** Pin the prior published snapshot; retain or move its existing reference. Serialize the journal intent against other writers, exclusive grants and capture of a displaced generation. Reserve explicitly *without* advancing image length or sequence. For forward input the ordered lengths determine the exact wire size using journal's actual slicing policy. Check each splice by subtraction against the successive length, then the final selection. Skip empty splices. No nonempty splice means no new text ID even if selection changes. A nonempty replacement counts even if its bytes compare equal. Stage mark motion privately. At each splice endpoints before the cut stay put, endpoints through its inclusive old end move to the new end, later endpoints shift by the length difference (v1 `input.c:changed`). Undo transports only cursor and anchor in its opaque 16 B (P, two 64-bit coordinates copied by value).
+- **Admission.** Pin the prior published snapshot; retain or move its existing reference. Serialize this buffer's live command with save capture affecting any of its range operands. Reserve explicitly *without* advancing image length or sequence. For forward input the ordered lengths determine the exact wire size using journal's actual slicing policy. Check each splice by subtraction against the successive length, then the final selection. Skip empty splices. No nonempty splice means no new text ID even if selection changes. A nonempty replacement counts even if its bytes compare equal. Stage mark motion privately. At each splice endpoints before the cut stay put, endpoints through its inclusive old end move to the new end, later endpoints shift by the length difference (v1 `input.c:changed`). Undo transports only cursor and anchor in its opaque 16 B (P, two 64-bit coordinates copied by value).
 - **Forward.** After each successful `undo_replace`, record the splice destination and deletion. For a nonempty insertion of length n, the last n ADD bytes are its input (`change_text` captures any inverse before calling `piece_replace`). Keep that span even if a later splice removes it. All input is borrowed only during the call. On begin refusal release private claims. On replace error the only legal log call is `undo_abort`.
 - **Replay.** Request one group (G, the user Undo or Redo command). Undo applies it under a checkpoint. Edit can yield during application and again while reading the prepared splices, before committing. Use the operation offsets to move the mark and build the change envelope. DELETE precedes insertion at the same offset. Emit ADD, undo literals, private or undeclared ORIGINAL and embargoed ORIGINAL by value. Only a verified eligible declared generation may use RESTORE_BASE_RANGE, including repeated and backward source offsets.
-- **Common commit.** With append admission held, size and reserve the exact descriptors, source holds, image bytes and sequence interval, reusable record scratch, session leaf, counters, change and reply slots. Check arithmetic before memory commit. Sizing uses the actual encoder policy. Sealing and snapshot acquisition may still fail. Take the candidate snapshot and bind its source holds. On any precommit failure abort the open checkpoint and release all claims. Call `undo_commit` once. On closing CONFLICT undo has already aborted. On success transfer the sealed batch without a claim, allocation, I/O or refusal, then attempt the first append. All data needed after the call is owned. Both directions and forward editing use this sequence.
-- **Journal.** A replacement with deletion and insertion or any other multi-record command has a contiguous nonempty GROUP_BEGIN … GROUP_COMMIT. A single data record stands alone. Journal slices literal bytes, uses checked additions for every destination, offset, size and sequence, retains encoded bytes and write position across turns. Interleaving a different command, generation redeclaration or rotation inside this batch is forbidden. After memory commit the command runs exactly once. Transport pressure yields MORE. A short, zero or failed write preserves the *whole encoded record*, original write offset, accepted prefix and unissued suffix. The owner latches recovery suspension, edit stays EMITTING, status is visible and success remains fenced. Repair off path, explicitly reconcile the exact batch and its final image-qualified position, then continue/publish once. No second INSERT on retry. Continuity loss elsewhere while idle refuses new admission visibly. An uncertain or failed repair keeps the fence closed. [Wire group and reader rules](../../src/journal/journal.h)
-- **Observability.** The prior bytes, selection, history cursor (including redo and eviction), saved/cutoff bookmarks, ID, revision, journal sequence and pending change survive every precommit refusal. NOMEM displays **“Edit not applied — buffer memory is full.”** Other causes have distinct statuses. Postcommit suspension preserves the committed RAM edit for recovery and exposes only the prior boundary for frames. After the final complete record (including COMMIT when grouped), install the published snapshot, return the immutable change and signal the matching command ID through the app's reserved reply path. Layout may read the new snapshot before submit. L4/L5 poll the change after submit; headless success uses the same fence with no fake draw or forced flush. Before ACK, process death permits the previous or whole command; after ACK it requires the whole command, untitled included, starting from a verified recoverable BASE. Failed storage barriers, power loss and A23 foreign replacement follow their separate recovery contracts. [PLAN §4.2](../PLAN_V2.md#42-l2-edit-kernel-journal-publish-point--sigkill-kill-oracle) · [Q16](wave1-L2-derivations.md#q16--settled--external-headless-command-completion)
+- **Before commit.** Reserve exact quantities and prepare the candidate snapshot. For a grouped command the UI writes BEGIN and all typed members while the log is provisional. A singleton has only its validated payload in scratch. All new source reads end here. For a displaced generation, finish the provisional command before capture or abort and restage by value. Other commands and checkpoints can occupy intervening positions.
+- **Final and publication.** After the last accepted member, call `undo_commit`. On closing conflict it already rolled back. Call `journal_command_abort` and release the candidate. On success issue `journal_command_final` without yielding. A full write publishes the new snapshot and change. A short final holds the exact bytes and image offset. Keep the old frame and block ACK through reconciliation. The prior history position cannot be restored by retrying Undo. The runtime alone reissues the held frame. Publish once on its original receipt.
+- **Failure evidence.** An abort restores the starting RAM ledger, cursor and bookmarks. Accepted abandoned members stay in the physical prefix, consume sequence space and have no logical effect. Independent ACKs survive. On NOMEM show “Edit not applied — buffer memory is full.” A process kill after final acceptance recovers the whole command. Machine loss guarantees it after the covering barrier. [Wire and runtime](wave1-journal-wire-amendment.md)
 
 For the change envelope, retain the longest *untouched* exterior prefix and suffix. Initialize both to the original length; for each nonempty splice shorten prefix to at most its offset and suffix to at most the length after its cut in that step's input. Subtract both survivors from the old and new total lengths to get old_len and new_len (P, the two exterior regions survive every step and are disjoint after the first splice). This computes exact extents for a simple replacement and encloses disjoint changes without reading the intervening text. Only the actual splices are journaled or used to move a mark.
 
-## E1 · undo.h erratum for signature
+## E1 · signed undo.h erratum
 
 Replace the internally committing, group-count `undo_undo` and `undo_redo` entry points with the following one-group operation. Migrate their callers in the erratum. A caller requesting multiple groups loops at owner-committed boundaries. The public cursor types below are value types that fit in the owner's continuation. Clients treat their pointer members as private.
 
@@ -340,21 +337,19 @@ void undo_abort(undo_log *u);
 - **Iteration.** Initialize only after successful nonempty preparation. Walk last to first on undo and first to last on redo. Each result has the destination offset in the text immediately before the mutation and the count of bytes it removed. A zero span count denotes a pure delete. Otherwise the sum of span lengths is its inserted length. On redo use the record's removed count and inserted ADD run. On undo remove the forward insertion and enumerate the inverse. An empty inverse supplies no spans. Local or external spans keep their recorded order. A literal uses its owned ADD copy, including the reversed sequence of capture segments reconstructed from the cut mask for joined backspaces. The resulting spans describe exactly the bytes passed to the piece mutation. No document-offset lookup or mapped payload read occurs here. O(1) cursor space and work per record or span, including the fixed-width literal cut walk. The iterator may restart for an exact sizing pass. Its cursor and results are valid across UI turns only while this prepared checkpoint is open. The caller checks index < span_count. [Record representations and apply order](../../src/undo/undo.c)
 - **Commit or abort.** Block begin, replace, another prepare, cap change and revision-ending operations while prepared. Reads of published counters remain legal. Edit may take its candidate snapshot. For replay pass the saved target to the existing commit signature. Undo validates last, commits the checkpoint and moves the applied-history position in the saved direction without appending history, trimming or branching. A forward caller supplies its own final cursor state and retains landed join, branch and cap behavior. Only the owner's successful undo_commit advances an edit's history position. Closing CONFLICT aborts internally. Explicit undo_abort is allocation-free and valid for an open or failed forward command and for an applying or prepared replay. Either close invalidates every borrowed target, cursor and splice. The owner copies descriptors into its plan and acquires pins before that point. There is no replay callback or additional undo refusal code.
 
-## E3 · bytes between memory commit and the final append
+## E3 · bytes through the final append
 
-Delete a contiguous mapped ORIGINAL range, save the deletion, then undo it after capture has embargoed its generation. Undo restores the range by reference in the tree. Its bytes still reside in the old mapped backing, kept alive by the candidate snapshot. The named journal must receive the bytes by value. Journal takes the source pin, compact operation/run descriptors, exact wire reservation and one reusable encoded-record buffer. It advances destination and source cursors as INSERTs complete. A long run needs one descriptor regardless of the number of slices. Journal releases its pins only after acceptance or definitive reconciliation. The pin also keeps the snapshot's ADD and private ORIGINAL sources alive for mixed commands. [Snapshot ownership and mapped faults](../../src/piece/piece.h)
+A restore of a deleted, now embargoed ORIGINAL range reads from the pinned source before RAM commit. The command's descriptors identify runs and splice order. The journal lends the funded record window for each validated slice, and retains a short-written frame at its assigned position. After commit only the final frame is needed. [Snapshot ownership](../../src/piece/piece.h)
 
 **Source coordinates matter.** In a compound command, insert bytes, then delete them before the candidate snapshot is taken. Redo must journal that insertion before its deletion. The final document view cannot locate it. The sealed span still names bytes in the snapshot's source stores. Require a bounded, allocation-free piece reader for a provenanced span in those pinned stores, including ADD below the captured high-water even when absent from the document. Bind descriptors to the snapshot's tree/incarnation and checkpoint lineage. Discard all provisional descriptors on abort, including when a later command grows ADD over the same offset. Snapshot ownership preserves the storage lifetime. File supplies the evidence for trusting a mapped load. [Landed document-coordinate readers](../../src/piece/piece.h)
 
-**Validation and repair.** Fill the literal directly in the current record's scratch, then check the held backing's live identity (including same-size overwrite) and poll its registered fault ID after the last dependent load. Require OS_OK and epoch zero (G, the mapped reader contract). Only a validated record may acquire its CRC and be issued. Keep a validated short-written record verbatim for retry at its original offset. A failed source check *before* owner commit aborts the group. A failed read/check *after* owner commit discards the unissued scratch, keeps the committed history position, pins, descriptor cursor and accepted prefix, latches journal suspension and leaves edit in EMITTING. Report the source conflict and unacknowledged undo. Keep the prior submitted frame or a conflict status if that backing is also untrustworthy. No provisional frame, success reply, further writer admission or GROUP_COMMIT may pass. In particular, fault-substituted zeroes never become an INSERT.
+**Validation and repair.** Fill the literal in journal scratch, validate the held backing's live identity and poll the registered fault id after the last dependent load. Require OS_OK and epoch zero (G, mapped reader contract). Abort provisional work on source conflict, including a late failure at closing validation. On short precommit write either abort or observe reconciliation before consuming that member. In both cases the UI must resolve the physical hole before another append. On failed final, use only its already encoded bytes on the same inode at the original position. If continuity is lost, suspend acknowledgment and preserve the committed candidate for exceptional recovery.
 
-Resume only with independently verified bytes for the same original generation/range and a reconciled named-image position. A faulted registration cannot regain a pristine epoch. The current target after save may itself be the file *with the range deleted*. It cannot supply the missing bytes. If exact repair is impossible, the user sees a persistent recovery conflict and the incomplete group remains unacknowledged. Preserve the journal and available evidence for salvage. A restart ignores the incomplete group. The normal final append publishes once.
-
-**Space and visible work.** Let L be the restored length, S the journal encoder's literal slice size, R the number of described source runs and A the number of splice operations. For each batch reserve scratch equal to its largest actual encoded record. For this restore it is at most 40 + min(L,S) bytes (P, 32 B header + 8 B destination + slice), at most 1,048,576 B (G, landed maximum record size). Fill that same buffer in place and reuse it only after the complete write. Checked record-count, offset and sequence intervals need constant space. Descriptor memory is O(A + R) (P, one operation entry per splice and one source description per run). The reservation contains no per-slice array. Physically pinning an existing snapshot shares its nodes. A new header takes one 400 B slot on a cache miss (P, piece snapshot layout). A reference-only replay appends no ADD bytes, so it needs no private ADD boundary copy. [Wire maximum and framing](../../src/journal/journal.h) · [Snapshot claims](../../src/piece/piece.h)
+**Space and visible work.** Let L be the restored length, S the journal encoder's literal slice size, R the number of described source runs and A the number of splice operations. For each batch reserve scratch equal to its largest actual encoded record. For this restore it is at most 40 + min(L,S) bytes (P, 32 B header + 8 B destination + slice), at most 1,048,576 B (G, landed maximum record size). Fill that same buffer in place and reuse it only after the complete write. Checked record counts, byte credits and source cursors need constant space. Descriptor memory is O(A + R) (P, one operation entry per splice and one source description per run). The reservation contains no per-slice array. Physically pinning an existing snapshot shares its nodes. A new header takes one 400 B slot on a cache miss (P, piece snapshot layout). A reference-only replay appends no ADD bytes, so it needs no private ADD boundary copy. [Wire maximum and framing](../../src/journal/journal.h) · [Snapshot claims](../../src/piece/piece.h)
 
 At **10 GiB** (G, Wave 2 mapped-file case), take the entire aligned ORIGINAL as one restored run into the now empty document. L = 10 × 2³⁰ = 10,737,418,240 B (P, binary GiB). A = R = 1 (P, one inverse splice with one contiguous source). Incremental journal staging therefore needs **at most 1 MiB of payload-plus-framing scratch, one splice, one run and fixed pins/cursors**. The process also owns tree and history metadata. The range spans 163,840 chunk descriptors (P, L / 65,536). For the snapshot-held empty-tree bulk shape the piece planner charges 8,378 new structural slots, or 3,351,200 B (P, the signed contiguous-batch count times 400 B). Other starting shapes use the exact piece claim. Charge existing trees, pinned roots, page-rounded extents and mapped pages separately. Scanning L bytes can fault in that entire range and dirty file-cache pages. The staging bound is an owned-storage bound, not a peak RSS promise. [Bulk insertion derivation](wave1-piece-pool.md#bulk-insertion-signed-review-10a)
 
-The user sees the preceding frame and pending undo while journal writes **L + 40 × ceil(L/S) + 64 B** (P, one INSERT per slice and a BEGIN/COMMIT pair for this multi-record command). Work and journal space grow with L even though the payload buffer stays bounded. The loop advances across turns and pumps completions while later dependent input waits. On full acceptance the restored text and matching ACK become eligible together. Actual metadata admission failure before commit leaves the deletion in place. Disk exhaustion or source loss during emission keeps the undo fenced. The size of the range alone does not require a matching payload allocation or establish a latency bound.
+The user sees the preceding frame and pending undo while journal writes **L + 40 × ceil(L/S) + 64 B** (P, one INSERT per slice and a BEGIN/COMMIT pair for this multi-record command). Work and journal space grow with L even though the payload buffer stays bounded. The loop advances across turns and pumps completions while later dependent input waits. On full acceptance the restored text and matching ACK become eligible together. Actual metadata admission failure before commit leaves the deletion in place. A source failure while emitting aborts the undo. A short final keeps it committed and fenced. The size of the range alone does not require a matching payload allocation or establish a latency bound.
 
 ## E5 · default history charge
 
@@ -364,15 +359,15 @@ Use the v1 config default of **32,768 history records** (G, `cfg.history_keys`, 
 
 ## Transaction and burst
 
-Exactly **five reachable phase tags** (P, one per row below). Use a tagged union and exhaustive switches under `-Wswitch-enum`. REPLAYING carries its direction and a continuation for applying mutations or staging prepared splices. EMITTING retains the batch handle through journal suspension. Query lease and suspension at journal and source validity at file. Savectl's **22 reachable states** (P, its eleven phases each open or closing) remain with savectl. [Savectl states](wave1-savectl-spec.md#states-and-transitions)
+There are **five reachable edit phases** (P, one row per distinct continuation). Use one tagged union with exhaustive switches under `-Wswitch-enum` and no default. The REPLAYING continuation carries direction. Journal owns suspension and transport. No postcommit suffix cursor exists.
 
-| Tag | Owner and transitions |
+| Tag | Entry and exit |
 |---|---|
-| IDLE | A refusal or empty history leaves the buffer here. Admission enters OPEN for a forward mutation or REPLAYING for a history command. |
-| OPEN | Forward checkpoint and private batch. All staging stays here. Failure → IDLE, successful memory commit → EMITTING. No external yield. |
-| REPLAYING | Direction selects undo or redo. The old snapshot remains published across application and iterator yields. Refusal or abort returns to IDLE. Owner commit enters EMITTING. Opposite input stays queued. |
-| EMITTING | Already committed. Resume from transport cursor. Backpressure, short write or unresolved repair stays here. Complete page-cache acceptance → READY. |
-| READY | New boundary visible, change slot full. After submit, consuming it → IDLE. Admission waits rather than overwriting an unseen change. |
+| IDLE | Admit a forward command into OPEN or a history command into REPLAYING. Empty history and refused admission stay here. |
+| OPEN | Retain owned forward descriptors, source pins and provisional log across precommit member turns. Abort to IDLE. After owner commit, full final acceptance enters READY and a failed final enters FINAL_PENDING. |
+| REPLAYING | Apply or resume the selected direction and enumerate the prepared group. Stream its precommit members, then take the same commit, abort and final transitions as OPEN. |
+| FINAL_PENDING | A short final after successful memory commit leaves the old frame visible. Accept its original repaired request to enter READY. |
+| READY | Publish the new boundary once. Taking the change after submit returns to IDLE. |
 
 For a burst, remember the last eligible **committed** command's kind, offset, extent and monotonic receipt time. Require a collapsed selection, no intervening break, no redo suffix and matching ordinary kind. Type joins at previous insertion end; forward delete at the same start; backspace when this deletion ends at the previous start. Test `now >= last && now - last <= EDIT_BURST_NS`, using **300 ms = 300,000,000 ns** (G, inherited product behavior, including equality and the backwards-clock check at oracle pin `6fec2e8`). Define the constant privately. Each paste, compound/selection replacement, explicit selection change, kind change, admitted save cutoff or replay breaks the chain. A refused mutation leaves the predecessor intact. Undo independently checks structural adjacency and may start a fresh group. [Pinned v1 threshold](</home/tobias/Projects/sublimite-v1-oracle/src/undo/undo.h:67>) · [Pinned v1 join predicate](</home/tobias/Projects/sublimite-v1-oracle/src/undo/undo.c:301>)
 
@@ -382,9 +377,9 @@ For a burst, remember the last eligible **committed** command's kind, offset, ex
 |---|---|
 | Piece | `piece_tree_view/length` for bounds, `piece_iter_init/next_span` for descriptions, `piece_iter_next` for needed literals, `piece_view_backing` for source, `piece_snapshot_take/retain/view/release` for publication, `piece_close` after log destruction. Edit calls neither a logged tree's mutation nor checkpoint functions. At quiescence piece admits from funded slots **and** companions, otherwise exact plan, one local drain and replan if needed, release excess whole extents, then at most one exact base request (G, A26 procedure). Concurrent last release may make the very next request succeed. |
 | Undo | Lifetime, history and forward calls remain as landed. The prepared replay and iteration signatures below replace internal replay publication. File supplies live backing validation and undo owns its closing fault poll. |
-| Journal | Reserve an ordered command against the named image and generation policy. Reserve exact descriptor, sequence, wire and scratch capacity. Discard privately or take custody infallibly on commit. Encode, validate and append each record, expose suspension and reconcile the batch through its image-qualified end. Report native diagnostics. |
-| Savectl through the session owner | Read `edit_read` at the published boundary; call `savectl_content_identity` once per published revision even on return to an equal ID. `savectl_save_request` takes matching snapshot, ID and complete journal view. In the same serialized admission, reserve all claims, seal joining with `edit_save_boundary(CAPTURED)` and have journal embargo the displaced generation **from capture onward**, even after cancellation. A rejected admission does none of these. The cutoff's position, generation and synced temp witness (the fd-derived evidence identifying the file the saver wrote) belong to journal/save. On `savectl_get_model` reporting definitive verified finish transfer the matching cutoff to saved; on definitive loss of the request drop it. Defer logical adoption of completions across an open edit, keep routing messages. Filter stale request/incarnation before notifying edit. On `savectl_take_reload` the host installs a fresh tree/log/domain together, clamping selection itself. |
-| App and work | Single UI consumer routes shared-pool messages and ticks owners; edit never drains or submits worker jobs. `os_now_ns` supplies input receipt and slice checks. Global FIFO targets stable buffer incarnations. Open starts acquisition then releases dispatch. Switch-to-ready-tab and Save can proceed until the head needs unavailable text, a grant or replay completion. At that point hold the head, pump progress, and visibly refuse a failed-open dependent before advancing. No input overtakes it. |
+| Journal | Size with `journal_literal_limit` and `journal_range_allowed`. Call `journal_command_begin`, fill `journal_command_payload`, issue grouped records with `journal_command_member` and inspect `journal_command_accepted` after repair. Call `journal_command_seal` before owner commit, then `journal_command_abort` on abort or `journal_command_final` on success. Observe the final with `journal_request_result` and drop it with `journal_request_release`. Session routing owns `journal_receive`, `journal_service` and driving `journal_reconcile` after inspecting `journal_state`. [Runtime header](wave1-journal-wire-amendment.md) |
+| Savectl through the session owner | Read `edit_read` at the published boundary; call `savectl_content_identity` once per published revision even on return to an equal ID. `savectl_save_request` takes matching snapshot, ID and owned destination observation. In the same serialized admission, reserve all claims, seal joining with `edit_save_boundary(CAPTURED)` and have journal embargo the displaced generation **from capture onward**, even after cancellation. A rejected admission does none of these. The cutoff's position, generation and synced temp witness (the fd-derived evidence identifying the file the saver wrote) belong to journal/save. On `savectl_get_model` reporting definitive verified finish transfer the matching cutoff to saved; on definitive loss of the request drop it. Defer logical adoption of completions across an open edit, keep routing messages. Filter stale request/incarnation before notifying edit. On `savectl_take_reload` the host installs a fresh tree/log/domain together, clamping selection itself. |
+| App and work | Single UI consumer routes shared-pool messages and ticks owners; edit never drains or submits worker jobs. `os_now_ns` supplies input receipt and slice checks. Global FIFO targets stable buffer incarnations. Open starts acquisition then releases dispatch. Switch-to-ready-tab and Save can proceed until the head needs unavailable text, a healthy append or replay completion. At that point hold the head, pump progress, and visibly refuse a failed-open dependent before advancing. No input overtakes it. |
 
 Maintain saved and in-flight IDs even after corresponding history becomes unreachable. Position is `evicted_groups + undo_groups` (P, trimmed prefix plus applied groups). On actual branch commit invalidate discarded redo positions before reusing depth. On actual join invalidate the replaced endpoint; use the starting/ending `group_serial` to distinguish a new group. Remove reachability strictly outside the surviving interval, keep IDs for still-owned cutoffs. Match remaining bookmarks only on completed replay. A reload starts a fresh incarnation; identities are compared only within it. With the zero sentinel, savectl carries a scalar saved ID and computes `saved_id == 0 || saved_id != current_id`. At the wire boundary translate the existing HAS_SAVED flag. [Q10 and Q15, ratified by A22](wave1-L2-derivations.md)
 
@@ -396,9 +391,9 @@ The edit bead brief must name the **UI host that schedules post-submit maintenan
 
 | Required operation | Evidence or GAP |
 |---|---|
-| Prepare and enumerate a replay group while retaining the owner's right to commit or abort. | **GAP (undo).** Landed replay commits inside the call. E1 above specifies the prerequisite erratum. [undo.h](../../src/undo/undo.h) |
+| Prepare and enumerate a replay group while retaining the owner's right to commit or abort. | **Signed prerequisite (undo).** Landed replay commits inside the call. E1 above specifies the prerequisite erratum. [undo.h](../../src/undo/undo.h) |
 | Read a bounded slice by source coordinate from the pinned stores, including a private ORIGINAL or ADD interval absent from the final document. | **GAP (piece).** The public byte iterator starts at a document offset. The mapped backing accessor alone cannot supply ADD or private ORIGINAL. The read needs snapshot-relative provenance and lifetime. [piece.h](../../src/piece/piece.h) |
-| Reserve/discard an exact descriptor plan, source holds, wire interval and reusable scratch, then transfer custody infallibly and resume at an image-qualified record position. Suspend on invalid source before issuing that record. | **GAP (journal runtime).** This extends savectl's existing writer-admission gap. The wire defines record framing and contiguous groups. The runtime brief retains a short-written record. Neither defines rollback of private claims, transfer on undo commit, or repair of an unread suffix after mapped validation fails. [Journal runtime brief](../briefs/L2-2b-journal-runtime.md) · [Savectl seam table](wave1-savectl-spec.md#seam-table) |
+| Reserve the final and stream members while rollback is legal. | The proposed journal runtime above supplies this contract. The first runtime bead implements it after joint signature. |
 
 ## Proof obligations for the implementer
 
@@ -409,21 +404,21 @@ The edit bead brief must name the **UI host that schedules post-submit maintenan
 | Input decode, FIFO, receipt clock, edit_read/select, join and checked plan | Reserved input/reply slots, borrowed arguments, scalar/stack work. |
 | undo_begin, each undo_replace, piece admission and snapshot_take, abort or commit | Base extents, piece slots, ADD chunks and history storage. Exact cold top-up uses base. |
 | Replay preparation, iterator staging and each continuation | Undo uses its checkpoint, piece storage and history records. Edit keeps a private descriptor plan and its prior published snapshot across the deadline. |
-| Stage/reserve, wire encode, journal RAM handoff, append/insert_step and write | Checked base staging and retained encoded record. No worker submission, wait, sync or malloc in append. |
+| Stage/reserve, wire encode, reserved final append, member append and write | Checked base staging and retained encoded record. No worker submission, wait, sync or malloc in append. |
 | Identity publication, session leaf, layout/frame or headless reply | Preclaimed leaf and reply slot, prepaid render path. A12 excludes libxcb calls capable of reading on UI between ingress and submit, flush included. |
 
 Register the production edit path in the release law2 suite. Fail unless `base_malloc_guard_active() && count == 0` (G, Law 2); count across ingress through **true submit**, including intervening turns, even for back-to-back input and resumed replay. Fixture setup and post-submit maintenance are outside. Run typing, both deletes, paste/compound, undo, redo, cold tab switch and refused exact base claim followed by a successful key. Count maintenance order with wrappers and check production call sites. Measure typing begin/replace/commit p50/p99 (G, provisional bench asks for median and 99th percentile), and full ingress-to-submit median/tail under ordinary typing and heavy writeback with power/load stamps; measure separately from allocation/read counters. [Release guard](../../src/base/base.h) · [A12, A13, A19 and A22](wave0-plan-amendments.md)
 
 **Independent oracle.** Use a flat byte vector with parallel ORIGINAL/ADD coordinates, immutable copies for snapshots, and an undo list of whole before/after states plus selection endpoints. Apply each plan to a private copy. Publish or discard it as a unit. A model clock, adjacency and byte-cap fixtures determine expected grouping, branching and trims. Keep persistent oracle identities for every boundary; compare observable equality for current/saved/in-flight owners, including finishing an older save after typing, undo to cutoff, equal depth on a different branch, joined endpoints and eviction. Model journal as a sequence of complete logical records plus a partial tail; a separate reader applies only complete groups and resolves source generation policy. Compare bytes and accepted revisions independently of production encoding, splice iterator and FSM. Use real named journals in a directory under `build/` for integration and external headless kill tests. Flat services and controlled failures are test doubles at the same mandatory journal contract.
 
-- Inject each claim refusal, conflict on final mapped read, replay refusal after yield, short write and recovery. Compare prior published bytes, selection/mark, history cursor/redo/evictions, bookmarks, ADD length and journal sequence. Exercise private insert then delete in an aborted command, regrow ADD at the old offset, capture and undo; repeat with a literal. Repeat a failed warm-up followed by a fitting key. Verify old snapshots while a replay is provisional and rejection of interleaved writes/lease acquisition.
+- Inject each claim refusal, conflict on final mapped read, replay refusal after yield, short write and recovery. Compare prior published bytes, selection/mark, history cursor/redo/evictions, bookmarks, ADD length and physical versus logical progress. Exercise private insert then delete in an aborted command, regrow ADD at the old offset, capture and undo; repeat with a literal. Repeat a failed warm-up followed by a fitting key. Verify old snapshots while a replay is provisional and independent accepted writes among provisional members.
 - Count actual mapped ORIGINAL reads/copied inverse bytes. Eligible one-span delete+undo reads at most **131,072 B** (P, description and deletion each clip two ends at up to 32,768 B; undo carries counts). Inverse copies at most **min(length, 16 × spans) B** (G, A13 chooses the cheaper of literal and 16 B descriptors), with O(spans) inverse storage. Compare the one-byte literal and large one-span equality/reference cases. Test A23's mandatory by-value emission separately and charge its payload to journal. After ORIGINAL counts resolve, check rank/select against the flat bytes before, between and after deletion/undo of **513 chunks** (G, A19 regression, P, one beyond the old 512-chunk boundary); count O(height) node visits. No edit-path newline scan or independent index veto.
 - Run AFTER_DELETE / BEFORE_COMMIT / COMPLETE cuts across undo, redo, replacement and paste. The torn-undo fixture has **262,144 B** on one side (P, v1 fixture 16 × 16,384 B) and **1 B** on the other (G, its replacement byte). Only a whole side may recover. Kill just before and after the external matching ACK with no graceful flush. Include untitled, prepared save restoring by value, foreign replacement/unresolved BASE, source conflict on in-place overwrite, independent fsync/dirsync outcomes, and the save/discarded-redo branch fixture. [Harvest acceptance](wave1-L2-L5-harvest.md#44-acceptance-lines-that-already-exist) · [A23](wave0-plan-amendments.md#a23-the-save-protocol-no-retention-rules-17-t5-is-a-stated-product-contract-advisor-2026-11-23)
 
-**Reservation tests.** Use a separate failure case for each abort exit and inject refusal after each successful partial claim. Cover forward begin and replace failure, replay preparation failure before and after a yield, checked wire/sequence/identity overflow, descriptor or scratch refusal, snapshot/source/session/reply claim refusal, owner abort during staging and the internally aborted commit conflict. Count claimed and released pins, descriptors, scratch, sequence and append admission. Each case returns exactly to its starting ledger and the next fitting command can acquire it. On success transfer ownership once and confirm release only at completion or definitive reconciliation.
+**Reservation tests.** Inject refusal after each partial claim, including history, descriptors, pins, scratch, change/reply, counter and final-record capacity. Check exact release on every abort. Distinguish unspent credits from actual physical bytes and sequences. Force closing conflict after all members were accepted, then commit a fitting command. Check the original history cursor and survival of independent peer keys.
 
 **Discriminating replay case.** Restore an embargoed span, yield after the last provisional mutation, then refuse the last descriptor or snapshot claim. The owner aborts and a second Undo still selects the same group. Repeat with a one-mutation group that reaches preparation in the initial call. Exercise redo of an insertion erased later in the group and undo of a joined backspace literal with cuts. Compare every inserted byte with the flat oracle.
 
-**Streaming cuts.** Count peak live staging bytes and plans while increasing the length of a single run at fixed slice size. Inject a key during a save grant and again during an unfinished large undo. Check FIFO order, mailbox progress, prior frame and absence of success. After an accepted INSERT and before the next one, inject truncation/fault, registration failure and same-size in-place overwrite separately. Verify the failed slice was never written and no COMMIT or ACK escaped. Try repair with a foreign source, then with independently verified original bytes. Kill at incomplete-group and completed-group boundaries. Separately short-write a validated slice and make its backing unreadable before retry. The retry must use the retained encoded bytes at the original offset.
+**Streaming cuts.** Accept a peer key between every pair of precommit records. Inject mapped truncation, same-size rewrite and closing validation failure separately. The incomplete command has no text effect. Fail a singleton and a grouped final after RAM commit, revoke the backing and reconcile the exact frame. Neither path reloads payload or moves history twice. Exercise the old-frame/withheld-ACK fence and recovery before and after final acceptance.
 
-**Signature boundary.** The coordinator can file the undo erratum as an edit prerequisite after signature. The piece reader and journal handoffs in the seam table need owner agreement. Command-plan producers, implementation, measurements and bead filing belong to their respective owners.
+**Signature boundary.** Implementation of the signed undo erratum, the piece reader, runtime, command-plan producers and measurements belongs to the implementation owners.
