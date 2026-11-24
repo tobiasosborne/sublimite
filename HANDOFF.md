@@ -40,7 +40,13 @@ In flight (state at 02:31 CET 2026-11-24):
   Opus thread after 7b lands and Claude is > 3 behind; then it switches from the piece model to the real tree.
 - Landed tonight: 0.87, 1.20, 1.21 undo, 2.0 L2-0a, 2.1 L2-2a, 4.1 dnd, 4.2 TOML. Briefs ready: L2-3, L2-1, v2-0fv.15.
 - Filed: v2-0fv.21 os export deletion + nm gate, .22 empty-tab footprint, .27 54-bit node-prefix packing.
-- Quota: the coordinator's own turns consume Claude room at about the accrual rate; go quiet to recover it.
+- Quota, last readings: Claude 89.0 % weekly, 1.4 behind (`quota` 02:29 CET), then HTTP 429 from `quota` at 02:31
+  (t3quota cache, age ~1 h: 89.0 %, 2.4 behind); Codex 7.0 %, 1.7 behind (02:31); Muse weekly 16 % with 5 d 23 h left,
+  ~1.5 over pace (01:30), 5-hour session 35 % (02:31). The coordinator's own turns consume Claude room at about the
+  accrual rate; a 2-minute quota poll for an hour (~30 full-context turns) ate the room it waited for. Do not poll.
+- Wake: the advisor scheduled itself for 05:05 CET (after the 03:45–05:00 no-build window): one `quota` read; if Claude
+  is >= 2.0 behind it messages the coordinator to dispatch the A26 round (and resume L2-2b if > 3.0 behind), else it
+  reschedules +90 min. Until then the coordinator does nothing.
 L2/L5 decisions: A19–A26; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
 L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md, wave1-L2-derivations.md, wave1-L2-q2-crash-consistency.md,
 wave1-L2-q2-protocol.md. Briefs live in docs/briefs/ named by bead and are committed with their dispatch.
