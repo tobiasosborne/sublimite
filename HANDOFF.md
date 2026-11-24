@@ -17,9 +17,16 @@ branches: push each at every pause or session end; delete the remote branch once
     CRCs) was cut at its last line by the Codex filter. The subject is enough; execution is not needed. Reads of journal
     recovery, repair and file fault paths go to Claude or Muse from the start.
   - Current jobs:
-    - Muse: one job for the N2 fixes v2-c42/o0t/kbj/23u (Astra's inputs are the tests; the oracle is taught each case).
-      Then a FRESH Muse thread does the adversarial L2-1 source read (mutation reds by name). Then the advisor's owner
-      read of L2-1, and L2-1 lands (review/l2-1 1ce753a, lanes green).
+    - MUSE QUOTA (Tobias 22:19 CET: "watch muse wonder full quota carefully"). Measured rate: about 8 weekly points
+      per Muse lane-hour (M, 2026-11-24: 18 % at 21:40 -> 23 % at 22:20 with ~35 min of lane time). This replaces the
+      earlier 1.7 estimate. One lane runs at about 1.5x the 5-hour window's pace.
+    - Muse: the N2 fix job (v2-c42/o0t/kbj/23u) was stopped at 22:21 before any edit. Its worktree is untouched at
+      9235a3a, so there is no wip. It may restart only when ONE quota reading shows the Muse 5-hour window at or behind
+      pace AND Muse weekly >= 3.0 behind. Its brief then adds a self-check: run `muse usage` before each build-and-test
+      cycle; stop at a compiling state when Weekly >= 26 %, or when Window % > (minutes since 21:29 CET) / 3. Scope is
+      the four fixes and their tests only. No further Muse dispatch tonight without asking the advisor.
+    - L2-1's adversarial source read: a fresh Opus reviewer in the Claude queue, after v2-40h and before 2b-1, each at
+      Claude room >= 1.0. Then the advisor's owner read, and L2-1 lands (review/l2-1 1ce753a, lanes green).
     - Astra: the L5 spec. Next on Codex after L2-1 lands: v2-677 permission bits (Sol; fix in os_file_copy_metadata).
   - Serial chains:
     - Codex: N2 (LANDED 1.27), then Astra's N2 landing read (docs/reviews/wave1-N2-astra.md), then Astra's minimal
