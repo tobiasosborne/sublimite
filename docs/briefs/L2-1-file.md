@@ -17,6 +17,10 @@ Scope (dossier §1.2 API table, with these decided points):
 - Reload acquisition moves into file (it owns mappings), through the same registered construction (§1.5(h)).
 - Close: a non-blocking two-phase close (begin, then work_handle_finished per handle); zero UI-thread sleeps or spins (§1.5(b)); worker publish backpressure with a stated bound or work_continue (§1.5(c)).
 - One -Wswitch-enum job-state enum per job slot instead of v1's _fin/_ready/_installed triples and the save path's seven booleans (§1.5(e)).
+- Seam-table GAPs, added 2026-11-24 by the advisor from docs/decisions/wave1-savectl-spec.md "Seam table". They hold under either journal model (W1):
+  (1) an owned target handle with the full comparison and error contract (acquire full tagged target expectations, retain and release immutable bindings, and on every check tell a missing path apart from a failed observation);
+  (2) custody and resumption of a synced temp across asynchronous jobs (fd, temp name, metadata and witness intact), with cleanup after refusal or close;
+  (3) classified publication evidence (definitely before rename, rename uncertain, installed but directory barrier failed, verified, post-rename conflict) and a barrier-only retry on the original handle, which never renames again.
 - The six save step hooks (TEMP_CREATED, MID_WRITE, TEMP_WRITTEN, FSYNCED, RENAMED, DIR_SYNCED) only under FILE_TEST_HOOKS.
 
 Acceptance (each a test, red first):
@@ -29,6 +33,7 @@ Acceptance (each a test, red first):
 - OS_E_NOSPC on a mapped open or reload: refused visibly, the old tree and registration intact on reload.
 - Zero UI-thread sleeps or spins (grep proof + a close-while-saving test).
 - Ported tests per dossier §1.6; fuzz/file_fuzz.c ported; bench/file_bench.c ported without layout/raster/x11.
+- Each seam GAP above: a test per result class and per cleanup path.
 - docs/decisions/L2-1-file.md: each mechanism with invariant, simplest alternative, defeating counter-example; v1 kept/cut.
 
 Rules: no git (not even git add -N), no bd. No rm -rf, no mktemp with a clean-up trap, nothing outside your checkout (test files and fixtures under build/); HOME under build/; build under build/; at most nice make -j2; no starts Tue 24 Nov 03:45–05:00 CET; run date before each; report rather than run anything needing approval. Acceptance lanes: nice make -j2 check (CONTRACT_CHECK_DISPLAYS from the coordinator), check-tsan, fuzz-smoke. Report: red/green per acceptance line, lines removed vs added, anything outside scope (report only).

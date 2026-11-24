@@ -376,3 +376,14 @@ Procedure (at most two plan computations and one base request per call):
 Tests: I's and A(1)'s traces assert the contract (refused during the race, the identical retry succeeds, nothing
 latched); J and K test steps 4, 2 and 1. piece_fund_exact's loop and its predicates are deleted (a deletion round).
 
+## Reopened, not yet amended (advisor, 2026-11-24; joint read of savectl 62c1441 and edit aa25e91)
+- A27 (savectl's PLAN 4.4 "orthogonal four axes" are observables, not stored fields) is DRAFTED in
+  docs/decisions/wave1-savectl-spec.md and waits for W1.
+- The wire's group-contiguity rule (2.1, src/journal/journal.h) and Q7 (A22's "finish uses an exclusive lease and a
+  current complete checkpoint") are REOPENED by the advisor, with W1 as the proposal (docs/briefs/W1-journal-write-model.md;
+  Astra's answer in docs/decisions/wave1-journal-write-model.md). Nothing lands on the wire until the advisor signs.
+- Signed the same day: the undo replay erratum (edit spec E1; owner-called commit/abort; undo_undo/undo_redo deleted),
+  the default history cap 32,768 x c with c = 2 x sizeof(undo_slot) + 1 (529 B on LP64, a test asserts it; E5), and
+  E3's principle (a by-value restore is streamed from pinned stores, never copied whole; scratch of at most one record).
+  The piece.h reader for a provenanced span in pinned stores is filed only once the edit header is signed.
+
