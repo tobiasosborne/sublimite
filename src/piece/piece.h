@@ -196,6 +196,12 @@ typedef struct piece_backing {
     void (*release)(void *ctx);
 } piece_backing;
 
+/* The owner checks the live identity of this mapped backing. The check
+ * returns true on a verified match. It must leave the tree and its
+ * owners untouched and complete without waiting. The owner keeps ctx
+ * alive for the borrowing log or request, including retired work. */
+typedef bool (*piece_validate_fn)(void *ctx, const piece_backing *backing);
+
 /* ---- Reserve and trees -------------------------------------------------- */
 
 /* The UI-owned process reserve: whole free page extents that any core may

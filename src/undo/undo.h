@@ -57,13 +57,12 @@ typedef struct undo_stats {
  * retain zero tree roots. Once a log exists, only undo may edit the tree or
  * call piece_checkpoint_* on it. Trees without history use piece directly. */
 
-/* For mapped trees, this callback supplies the owner's live identity check.
+/* For mapped trees, piece_validate_fn supplies the owner's live identity check.
  * A same-size external overwrite can leave a pristine fault epoch and the
  * owner's asynchronous notification can arrive later. Undo checks at the
  * publication boundary and around replay mutations. The callback may inspect
  * the backing, must not edit the tree or log, and must not wait. Undo also
  * polls the fault id itself. */
-typedef bool (*undo_validate_fn)(void *ctx, const piece_backing *backing);
 
 /* Default published history budget. undo_create still takes a caller's cap. */
 size_t undo_default_cap_bytes(void);
@@ -72,7 +71,7 @@ size_t undo_default_cap_bytes(void);
  * ASSERT: out and tree are non-NULL, cap_bytes > 0, and mapped trees have a
  * non-NULL validator. Private-copy trees may pass NULL. ctx is borrowed. */
 undo_err undo_create(undo_log **out, piece_tree *tree, size_t cap_bytes,
-                     undo_validate_fn validate, void *ctx);
+                     piece_validate_fn validate, void *ctx);
 
 /* Destroys the log and releases every history extent. O(records). Cannot
  * fail. ASSERT: live log, tree still open, no prepared replay. */

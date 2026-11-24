@@ -24,3 +24,8 @@ published counters, then retry. Also run the existing mapped refusal cases at
 admission and after MORE and the closing fault-poll case on the resumed mutation.
 The opposite-direction resume and writer calls while prepared are caller precondition
 tests for the existing assertion harness.
+
+**Validator erratum (v2-bkz).** `undo_create` uses `piece_validate_fn` from `piece/piece.h` for the same
+mapped-backing check, and the owner still keeps the borrowed context alive. Piece is the lowest layer both undo and
+journal include. Keeping the typedef in undo would require journal to include undo. The validator contract is signed
+in the [journal wire amendment](wave1-journal-wire-amendment.md#proposed-runtime-section-of-journalh).

@@ -123,7 +123,7 @@ typedef struct undo_pending {
 struct undo_log {
     base_arena self;
     piece_tree *tree;
-    undo_validate_fn validate;
+    piece_validate_fn validate;
     void *ctx;
     size_t page, cap, storage, span_payload;
     undo_slab *available;
@@ -355,7 +355,7 @@ static void trim(undo_log *u)
 }
 
 undo_err undo_create(undo_log **out, piece_tree *tree, size_t cap_bytes,
-                     undo_validate_fn validate, void *ctx)
+                     piece_validate_fn validate, void *ctx)
 {
     ASSERT(out && tree && cap_bytes != 0);
     ASSERT(!piece_view_backing(piece_tree_view(tree)) || validate);

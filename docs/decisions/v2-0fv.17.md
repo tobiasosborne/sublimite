@@ -435,3 +435,8 @@ mapped chunks pinned, an empty reserve; base admits the extent's page but not th
 tree (`build/red_step4.log`: the bought extent stayed in the reserve, base's live bytes +4,096) and is green after
 the rollback. Replenish shares `piece_spares_make` (base, and once more after one drain on a refusal);
 `piece_boundary_fund` and `piece_core_memory` are deleted.
+
+**Validator erratum (v2-bkz).** The mapped-backing validator typedef moves from `undo/undo.h` to `piece/piece.h` as
+`piece_validate_fn`, immediately after `piece_backing`. Piece is the lowest layer both undo and journal include.
+Keeping the type in undo would require journal to include undo. The validator contract is signed in the
+[journal wire amendment](wave1-journal-wire-amendment.md#proposed-runtime-section-of-journalh).
