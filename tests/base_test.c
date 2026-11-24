@@ -107,6 +107,19 @@ static void test_pool(void)
     base_pool_put(&pool, a);
     ASSERT(base_pool_get(&pool) == a);
     base_pool_free(&pool);
+
+    /* Reset returns every block at once and keeps the reservation: the
+     * pool hands out blocks from the first again, as after init. */
+    ASSERT(base_pool_init(&pool, alignment + 1, alignment, 3) == 0);
+    unsigned char *first = base_pool_get(&pool), *reservation = pool.base;
+    unsigned char *second = base_pool_get(&pool);
+    base_pool_put(&pool, first); /* a free-list entry must not survive reset */
+    base_pool_reset(&pool);
+    ASSERT(base_pool_count_live(&pool) == 0 && pool.base == reservation);
+    ASSERT(base_pool_get(&pool) == first && base_pool_get(&pool) == second);
+    ASSERT(base_pool_get(&pool) != NULL && base_pool_get(&pool) == NULL);
+    ASSERT(base_pool_count_live(&pool) == 3);
+    base_pool_free(&pool);
     puts("pool: ok");
 }
 

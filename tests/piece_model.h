@@ -24,14 +24,10 @@
  * is recounted from the bytes, and every mapped scan sits between two polls.
  * With records, piece_replace_spans runs the provenance debug check.
  *
- * Two uses:
- *  - pm_*: the reference, called directly by tests/piece_test.c and
- *    fuzz/piece_fuzz.c next to the implementation under test;
- *  - with PIECE_MODEL_IMPL defined (tests/piece_model.c, exactly one TU),
- *    external definitions of every piece.h symbol on top of pm_*. A suite
- *    that links build/<cfg>/tests/piece_model.o ahead of libtext.a never
- *    selects the archive's piece.o; a reference that would is a
- *    duplicate-definition link error. */
+ * The reference: pm_* is called directly, through tests/piece_harness.h, by
+ * tests/piece_test.c, tests/undo_test.c and fuzz/piece_fuzz.c next to the
+ * real tree (v2-0fv.17). Until 7b it also stood in for the tree through a
+ * wrapper TU defining every piece.h symbol; 7b deleted that (A24 item 3). */
 #ifndef TESTS_PIECE_MODEL_H
 #define TESTS_PIECE_MODEL_H
 
@@ -669,7 +665,7 @@ static inline piece_err pm_capture(pm_tree *t, uint64_t off, uint64_t len, piece
     pm_iter_init(&it, &t->view, off);
     uint64_t left = len;
     while (left) {
-        const uint8_t *p;
+        const uint8_t *p = NULL; /* set whenever left > 0 (gcc -O2 cannot see it) */
         uint64_t k = pm_min(pm_iter_next(&it, &p), left);
         pm_add_write(t, p, k); /* sources lie below a, the destination at or above */
         left -= k;
@@ -931,181 +927,5 @@ static inline piece_err pm_lines_resolve(pm_tree *t, size_t budget, bool *more)
     *more = false;
     return PIECE_OK;
 }
-
-/* ---- piece.h on top of the model (one TU: tests/piece_model.c) ----------- */
-
-#ifdef PIECE_MODEL_IMPL
-
-#define PM_R(x) ((pm_reserve *)(void *)(x))
-#define PM_T(x) ((pm_tree *)(void *)(x))
-#define PM_CT(x) ((const pm_tree *)(const void *)(x))
-#define PM_S(x) ((pm_snap *)(void *)(x))
-#define PM_CS(x) ((const pm_snap *)(const void *)(x))
-#define PM_V(x) ((const pm_view *)(const void *)(x))
-
-_Static_assert(sizeof(pm_iter) <= sizeof(piece_iter), "pm_iter fits piece_iter");
-_Static_assert(_Alignof(pm_iter) <= _Alignof(piece_iter), "pm_iter alignment");
-
-static uint32_t pm_join_counts(uint32_t a, uint32_t b)
-{
-    return a == PIECE_NL_UNKNOWN || b == PIECE_NL_UNKNOWN ? PIECE_NL_UNKNOWN : a + b;
-}
-
-piece_span_nl piece_span_nl_join(piece_span left, piece_span_nl ln,
-                                 piece_span right, piece_span_nl rn)
-{
-    ASSERT(left.len && right.len && ((left.src ^ right.src) & PIECE_SPAN_ADD) == 0);
-    ASSERT(right.src > left.src && right.src - left.src == left.len &&
-           right.len - 1 <= UINT64_MAX - right.src);
-    /* Tagged offsets preserve the chunk grid because the tag is chunk
-     * aligned. A shared seam may belong to the head, tail, or neither. */
-    uint64_t first = left.src / PIECE_CHUNK, seam = right.src / PIECE_CHUNK;
-    uint64_t last = (right.src + right.len - 1) / PIECE_CHUNK;
-    uint32_t head = first == seam ? pm_join_counts(ln.head, rn.head) : ln.head;
-    uint32_t tail = 0;
-    if (last != first) {
-        if (last != seam) tail = rn.tail;
-        else if (right.src % PIECE_CHUNK == 0) tail = rn.head;
-        else tail = pm_join_counts(ln.tail, rn.head);
-    }
-    return (piece_span_nl){head, tail};
-}
-
-piece_err piece_reserve_create(piece_reserve **out)
-{
-    ASSERT(out != NULL);
-    pm_reserve *r;
-    piece_err e = pm_reserve_create(&r);
-    *out = (piece_reserve *)(void *)r;
-    return e;
-}
-void piece_reserve_destroy(piece_reserve *r) { pm_reserve_destroy(PM_R(r)); }
-
-piece_err piece_open_copy(piece_reserve *r, const uint8_t *bytes, size_t n, piece_tree **out)
-{
-    ASSERT(out != NULL);
-    pm_tree *t;
-    piece_err e = pm_open_copy(PM_R(r), bytes, n, &t);
-    *out = (piece_tree *)(void *)t;
-    return e;
-}
-piece_err piece_open_mapped(piece_reserve *r, const piece_backing *b, piece_tree **out)
-{
-    ASSERT(out != NULL);
-    pm_tree *t;
-    piece_err e = pm_open_mapped(PM_R(r), b, &t);
-    *out = (piece_tree *)(void *)t;
-    return e;
-}
-void piece_close(piece_tree *t) { pm_close(PM_T(t)); }
-const piece_view *piece_tree_view(const piece_tree *t)
-{
-    return (const piece_view *)(const void *)pm_tree_view(PM_CT(t));
-}
-uint64_t piece_add_length(const piece_tree *t) { return pm_add_length(PM_CT(t)); }
-
-uint64_t piece_length(const piece_view *v) { return pm_length(PM_V(v)); }
-uint8_t piece_byte_at(const piece_view *v, uint64_t off) { return pm_byte_at(PM_V(v), off); }
-const piece_backing *piece_view_backing(const piece_view *v) { return pm_view_backing(PM_V(v)); }
-
-void piece_iter_init(piece_iter *it, const piece_view *v, uint64_t off)
-{
-    ASSERT(it != NULL);
-    pm_iter m;
-    pm_iter_init(&m, PM_V(v), off);
-    memcpy(it, &m, sizeof m);
-}
-void piece_iter_seek(piece_iter *it, uint64_t off)
-{
-    pm_iter m;
-    memcpy(&m, it, sizeof m);
-    pm_iter_seek(&m, off);
-    memcpy(it, &m, sizeof m);
-}
-size_t piece_iter_next(piece_iter *it, const uint8_t **p)
-{
-    pm_iter m;
-    memcpy(&m, it, sizeof m);
-    size_t n = pm_iter_next(&m, p);
-    memcpy(it, &m, sizeof m);
-    return n;
-}
-bool piece_iter_next_span(piece_iter *it, uint64_t end, piece_span *out, piece_span_nl *nl)
-{
-    pm_iter m;
-    memcpy(&m, it, sizeof m);
-    bool more = pm_iter_next_span(&m, end, out, nl);
-    memcpy(it, &m, sizeof m);
-    return more;
-}
-
-piece_err piece_replace(piece_tree *t, uint64_t off, uint64_t del, const uint8_t *bytes, size_t n)
-{
-    return pm_replace(PM_T(t), off, del, bytes, n);
-}
-piece_err piece_replace_spans(piece_tree *t, uint64_t off, uint64_t del, const piece_span *spans,
-                              const piece_span_nl *nl, size_t count)
-{
-    return pm_replace_spans(PM_T(t), off, del, spans, nl, count);
-}
-piece_err piece_capture(piece_tree *t, uint64_t off, uint64_t len, piece_span *out)
-{
-    return pm_capture(PM_T(t), off, len, out);
-}
-
-piece_err piece_snapshot_take(piece_tree *t, piece_snapshot **out)
-{
-    ASSERT(out != NULL);
-    pm_snap *s;
-    piece_err e = pm_snapshot_take(PM_T(t), &s);
-    *out = (piece_snapshot *)(void *)s;
-    return e;
-}
-piece_snapshot *piece_snapshot_retain(piece_snapshot *s)
-{
-    return (piece_snapshot *)(void *)pm_snapshot_retain(PM_S(s));
-}
-void piece_snapshot_release(piece_snapshot *s) { pm_snapshot_release(PM_S(s)); }
-const piece_view *piece_snapshot_view(const piece_snapshot *s)
-{
-    return (const piece_view *)(const void *)pm_snapshot_view(PM_CS(s));
-}
-
-piece_err piece_checkpoint_begin(piece_tree *t) { return pm_checkpoint_begin(PM_T(t)); }
-void piece_checkpoint_commit(piece_tree *t) { pm_checkpoint_commit(PM_T(t)); }
-void piece_checkpoint_abort(piece_tree *t) { pm_checkpoint_abort(PM_T(t)); }
-
-piece_err piece_replenish(piece_tree *t) { return pm_replenish(PM_T(t)); }
-bool piece_reclaim(piece_tree *t, size_t budget) { return pm_reclaim(PM_T(t), budget); }
-
-/* Lines (draft section). */
-bool piece_lines_before(const piece_view *v, uint64_t off, uint64_t *count)
-{
-    return pm_lines_before(PM_V(v), off, count);
-}
-bool piece_lines_start(const piece_view *v, uint64_t line, uint64_t *off, uint64_t *before)
-{
-    return pm_lines_start(PM_V(v), line, off, before);
-}
-bool piece_lines_count(const piece_backing *b, uint64_t first, uint32_t *counts, size_t n)
-{
-    return pm_lines_count(b, first, counts, n);
-}
-bool piece_lines_adopt(piece_tree *t, os_fault_id source, uint64_t first, const uint32_t *counts, size_t n)
-{
-    return pm_lines_adopt(PM_T(t), source, first, counts, n);
-}
-piece_err piece_lines_resolve(piece_tree *t, size_t budget, bool *more)
-{
-    return pm_lines_resolve(PM_T(t), budget, more);
-}
-
-size_t piece_app_id_len(void) { return strlen(os_app_id()); }
-
-/* Test hook (v2-0fv.7 §8): the model has no shape, so it never refuses. */
-void piece_test_set_height_limit(unsigned levels);
-void piece_test_set_height_limit(unsigned levels) { ASSERT(levels <= PIECE_MAX_HEIGHT); }
-
-#endif /* PIECE_MODEL_IMPL */
 
 #endif

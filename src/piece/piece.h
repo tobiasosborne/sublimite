@@ -62,15 +62,35 @@
  * private ORIGINAL copy. All of it comes from src/base, which reserves
  * through os_vm_reserve; nothing here calls malloc. Admission is a function,
  * not a state: a call that can need storage computes its own claim from the
- * tree's current shape before it changes anything, and funds it from its
- * core's free slots, then the reserve's whole free extents, then storage
- * already returned by retirement (draining its tree's retirement queue
- * first), then base. It returns PIECE_ERR_NOMEM exactly when base refused the
- * remainder. Nothing latches: the next call tries afresh. A caller asks
- * nothing before an edit; a compound command runs under a checkpoint, whose
- * abort cannot fail. After each submitted command the UI calls
- * piece_replenish, outside the input-to-submit window, so the next ordinary
- * command finds its claim funded and calls base only for new ADD chunks. */
+ * tree's current shape before it changes anything (A26): an ordinary command
+ * whose scalar claim and companion storage are already local proceeds;
+ * otherwise its exact need is planned, then funded from its core's free
+ * slots and the reserve's whole free extents, then, once, from its tree's
+ * retirement queue and the reserve's inbox, then from base for exactly the
+ * remainder, after returning whole free extents beyond the exact slot need
+ * (erratum, A26 step 4 as amended): a fixed list of base requests taken from
+ * that single plan, the missing extents and then the companion objects (ADD
+ * chunks and their directory nodes, or the private boundary's chunk and
+ * directory nodes), each once and in that order, all before anything is
+ * published, at most ceil(S / e) + 9 x max(k, 1) of them (P: S the planned
+ * slots; e the slots per extent, (page - sizeof(piece_extent)) / 400 B,
+ * which is 10 at a 4,096 B page; k the new ADD chunks. ADD offsets are below
+ * 2^63 by the ASSERT in piece_add_prepare, so chunk indices are below
+ * 2^63 / 2^16 = 2^47 and the 64-way ADD directory has at most
+ * ceil(47 / 6) = 8 levels: a new chunk costs 1 + 8 objects, and so does a
+ * take's private boundary). A refusal returns every object the call took to base
+ * and the call returns PIECE_ERR_NOMEM with the tree, and base apart from
+ * what those steps returned on purpose, as before. Exactness is promised at
+ * quiescence: with no release by
+ * another thread in flight, a call returns PIECE_ERR_NOMEM only when base
+ * refused the exact remainder after every local source was used. While
+ * another thread is releasing storage, a call may be refused that an
+ * immediate retry would not be; nothing latches, the next call tries afresh.
+ * A caller asks nothing before an edit; a compound command runs under a
+ * checkpoint, whose abort cannot fail. After each submitted command the UI
+ * calls piece_replenish, outside the input-to-submit window, so the next
+ * ordinary command finds its claim funded and calls base only for new ADD
+ * chunks. */
 #ifndef PIECE_PIECE_H
 #define PIECE_PIECE_H
 
@@ -309,10 +329,10 @@ piece_err piece_replace(piece_tree *t, uint64_t off, uint64_t del,
  * reference: their coordinates are inserted as given, no byte of the
  * inserted source is copied, and no mapped byte of it is read; a private
  * source (ADD, a private-copy ORIGINAL) may be scanned within the bounds
- * stated under Lines, at most PIECE_CHUNK / 2 = 32,768 B per span end (P),
- * to count it (erratum at 7b, advisor 2026-11-23: the guarantee was always
- * about mapped bytes, which can fault and block on storage; private memory
- * can do neither). Its destination cuts read as the Editing preamble states. nl is NULL or count records carried with the spans
+ * stated under Lines, at most 511 B per span end (P, the end's partial
+ * 512 B prefix block), to count it (errata at 7b, advisor 2026-11-23 and A24:
+ * the guarantee was always about mapped bytes, which can fault and block on
+ * storage; private memory can do neither). Its destination cuts read as the Editing preamble states. nl is NULL or count records carried with the spans
  * (piece_span_nl; its provenance rule is a precondition of this call). A
  * counted part goes in counted; a whole chunk whose count the core's table
  * holds is counted from the table whatever the record says; private storage
@@ -366,7 +386,11 @@ piece_err piece_capture(piece_tree *t, uint64_t off, uint64_t len,
  * nodes with the snapshot and copies none. PIECE_ERR_NOMEM, with *out NULL.
  * ASSERT: out != NULL. */
 piece_err piece_snapshot_take(piece_tree *t, piece_snapshot **out);
-/* Adds an owner and returns s. Any thread, O(1), claims nothing. */
+/* Adds an owner and returns s. Any thread, O(1), claims nothing.
+ * ASSERT: s is owned, and it has fewer than 2^64 - 1 owners, a bound no
+ * program reaches: every owner occupies storage of its own, so 2^64 of them
+ * cannot exist in a 2^47- or 2^56-byte address space (P). The same bound
+ * holds a core's owners, its tree and one per live snapshot header. */
 piece_snapshot *piece_snapshot_retain(piece_snapshot *s);
 /* Drops one owner, exactly once per owner. Any thread, O(1). The last
  * release of an open tree's snapshot queues its exclusive storage for
@@ -413,8 +437,11 @@ piece_err piece_replenish(piece_tree *t);
  * leaves its exclusive storage queued on t. Performs at most budget steps,
  * each dropping one reference to a slot or chunk, and returns whole empty
  * extents to the reserve; true while queued work remains. budget 0 only
- * asks. Allocates nothing. Latency only: admission drains the queue itself
- * before it reports PIECE_ERR_NOMEM, and close drains the rest. */
+ * asks. Allocates nothing. For edits, takes and their companion storage it
+ * is latency only: their admission drains the queue itself before it
+ * reports PIECE_ERR_NOMEM, and close drains the rest. piece_lines_resolve
+ * never drains it (A24): the post-submit order is piece_reclaim,
+ * piece_lines_resolve, piece_replenish. */
 bool piece_reclaim(piece_tree *t, size_t budget);
 
 /* ---- Lines (frozen at the advisor's read, 2026-11-23) ------------------- */
@@ -437,11 +464,15 @@ bool piece_reclaim(piece_tree *t, size_t budget);
  *  - bytes piece_replace or piece_capture copies, while copying them;
  *  - a span inserted by reference: known carried counts; whole chunks from
  *    the core's chunk table, which overrides an UNKNOWN record; in private
- *    storage the store's chunk totals and prefix counts, scanning at most
- *    PIECE_CHUNK / 2 per end; any other mapped part goes in unknown;
- *  - the halves of a cut: a counted descriptor by scanning its shorter half
- *    (at most PIECE_CHUNK / 2 = 32,768 B (P)) and subtracting; the halves of
- *    an unknown descriptor stay unknown and nothing is read.
+ *    storage the store's chunk totals and 512 B block prefix counts,
+ *    scanning at most 511 B per end (P, one partial block); any other
+ *    mapped part goes in unknown;
+ *  - the halves of a cut: a counted mapped descriptor by scanning its
+ *    shorter half (at most PIECE_CHUNK / 2 = 32,768 B (P)) and subtracting;
+ *    a private one by counting its left part from the block prefixes, at
+ *    most the partial block at each end of that part, 2 x 511 = 1,022 B (P;
+ *    no shorter-side choice: private memory cannot fault or block, A24);
+ *    the halves of an unknown descriptor stay unknown and nothing is read.
  * An unknown entry becomes counted only through piece_lines_resolve once its
  * chunk's table entry is present: a whole chunk from the table, a partial one
  * by a UI scan of at most PIECE_CHUNK. Every counted mapped entry descends
@@ -544,33 +575,38 @@ bool piece_lines_adopt(piece_tree *t, os_fault_id source, uint64_t first,
 /* The resolve sweep: walks the live tree in document order from its cursor
  * and rewrites each unknown entry the chunk table can count, copying each
  * shared path before it publishes, so snapshots keep their answers, inexact
- * ones included. One call visits at most budget nodes, ancestors walked for
- * a copy and misses included, whatever the tree holds: a tree of unknown
- * entries whose chunks are not yet adopted costs a bounded amount per call
- * and nothing on the typing path. The copies cost up to one copy of every
- * node, e.g. 730 x 400 = 292,000 B for a packed 1 GiB tree whose old root a
- * snapshot pins (P, 683 leaves + 47 branches), and are admitted like an
- * edit's: PIECE_ERR_NOMEM changes nothing, cursor included, and can be
- * retried; run it before piece_replenish, whose top-up it would otherwise
- * spend. On PIECE_OK the cursor moves past the entries it rewrote, now
- * published, and past the ineligible ones it visited. Any successful live
+ * ones included. Ownership is decided on the visited path: an entry whose
+ * leaf and ancestors the live tree alone owns is rewritten in place and
+ * needs no slot. One call descends into at most budget nodes (ancestors
+ * walked for a copy and misses included); each branch it copies also updates
+ * the reference counts of that branch's children, at most 16 per copy (P,
+ * the branch fanout), so a call touches at most 17 x budget nodes, whatever
+ * the tree holds. It funds its copies from the core's free slots, the
+ * reserve and base, and never walks the retirement queue (A24; piece_reclaim
+ * frees that, run it first). A tree of unknown entries whose chunks are not
+ * yet adopted therefore costs a bounded amount per call and nothing on the
+ * typing path. The copies cost up to one
+ * copy of every node, e.g. 730 x 400 = 292,000 B for a packed 1 GiB tree
+ * whose old root a snapshot pins (P, 683 leaves + 47 branches). When a copy
+ * cannot be funded the call stops there: PIECE_OK if it rewrote something
+ * before (published, the cursor before the first entry it could not
+ * publish), else PIECE_ERR_NOMEM, which changes nothing, cursor included,
+ * and can be retried; run it before piece_replenish, whose top-up it would
+ * otherwise spend. On PIECE_OK the cursor moves past the entries it
+ * rewrote, now published, and past the ineligible ones it visited. Any successful live
  * edit, any abort, and an adoption that adds a chunk invalidate the cursor,
  * so no eligible entry is skipped forever; an identical re-adoption does not.
  * *more is false when no eligible work remains for the current root and
  * table (a later batch can make more eligible). Liveness: with root and
  * table unchanged and admission succeeding, a call with budget >= h + 1 (one
  * root-to-leaf walk) reports *more false or moves the cursor forward. A call
- * that replaces the root invalidates the snapshot cache and ends the live
- * view's revision (live iterators need a seek; the text is unchanged). An
+ * that replaces a node by a copy (the root, or a shared node under an
+ * exclusive root) invalidates the snapshot cache and ends the live view's
+ * revision (live iterators need a seek; the text is unchanged); a rewrite
+ * in place ends neither. An
  * abort may restore an unknown root: the table stays, and the invalidated
  * cursor makes that root eligible without allocating. UI only, outside the
  * input-to-submit window. ASSERT: more != NULL. */
 piece_err piece_lines_resolve(piece_tree *t, size_t budget, bool *more);
-
-/* ---- Transitional (not part of the frozen API) -------------------------- */
-
-/* The Wave 0 link smoke symbol, still called by src/edit/edit.c and
- * tests/layer_L1_test.c. v2-0fv.7b removes it with the stub. */
-size_t piece_app_id_len(void);
 
 #endif

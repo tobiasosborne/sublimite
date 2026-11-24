@@ -51,6 +51,10 @@ void *base_pool_get(base_pool *p);             /* NULL when full */
  * unissued address fails the ASSERT; a second return is not detected. */
 void  base_pool_put(base_pool *p, void *ptr);
 size_t base_pool_count_live(const base_pool *p);
+/* Initialized pool. Returns every block at once and keeps the reservation:
+ * the pool is as after init, handing out blocks from the first again.
+ * Blocks still held become invalid; O(1), touches no block. */
+void  base_pool_reset(base_pool *p);
 void  base_pool_free(base_pool *p);
 
 /* ---- SIMD dispatch: cached after first call ---------------------------- */

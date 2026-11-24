@@ -11,11 +11,17 @@
  * armed only around an IUT call, so the reference is never refused.
  *
  * Every use of piece_span and piece_span_nl goes through ph_spans, so a
- * change to the carried-count record stays local to it. */
+ * change to the carried-count record stays local to it.
+ *
+ * The IUT is the real tree (v2-0fv.17): every user links
+ * build/<cfg>/src/piece/piece_test_hooks.o, whose revision counter tells
+ * the harness when a resolve replaced the root (piece.h: that invalidates
+ * the snapshot cache, which is hidden shape, like the height limit). */
 #ifndef TESTS_PIECE_HARNESS_H
 #define TESTS_PIECE_HARNESS_H
 
 #include "piece_model.h"
+#include "piece/piece_test.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,16 +40,55 @@ static int ph_failures;
 
 os_err __real_os_vm_reserve(void **out, size_t len);
 os_err __wrap_os_vm_reserve(void **out, size_t len);
+void __real_os_vm_release(void *addr, size_t len);
+void __wrap_os_vm_release(void *addr, size_t len);
 
 static atomic_bool ph_refusing;
 static atomic_size_t ph_reserve_calls; /* every call, granted or refused */
+/* Base as a fixed capacity (-Wl,--wrap=os_vm_release too): bytes reserved
+ * and not yet released, process-wide, and the cap a reservation may not
+ * cross; SIZE_MAX (the default) is no cap. */
+static atomic_size_t ph_live_bytes;
+static atomic_size_t ph_cap_bytes = SIZE_MAX;
+
+/* Runs once, inside the next refused reservation (then clears): places an
+ * event (a worker's last release) between base's refusal and the caller's
+ * next look at its supply, a schedule no thread timing can pin. */
+static void (*ph_on_refusal)(void);
+
+static inline os_err ph_refused(void)
+{
+    void (*hook)(void) = ph_on_refusal;
+    ph_on_refusal = NULL;
+    if (hook) hook();
+    return OS_E_NOMEM;
+}
 
 os_err __wrap_os_vm_reserve(void **out, size_t len)
 {
     atomic_fetch_add(&ph_reserve_calls, 1);
-    if (atomic_load(&ph_refusing)) return OS_E_NOMEM;
-    return __real_os_vm_reserve(out, len);
+    if (atomic_load(&ph_refusing)) return ph_refused();
+    if (len > atomic_load(&ph_cap_bytes) - atomic_load(&ph_live_bytes)) return ph_refused();
+    os_err e = __real_os_vm_reserve(out, len);
+    if (e == OS_OK) atomic_fetch_add(&ph_live_bytes, len);
+    return e;
 }
+
+void __wrap_os_vm_release(void *addr, size_t len)
+{
+    atomic_fetch_sub(&ph_live_bytes, len);
+    __real_os_vm_release(addr, len);
+}
+
+/* Caps base at what is reserved now: a later reservation fits only after a
+ * release of at least its size. ph_uncap() lifts it. */
+static inline void ph_cap_at_live(void) { atomic_store(&ph_cap_bytes, atomic_load(&ph_live_bytes)); }
+/* Caps base at what is reserved now plus `extra` bytes. */
+static inline void ph_cap_at_live_plus(size_t extra)
+{
+    atomic_store(&ph_cap_bytes, atomic_load(&ph_live_bytes) + extra);
+}
+static inline void ph_uncap(void) { atomic_store(&ph_cap_bytes, SIZE_MAX); }
 
 static inline void ph_refuse(bool on) { atomic_store(&ph_refusing, on); }
 static inline size_t ph_calls(void) { return atomic_load(&ph_reserve_calls); }
@@ -304,6 +349,7 @@ typedef struct ph_state {
     piece_snapshot *last; /* the previous take, and whether the text moved since */
     pm_snap *mlast;
     bool moved;
+    uint64_t last_revision; /* the live revision at the previous take */
     bool height_limited; /* a test hook lowered the limit: RANGE is allowed */
     uint64_t seed;
     unsigned steps;
@@ -397,13 +443,26 @@ static inline void ph_expect_err(const ph_state *st, piece_err e, bool refused, 
 
 static inline void ph_moved(ph_state *st) { st->moved = true; }
 
+/* The live view's revision (white-box). Only a successful non-empty edit, an
+ * abort, or a resolve that replaced the root may change it. */
+static inline uint64_t ph_revision(const ph_state *st) { return piece_test_measure(st->t).revision; }
+
+/* An error changes nothing observable, the live revision included. */
+static inline void ph_check_kept(const ph_state *st, piece_err e, uint64_t revision, const char *op)
+{
+    if (e != PIECE_OK)
+        PH_CHECK(ph_revision(st) == revision, "%s returned %d and moved the revision", op, (int)e);
+}
+
 static inline void ph_op_replace(ph_state *st, uint64_t off, uint64_t del, const uint8_t *bytes, size_t n,
                                  bool refuse)
 {
+    uint64_t revision = ph_revision(st);
     ph_refuse(refuse);
     piece_err e = piece_replace(st->t, off, del, bytes, n);
     ph_refuse(false);
     ph_expect_err(st, e, refuse, "replace");
+    ph_check_kept(st, e, revision, "replace");
     if (e != PIECE_OK) return;
     PH_CHECK(pm_replace(st->m, off, del, bytes, n) == PIECE_OK, "model replace");
     if (del || n) ph_moved(st);
@@ -412,10 +471,12 @@ static inline void ph_op_replace(ph_state *st, uint64_t off, uint64_t del, const
 static inline void ph_op_replace_spans(ph_state *st, uint64_t off, uint64_t del, const ph_spans *l,
                                        bool with_nl, bool refuse)
 {
+    uint64_t revision = ph_revision(st);
     ph_refuse(refuse);
     piece_err e = piece_replace_spans(st->t, off, del, l->s, with_nl ? l->nl : NULL, l->n);
     ph_refuse(false);
     ph_expect_err(st, e, refuse, "replace_spans");
+    ph_check_kept(st, e, revision, "replace_spans");
     if (e != PIECE_OK) return;
     PH_CHECK(pm_replace_spans(st->m, off, del, l->s, NULL, l->n) == PIECE_OK, "model replace_spans");
     if (del || l->n) ph_moved(st);
@@ -424,11 +485,13 @@ static inline void ph_op_replace_spans(ph_state *st, uint64_t off, uint64_t del,
 static inline void ph_op_capture(ph_state *st, uint64_t off, uint64_t len, unsigned li, bool refuse)
 {
     piece_span got = {0, 0}, want = {0, 0};
-    uint64_t a = piece_add_length(st->t);
+    uint64_t a = piece_add_length(st->t), revision = ph_revision(st);
     ph_refuse(refuse);
     piece_err e = piece_capture(st->t, off, len, &got);
     ph_refuse(false);
     ph_expect_err(st, e, refuse, "capture");
+    /* The text is unchanged: live iterators and the cache survive (piece.h). */
+    PH_CHECK(ph_revision(st) == revision, "capture moved the live revision");
     if (e != PIECE_OK) return;
     PH_CHECK(pm_capture(st->m, off, len, &want) == PIECE_OK, "model capture");
     PH_CHECK(ph_span_eq(got, want) && got.src == (PIECE_SPAN_ADD | a), "capture span {%llx, %llu}",
@@ -463,7 +526,8 @@ static inline void ph_op_take(ph_state *st, unsigned slot, bool refuse)
         st->s[slot] = NULL;
         st->ms[slot] = NULL;
     }
-    bool hit = st->last && !st->moved;
+    /* A resolve that replaced the root ended the cache without an edit. */
+    bool hit = st->last && !st->moved && ph_revision(st) == st->last_revision;
     size_t c0 = ph_calls();
     piece_snapshot *s;
     ph_refuse(refuse);
@@ -492,6 +556,7 @@ static inline void ph_op_take(ph_state *st, unsigned slot, bool refuse)
     st->last = s;
     st->mlast = ms;
     st->moved = false;
+    st->last_revision = ph_revision(st);
 }
 
 static inline void ph_op_release(ph_state *st, unsigned slot)

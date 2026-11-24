@@ -104,6 +104,14 @@ void base_pool_put(base_pool *p, void *ptr)
 
 size_t base_pool_count_live(const base_pool *p) { return p->live; }
 
+void base_pool_reset(base_pool *p)
+{
+    ASSERT(p->base != NULL);
+    p->fresh = 0;
+    p->live = 0;
+    p->free_head = NULL;
+}
+
 void base_pool_free(base_pool *p)
 {
     if (p->base)

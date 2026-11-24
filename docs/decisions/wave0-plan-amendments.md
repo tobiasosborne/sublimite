@@ -355,8 +355,24 @@ Procedure (at most two plan computations and one base request per call):
 3. Otherwise use every local source once: drain this tree's retirement queue, take what the reserve and its inbox offer,
    then compute the exact plan again, once (the drain can remove the sharing that made copies necessary); if the
    remainder is now zero, proceed.
-4. Return to base every whole free extent beyond the exact slot need, then ask base once for exactly the remainder:
-   granted -> proceed; refused -> PIECE_ERR_NOMEM, nothing changed.
+4. Return to base every whole free extent beyond the exact slot need, then ask base for exactly the remainder:
+   granted -> proceed; refused -> PIECE_ERR_NOMEM, nothing changed. Amended (advisor, 2026-11-24, on Astra's
+   admission read, step 4): "once" is about the plan, not the number of calls. (a) The base requests of one call are
+   a fixed list taken from the single exact plan of step 3: the missing extents, then the companion objects (ADD
+   chunks and their directory nodes, or the private boundary's chunk and directory nodes). No plan is recomputed
+   after any request, no request is repeated, the order is fixed. (b) All requests come before publication; any
+   refusal returns every object this call took back to base (not into the tree's reserve), and the call returns
+   PIECE_ERR_NOMEM with the tree and base's available bytes as they were before the call, apart from what steps 3
+   and 4 returned to base on purpose (retired storage, surplus extents), which stays returned. (c) The list has a
+   stated maximum length per call, structural (Law 4): at most ceil(S / e) + 9 x max(k, 1) objects (P: S the
+   plan's slots; e the slots per extent, (page - sizeof(piece_extent)) / PIECE_SLOT, 10 at a 4,096 B page with
+   PIECE_SLOT = 400 B (piece.c, asserted in piece_shape_test); k the new ADD chunks. The enforced bound on ADD offsets
+   is ASSERT(mark < PIECE_SPAN_ADD - n) with PIECE_SPAN_ADD = 2^63, so chunk indices lie below 2^63 / 2^16 = 2^47
+   and the 64-way directory has at most ceil(47 / 6) = 8 levels; one new chunk costs 1 + 8 objects, and a take's
+   private boundary 1 chunk + at most 8 nodes; a call has ADD objects or boundary objects, never both). Derivation
+   in docs/decisions/v2-0fv.17.md §8.10. Erratum at landing (advisor, 2026-11-24): the first wording assumed ADD
+   offsets below 2^47 from the address space, which nothing enforces. Rule from here: a bound in a header that
+   names 2^47 or 2^48 is struck on sight unless an ASSERT in the code enforces it.
 Tests: I's and A(1)'s traces assert the contract (refused during the race, the identical retry succeeds, nothing
 latched); J and K test steps 4, 2 and 1. piece_fund_exact's loop and its predicates are deleted (a deletion round).
 

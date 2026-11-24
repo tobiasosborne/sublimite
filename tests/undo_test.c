@@ -4,8 +4,10 @@
 
 /* (G) A13's large mapped fixture, with each cut just inside a different
  * boundary chunk. The model gate uses ADD growth for the bytes copied.
- * Real tree (7b): count ORIGINAL reads around delete + undo and assert
- * mapped_bytes_read <= 2 * PIECE_CHUNK (P, A13 and v2-0fv.7 section 6). */
+ * Real tree (7b, v2-0fv.17): ORIGINAL bytes read across describe + delete +
+ * undo, setup and verification excluded, are at most 2 * PIECE_CHUNK (P, A13
+ * and v2-0fv.7 section 6), counted by the piece test hooks; midpoint_reads
+ * attains the bound through undo. */
 #define LARGE_LEN (513u * PIECE_CHUNK)
 
 /* (P, A20) Eight inline entries at 24 B, tag/count at 16 B, record
@@ -157,7 +159,9 @@ static void one_span_mapped(void)
     ph_describe(v, off, len, true, &original);
     ASSERT(original.n == 1); /* (P) contiguous mapped offsets */
     const uint64_t add = piece_add_length(f.tree);
+    piece_test_reset_reads(f.tree);
     ASSERT(erase_cmd(f.log, off, len, false, &first, &last) == UNDO_OK);
+    size_t mapped_read = piece_test_measure(f.tree).mapped_reads;
     ASSERT(piece_add_length(f.tree) == add);
     ASSERT(pm_checkpoint_begin(model) == PIECE_OK);
     ASSERT(pm_replace(model, off, len, NULL, 0) == PIECE_OK);
@@ -173,7 +177,13 @@ static void one_span_mapped(void)
     ASSERT(piece_length(v) == sizeof sample - len);
     trust = true;
     expect_replay = &original;
+    piece_test_reset_reads(f.tree);
     ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && expect_replay == NULL);
+    mapped_read += piece_test_measure(f.tree).mapped_reads;
+    /* (P) Each cut lies one byte inside its chunk: the shorter halves are
+     * 1 B at each end, for describe and for delete; the undo cuts nothing.
+     * (G) A13: at most 2 x 65,536. */
+    ASSERT(mapped_read == 4u && mapped_read <= 2u * PIECE_CHUNK);
     ASSERT(piece_add_length(f.tree) == add && piece_length(v) == sizeof sample);
     pm_checkpoint_abort(model);
     ph_check_lines(v, pm_tree_view(model), off, 1, true, "after mapped undo");
@@ -796,12 +806,46 @@ static void late_fault_rollback(void)
     ph_map_unref(&mp);
 }
 
+/* The A13 bound attained through undo (real tree): two counted mapped chunks
+ * with an LF at every even offset; erase [H, C + H), H = 32,768. Undo
+ * describes it with counts (two H-byte cuts), the deletion cuts the same
+ * two places (2 x H), and the undo reinserts at a seam whose survivors have a
+ * C-byte source gap, so nothing is cut: 4H = 131,072 B (P). */
+static void midpoint_reads(void)
+{
+    static uint8_t sample[2u * PIECE_CHUNK];
+    for (size_t i = 0; i < sizeof sample; i++) sample[i] = i % 2u ? 'a' : '\n';
+    const uint64_t half = PIECE_CHUNK / 2u;
+    ph_mapping mp;
+    ASSERT(ph_map_open(&mp, sample, sizeof sample));
+    fixture f;
+    ASSERT(piece_reserve_create(&f.reserve) == PIECE_OK);
+    ASSERT(piece_open_mapped(f.reserve, &mp.b, &f.tree) == PIECE_OK);
+    bool trust = true;
+    ASSERT(undo_create(&f.log, f.tree, SIZE_MAX, trusted, &trust) == UNDO_OK);
+    ASSERT(ph_lines_complete(f.tree, &mp, "midpoint resolve"));
+    const piece_view *v = piece_tree_view(f.tree);
+    piece_test_reset_reads(f.tree);
+    ASSERT(erase_cmd(f.log, half, PIECE_CHUNK, false, &first, &last) == UNDO_OK);
+    undo_change c;
+    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    size_t mapped_read = piece_test_measure(f.tree).mapped_reads;
+    ASSERT(mapped_read == 4u * half && mapped_read <= 2u * PIECE_CHUNK);
+    uint64_t rank;
+    ASSERT(piece_length(v) == sizeof sample && piece_lines_before(v, sizeof sample, &rank) &&
+           rank == sizeof sample / 2u);
+    close_fixture(f);
+    ph_map_unref(&mp);
+    printf("undo mapped reads (P): describe + delete + undo %zu B <= 131,072 B (G, A13)\n", mapped_read);
+}
+
 int main(void)
 {
     ASSERT(assert_death(mapped_without_validator, "src/undo/undo.c",
                         "!piece_view_backing(piece_tree_view(tree)) || validate"));
     ASSERT(assert_death(wrote_during_yield, "src/undo/undo.c", "now == u->replay.guard"));
     one_span_mapped();
+    midpoint_reads();
     late_fault_rollback();
     threshold();
     external_store();

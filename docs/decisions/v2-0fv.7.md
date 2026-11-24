@@ -418,3 +418,29 @@ with the same prefixes and totals can place an LF at offset 0 or 1, and a NULL-c
 scan to stay exact. Corrected text: no byte of the inserted source is copied and no mapped byte of it is read; a private
 source may be scanned within the bounds stated under Lines, at most PIECE_CHUNK / 2 = 32,768 B per span end (P). The
 guarantee was always about mapped bytes, which can fault and block on storage; private memory can do neither.
+
+## Erratum 2 (7b source read, A24, 2026-11-24)
+
+Private reads. The Lines text said a private source is scanned "at most PIECE_CHUNK / 2 per end" and that a cut scans
+"its shorter half". The real tree counts private storage from its 512 B block prefixes (ADD chunks and the private-copy
+ORIGINAL both keep them), so the bounds are smaller and one cut rule does not fit both stores. Corrected text in
+`piece.h`: a span inserted by reference reads at most 511 B per span end (P, the end's partial prefix block; a chunk
+boundary or a block boundary reads nothing); a cut of a counted private descriptor counts its left part from the
+prefixes, reading at most the partial block at each end of that part, 2 × 511 = 1,022 B (P), with no shorter-side
+choice (A24: private memory cannot fault or block, so the cheaper side buys nothing the contract needs); a mapped cut
+still scans its shorter half, at most 32,768 B (P). Counter-example to a single 511 B bound for a private cut: an ADD
+descriptor starting at chunk offset 511, cut at offset 1,535, needs the prefix at both ends of [511, 1,535): 511 + 511 B
+(P). The ruling's "one 512 B prefix block less one" holds per end, which is the form the header now states.
+
+Resolve (A24 on the 7b source read D, E). Ownership is decided on the visited path (an entry under exclusively owned
+nodes is rewritten in place with no slot), copies are funded from free slots, the reserve and base and never from the
+retirement queue, so "one call visits at most budget nodes" holds as written; a copy that cannot be funded stops the
+call, which returns PIECE_OK with what it published before, or PIECE_ERR_NOMEM with nothing changed. A copy that
+replaces any node of the live tree, not only the root, ends the revision and the snapshot cache.
+
+Owners (A24 on F). `piece_snapshot_retain` states its precondition: fewer than 2^64 − 1 owners, unreachable because
+every owner occupies storage of its own (P); core and snapshot owner counts are 64-bit.
+
+Model wrapper (A24 item 3). `tests/piece_model.c` and the model's `PIECE_MODEL_IMPL` section (piece.h on top of the
+model, §7's "one link mechanism") are deleted: since 7b every suite links the real tree, and the model serves as
+the reference only, through `tests/piece_harness.h`.

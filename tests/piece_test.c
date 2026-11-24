@@ -2,13 +2,15 @@
  * of the frozen sections is checked against the flat model
  * (tests/piece_model.h) through tests/piece_harness.h; the directed cases
  * also carry literal expectations, which check the model itself. The Lines
- * section (a draft) has its own part at the end, checked against the truth
- * of the reference bytes.
+ * section has its own part at the end, checked against the truth of the
+ * reference bytes.
  *
- * Until v2-0fv.7b the suite links the model as the implementation (the
- * Makefile names build/<cfg>/tests/piece_model.o for it); 7b drops that line
- * and links piece.c's PIECE_TEST_HOOKS variant instead. Base refusal comes
- * from -Wl,--wrap=os_vm_reserve (LDFLAGS_piece_test). */
+ * The implementation under test is the real tree (v2-0fv.17): libtext.a's
+ * piece.c, linked through its PIECE_TEST_HOOKS variant
+ * build/<cfg>/src/piece/piece_test_hooks.o for the height limit and the
+ * live revision. The model is the reference only. Base refusal comes from
+ * -Wl,--wrap=os_vm_reserve (LDFLAGS_piece_test). The shape, admission and
+ * read-count checks that only a real tree has are tests/piece_shape_test.c. */
 #include "piece_harness.h"
 
 #include "indent/indent.h"
@@ -16,10 +18,6 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
-
-/* Test hook (§8): lowers the height limit. The model has no shape and never
- * refuses; piece.c defines it under PIECE_TEST_HOOKS. */
-void piece_test_set_height_limit(unsigned levels);
 
 #define CHECK PH_CHECK
 #define SPAN(src, len) ((piece_span){(src), (len)})
@@ -1113,6 +1111,63 @@ static void t_lines_faults(void)
     free(init);
 }
 
+/* FAULTS for cuts and resolve (Muse's 7b test read): a poll that reports a
+ * nonzero epoch or fails, around a cut of a counted mapped descriptor (an edit,
+ * or a description with counts) or around a resolve scan, leaves the entry
+ * unknown: no count read from possibly repaired pages is published. */
+static void lines_fault_cut_resolve(ph_poll mode, const char *tag)
+{
+    enum { N = 2 * PIECE_CHUNK };
+    uint8_t *init = malloc(N);
+    ASSERT(init != NULL);
+    for (size_t i = 0; i < N; i++) init[i] = i % 3u ? 'a' : '\n';
+    ph_mapping map;
+    ph_state st;
+    if (ph_open(&st, init, N, 1, &map) && ph_lines_complete(st.t, &map, tag)) {
+        const piece_view *v = piece_tree_view(st.t);
+        uint64_t count;
+        CHECK(piece_lines_before(v, piece_length(v), &count), "%s: exact before", tag);
+        /* A cut of chunk 0's counted descriptor under the fault. */
+        ph_poll_set(mode);
+        ph_op_replace(&st, 100, 1, NULL, 0, false);
+        ph_poll_set(PH_POLL_REAL);
+        CHECK(!piece_lines_before(v, piece_length(v), &count), "%s: a faulted cut published counts", tag);
+        ph_check_lines(v, pm_tree_view(st.m), 4, 4, false, tag);
+        /* A description with counts that cuts chunk 1's descriptor. */
+        piece_iter it;
+        piece_span sp;
+        piece_span_nl nl;
+        ph_poll_set(mode);
+        piece_iter_init(&it, v, PIECE_CHUNK + 10);
+        bool described = piece_iter_next_span(&it, PIECE_CHUNK + 20, &sp, &nl);
+        ph_poll_set(PH_POLL_REAL);
+        CHECK(described && nl.head == PIECE_NL_UNKNOWN, "%s: a faulted describe counted", tag);
+        piece_iter_init(&it, v, PIECE_CHUNK + 10);
+        CHECK(piece_iter_next_span(&it, PIECE_CHUNK + 20, &sp, &nl) && nl.head != PIECE_NL_UNKNOWN,
+              "%s: describe counts when trusted", tag);
+        /* The resolve scan of chunk 0's unknown halves under the fault. */
+        bool more = true;
+        ph_poll_set(mode);
+        CHECK(piece_lines_resolve(st.t, 64, &more) == PIECE_OK, "%s: faulted resolve", tag);
+        ph_poll_set(PH_POLL_REAL);
+        CHECK(!piece_lines_before(v, piece_length(v), &count), "%s: a faulted resolve published counts", tag);
+        ph_check_lines(v, pm_tree_view(st.m), 5, 4, false, tag);
+        /* Trusted again (the fault was simulated): an edit rewinds the sweep
+         * past the entries it passed under the fault, and it completes. */
+        ph_op_replace(&st, piece_length(v), 0, str("\n"), 1, false);
+        if (ph_lines_complete(st.t, &map, tag))
+            ph_check_lines(v, pm_tree_view(st.m), 6, 8, true, tag);
+    }
+    ph_close(&st);
+    free(init);
+}
+
+static void t_lines_fault_cut_resolve(void)
+{
+    lines_fault_cut_resolve(PH_POLL_FAULTED, "cut and resolve, nonzero epoch");
+    lines_fault_cut_resolve(PH_POLL_ERROR, "cut and resolve, failing poll");
+}
+
 /* B's debug check: a record that is not the true count of its bytes dies by
  * OS_SAN_ASSERT in the sanitizer lanes; the shipped build reads nothing. */
 static void v_record_wrong_count(void)
@@ -1214,6 +1269,7 @@ int main(void)
     t_lines_mixed_end();
     t_lines_snapshot_stable();
     t_lines_faults();
+    t_lines_fault_cut_resolve();
     printf("Lines: %lu exact and %lu inexact answers checked\n", ph_lines_exact, ph_lines_inexact);
     CHECK(ph_lines_exact > 0 && ph_lines_inexact > 0, "the Lines cases must see both kinds of answer");
     if (ph_failures) {
