@@ -13,11 +13,17 @@ branches: push each at every pause or session end; delete the remote branch once
 - Environment faults: a lane failure naming a /tmp path, a missing corpus or an Xvfb display (e.g. after a reboot) is
   rebuilt and rerun, never sent to a worker as a code defect.
 - Landed: 1.22 (cd8e357, v2-0fv.21 os export deletion + nm gate tools/check_exports.py; remote t3/audit-os-exports deleted).
-- 7b: round 4 merged on review/7b2 17da429, lanes green. Astra's admission read (docs/reviews/wave1-piece-7b-admission-
-  astra.md): step 1 MUST-FIX (n = 0 deletion with a non-NULL pointer leaks an ADD reference) sent to the 7b Opus thread;
-  step 4 MUST-FIX (two base requests when a capture crosses a full chunk) awaits the advisor's ruling (coordinator leans to
-  an A26 wording: base asked only for the exact remainder, one request per object, all before publication, any refusal
-  releases the tentative ones). Then merge, lanes, land, close v2-0fv.17, delete remote review/7b2; Opus lane -> L2-2b.
+- Landed: 1.23 (077910a, v2-0fv.17 piece 7b real tree; remote review/7b2 deleted). Bound erratum rule: a header bound
+  naming 2^47 or 2^48 is struck unless an ASSERT enforces it.
+- NEXT for the Opus lane: L2-2b (thread "L2-2b journal runtime (Opus)", wip a94af15 on t3/journal-runtime). Order:
+  move from the piece model to the real tree FIRST, then M4–M6, append, transport, recovery, repair. Rotation is HELD
+  until the advisor signs Q7 amended (wave1-L2-derivations.md; E2: an exclusive grant covers no sync and no
+  content-sized write). Not started at 21:07: Claude room 0.4 < stop line 0.5.
+- Specs awaiting the advisor's joint read: edit (5d57762 + Astra's send-back round running) and savectl revision
+  (62c1441; 8 seam GAPs become amendments to the L2-1 and L2-3 briefs before either is dispatched). Undo erratum bead
+  (E1: replay stops uncommitted; read-only iterator) is filed only once the shape is signed.
+- Filed: v2-ebd (Wave 1 exit export gate: 498 would-fail exports outside os).
+- 7b: LANDED as 1.23 (see above).
 - Specs for the advisor's read: docs/decisions/wave1-savectl-spec.md (Astra); Astra's edit spec (v2-0fv.15) running.
 - Tobias's decisions 2026-11-24: A23's large-file external-replacement contract ACCEPTED (L2-3 proceeds on it); v1
   findings live in v1's tracker — edit-hagx (undo above 32 MiB terminates the editor), edit-v1f5 (post-rename save
