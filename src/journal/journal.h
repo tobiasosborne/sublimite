@@ -767,6 +767,435 @@ typedef struct journal_stream_result {
 journal_codec_err journal_stream_validate(const uint8_t *bytes, size_t len,
                                           journal_stream_result *out);
 
+/* Incremental form of the same rules (L2-2b), for a reader that streams
+ * a file through one record buffer: journal_stream_validate is exactly
+ * a loop of journal_stream_next over its input, so the two can never
+ * disagree. The group position is one explicit state, never a set of
+ * booleans (CLAUDE.md, explicit FSMs). Offsets are stream offsets. */
+typedef enum journal_stream_phase {
+    JOURNAL_STREAM_OUTSIDE = 0,       /* no group open */
+    JOURNAL_STREAM_GROUP_EMPTY,       /* after BEGIN, before any member */
+    JOURNAL_STREAM_GROUP,             /* ordinary group with a member */
+    JOURNAL_STREAM_CHECKPOINT,        /* descriptor seen; INSERT slices */
+    JOURNAL_STREAM_CHECKPOINT_TARGET  /* its trailing TARGET seen */
+} journal_stream_phase;
+typedef struct journal_stream_state {
+    journal_stream_phase phase;
+    uint64_t offset;          /* where the next record starts */
+    uint64_t expected;        /* next non-PAD sequence; 0: none can follow */
+    uint64_t valid;           /* end of the committed prefix */
+    uint64_t records, last_sequence;           /* committed prefix */
+    uint64_t open_records, open_last_sequence; /* including an open group */
+    uint64_t group_at, group_sequence;         /* open group's BEGIN */
+    uint64_t chk_buffer, chk_text_len, chk_sum;
+} journal_stream_state;
+void journal_stream_init(journal_stream_state *s);
+/* Decodes the record at the head of bytes[0, len), which sits at stream
+ * offset s->offset, and checks it against section 7 given everything
+ * fed before. OK: *out borrows bytes and s moves past the record (a PAD
+ * included). Otherwise s is unchanged and the result is
+ * journal_record_decode's (TRUNCATED, INVALID, SEQUENCE), INVALID for
+ * a section-7 violation, or SEQUENCE when the last sequence was
+ * UINT64_MAX. A group still open when the input ends is a torn tail:
+ * the committed prefix (s->valid) stops at its BEGIN. */
+journal_codec_err journal_stream_next(journal_stream_state *s,
+                                      const uint8_t *bytes, size_t len,
+                                      journal_frame *out);
+
+/* ==== Runtime API (L2-2b) ==================================================
+ * One live journal per session, owned by the UI thread; its worker steps
+ * run as jobs on the application's shared work pool (Q7). Sources:
+ * docs/decisions/L2-2b-journal-runtime.md (mechanisms, derivations, the
+ * two state axes), wave1-L2-derivations.md Q3, Q6, Q7, A23.
+ *
+ * WRITE PATH. The UI encodes each record into one fixed buffer and
+ * writes it with exactly one os_file_pwrite_once at the append position
+ * (Q6): no allocation, lock, sync or job submission. JOURNAL_OK means
+ * the whole record is in the named journal's page cache, which is what a
+ * process kill needs (K). Durability against machine loss (M) comes from
+ * sync barriers that journal_pump runs on a worker: the UI first writes
+ * one canonical PAD so the barrier ends on a 4,096 B block (wire section
+ * 4), then a job fdatasyncs a duplicate descriptor while the UI keeps
+ * appending after the PAD. The worker never writes where the UI is
+ * appending, except under a lease (below), during which appends return
+ * BUSY.
+ *
+ * RESULTS of an append:
+ *   JOURNAL_OK            written to the page cache.
+ *   JOURNAL_MORE          journal_insert_step only: one slice written,
+ *                         more remain (*progress advanced).
+ *   JOURNAL_ERR_IO        accepted into RAM but the write failed, was
+ *                         short or wrote nothing: the whole record and
+ *                         its offset are held, suspension latches
+ *                         APPEND_GAP, and journal_pump rewrites it on the
+ *                         worker. Withhold success; never append it again
+ *                         (progress includes it).
+ *   JOURNAL_ERR_BUSY      nothing accepted; the journal makes progress by
+ *                         itself (a lease, a gap or a directory barrier
+ *                         being repaired): stage the record, pump, retry.
+ *   JOURNAL_ERR_SUSPENDED nothing accepted; recovery is suspended until a
+ *                         complete rotation from live state
+ *                         (journal_rotate_start). Keep editing; show it.
+ *   JOURNAL_ERR_FULL      nothing accepted: the image budget or the
+ *                         sequence space is exhausted; suspension latches
+ *                         NEEDS_ROTATION.
+ * Caller errors (wrong group nesting, PAD or markers through
+ * journal_append, NULL arguments) are ASSERTed (A15). */
+#include "base/base.h"
+#include "os/os.h"
+#include "piece/piece.h"
+#include "work/work.h"
+
+typedef enum journal_err {
+    JOURNAL_OK = 0,
+    JOURNAL_MORE,
+    JOURNAL_ERR_IO,
+    JOURNAL_ERR_BUSY,
+    JOURNAL_ERR_SUSPENDED,
+    JOURNAL_ERR_FULL,
+    JOURNAL_ERR_NOMEM,
+    JOURNAL_ERR_EXISTS,   /* journal_open on a name that holds an image no
+                             recovery handed over */
+    JOURNAL_ERR_REFUSED   /* journal_open on a recovery that could not set
+                             its damaged image aside (verdict DAMAGED) */
+} journal_err;
+
+/* Axis 1, the worker transport: who may touch the file now. Replaces
+ * v1's active/failed booleans (derivation in the decision doc).
+ *   IDLE      no job; the UI owns the append position.
+ *   SYNC      a barrier job runs; the UI still appends after the PAD.
+ *   LEASE     a job owns the append position (gap repair, self-contained
+ *             checkpoint, rotation): appends return BUSY.
+ *   RETIRING  the job's result is adopted, its slot not yet physically
+ *             finished; the UI owns the append position, no new job. */
+typedef enum journal_transport {
+    JOURNAL_TRANSPORT_IDLE = 0,
+    JOURNAL_TRANSPORT_SYNC,
+    JOURNAL_TRANSPORT_LEASE,
+    JOURNAL_TRANSPORT_RETIRING
+} journal_transport;
+
+/* Axis 2, recovery suspension: may the journal accept records, and what
+ * repairs it. Replaces v1's append_failed, append_pending,
+ * writeback_failed, directory_pending, recovery_pending and the sticky
+ * FULL error.
+ *   HEALTHY            appends accepted.
+ *   APPEND_GAP         a UI write failed; the held record is rewritten
+ *                      by a lease job (appends BUSY meanwhile).
+ *   DIRECTORY_PENDING  a rotation's rename landed but its directory
+ *                      barrier failed; retried by a job (appends BUSY).
+ *   WRITEBACK_LOST     a sync barrier failed: pages since the last good
+ *                      barrier may be lost on disk, and no rewrite can
+ *                      prove otherwise; only a rotation repairs it.
+ *   NEEDS_ROTATION     budget or sequence space exhausted, or a lease
+ *                      write left bytes it could not remove: only a
+ *                      rotation repairs it. */
+typedef enum journal_suspension {
+    JOURNAL_HEALTHY = 0,
+    JOURNAL_APPEND_GAP,
+    JOURNAL_DIRECTORY_PENDING,
+    JOURNAL_WRITEBACK_LOST,
+    JOURNAL_NEEDS_ROTATION
+} journal_suspension;
+
+typedef struct journal_status {
+    journal_transport transport;
+    journal_suspension suspension;
+    uint64_t accepted_sequence; /* last sequence accepted (RAM) */
+    uint64_t written_sequence;  /* last sequence wholly in the page cache */
+    uint64_t durable_sequence;  /* last sequence behind a completed barrier */
+    uint64_t file_bytes;        /* append position, preamble included */
+    uint64_t durable_bytes;     /* end of the last completed barrier */
+    os_err last_error;          /* the last failed write, sync or rename */
+    int last_native_error;
+} journal_status;
+
+/* Caller policy, no defaults here (the owner of the session decides and
+ * derives them): budget_bytes is the image size at which an ungrouped
+ * record or a GROUP_BEGIN reports FULL (members of an open group are
+ * admitted past it so a group can always commit); a barrier starts when
+ * sync_bytes have been written since the last one, or sync_interval_ns
+ * after the first write it does not yet cover. */
+typedef struct journal_options {
+    uint64_t budget_bytes;
+    uint64_t sync_bytes;
+    uint64_t sync_interval_ns;
+} journal_options;
+
+typedef struct journal journal;
+typedef struct journal_recovery journal_recovery;
+
+/* Opens the live journal `name` (one component) in the pinned directory
+ * dir for appending, and makes its starting point a synced boundary on a
+ * 4,096 B block (PAD, then fsync) before returning.
+ *   rec == NULL, or rec reports ABSENT or REFUSED: creates a fresh image
+ *     (preamble written and synced under a temporary name, renamed into
+ *     place with NOREPLACE, directory synced) carrying rec's allocator
+ *     high-waters; JOURNAL_ERR_EXISTS if the name holds a file.
+ *   rec reports CLEAN, REPAIRED or SET_ASIDE: continues that image at its
+ *     valid end and next sequence, after checking it is the same inode
+ *     and size recovery left (else JOURNAL_ERR_IO).
+ *   rec reports DAMAGED: JOURNAL_ERR_REFUSED (the image could not be set
+ *     aside, so nothing may append to it).
+ * The pool must outlive the journal; it needs one bulk worker. Setup
+ * only: allocates (base arena) and blocks on storage. */
+journal_err journal_open(journal **out, const os_dir *dir, const char *name,
+                         work_pool *pool, const journal_recovery *rec,
+                         const journal_options *opt);
+/* JOURNAL_ERR_BUSY while a job runs (pump, then retry); otherwise closes
+ * and frees. Requests no sync: make the state durable first if wanted. */
+journal_err journal_close(journal *j);
+journal_status journal_get_status(const journal *j);
+
+/* Allocators of section 5: strictly monotonic, never 0, refusing before
+ * wrap (JOURNAL_ERR_FULL). The image's preamble and every mention in it
+ * seed them on recovery. */
+journal_err journal_new_generation_key(journal *j, uint64_t *key);
+journal_err journal_new_buffer_id(journal *j, uint64_t *id);
+
+/* ---- Typing path ----
+ * INSERT slicing is encoder policy, not wire law (wire section 3). v2's
+ * reason for a slice at all: one journal_insert_step call is one unit of
+ * UI-thread work between input checks, and the UI slice is 0.5 ms (G,
+ * v1 perf/01-perf-target.md G1 row, kept by v2). The call gets half of
+ * it, 250 us; the other half is the loop's own work and the margin for
+ * regimes not measured ([bat], cold caches). Measured (M)[AC] load1
+ * 3.09, 2026-11-24 01:17 CET, bench/journal_bench.c, n = 1,000 each:
+ * a record of 256 KiB costs p99 196 us (encode + CRC32C + one
+ * pwrite_once), one insert_step of 256 KiB p99 212 us, a record of
+ * 512 KiB p99 368 us. The slice is the largest power of two within
+ * 250 us at p99: 256 KiB. (v1's 16 KiB was an inherited ceiling, not a
+ * derivation; the wire's 1 MiB record maximum is not this policy's
+ * ceiling, section 3.) Re-derive when the bench moves. */
+#define JOURNAL_INSERT_SLICE_BYTES (256u * 1024u)
+journal_err journal_group_begin(journal *j);
+journal_err journal_group_commit(journal *j);
+/* Initialize *progress to 0 and keep bytes stable until JOURNAL_OK.
+ * Each call writes INSERT(dest + *progress, next slice) and advances
+ * *progress by the slice (also on JOURNAL_ERR_IO). len >= 1. An insert of
+ * more than one slice is a multi-record command: inside
+ * journal_group_begin/commit, or a kill between slices recovers a prefix
+ * of it (wire section 7). */
+journal_err journal_insert_step(journal *j, uint64_t buffer_id, uint64_t dest,
+                                const uint8_t *bytes, size_t len,
+                                size_t *progress);
+journal_err journal_append_delete(journal *j, uint64_t buffer_id,
+                                  uint64_t dest, uint64_t len);
+journal_err journal_append_restore(journal *j, uint64_t buffer_id,
+                                   const journal_restore *r);
+/* Any other record by its codec payload: GENERATION, BASE, TARGET, VIEW,
+ * TABS, SAVE, INSERT, DELETE, RESTORE_BASE_RANGE. ASSERT: not PAD, a
+ * group marker or CHECKPOINT_BY_VALUE (those are the writer's). */
+journal_err journal_append(journal *j, journal_record_type type,
+                           uint64_t buffer_id, const uint8_t *payload,
+                           size_t payload_len);
+
+/* ---- Worker transport (UI, outside input-to-submit) ----
+ * Adopts a finished job, then starts at most one job, in this order:
+ * rewrite a held record (APPEND_GAP), retry a directory barrier
+ * (DIRECTORY_PENDING), or a sync barrier when sync_bytes are unsynced,
+ * the oldest unsynced write is sync_interval_ns old, or a sync was
+ * requested. Never waits; no drain loop. The job's completion message is
+ * bound to the journal (work_mailbox_bind), so the application's
+ * ordinary drain delivers it here and nowhere else. Returns the first
+ * error of a UI write it made (a PAD: JOURNAL_ERR_IO, held as above), else
+ * JOURNAL_OK. */
+journal_err journal_pump(journal *j, uint64_t now_ns);
+/* The next journal_pump starts a barrier even below the thresholds. */
+void journal_request_sync(journal *j);
+
+/* ---- Self-contained checkpoint (A23) ----
+ * A buffer whose text is at or below this size is made self-contained,
+ * a CHECKPOINT_BY_VALUE group of its whole text, once it has an
+ * acknowledged edit; until that group is durable its first edits stay
+ * BASE-relative. After it, its restores are journaled by value (the
+ * caller's encoder).
+ * Derivation: the worker writes the group under a lease, and every
+ * append in the meantime returns BUSY, so the lease delays other journal
+ * work by its length. Budget, as for the slice above: half the 0.5 ms
+ * UI slice at p99, 250 us. The lease from journal_checkpoint_start to the
+ * adoption that lets appends through, measured (M)[AC] load1 3.08,
+ * 2026-11-24 01:17 CET, bench/journal_bench.c "checkpoint_lease", piece
+ * model, n = 1,000 each: p99 244 us at 256 KiB, 470 us at 512 KiB
+ * (498 us in a run at load1 2.41), 921 us at 1 MiB; about 1.25 B/ns
+ * plus a scheduling floor near 60 us. The size is the largest power of
+ * two within 250 us at p99: 256 KiB, half the budget whole. v1's split
+ * at the pin, for comparison: a modified text stayed whole-text up to
+ * FILE_PREFIX_MAX, 1 MiB (v1 file.h:86, docs/decisions/edit-28u.md
+ * decision 5), a number tied to its synchronous-open prefix, not to a
+ * write budget. Re-derive with the real piece tree. */
+#define JOURNAL_SELF_CONTAINED_BYTES (256u * 1024u)
+typedef struct journal_checkpoint_request {
+    uint64_t buffer_id;
+    piece_snapshot *text;      /* the text at covered_sequence; the journal
+                                  retains it until the job finishes */
+    uint64_t covered_sequence; /* < the next sequence (ASSERT) */
+    uint64_t content_id;
+    uint64_t saved_content_id; /* with JOURNAL_CHECKPOINT_HAS_SAVED */
+    uint32_t flags;
+    const journal_target *target; /* NULL, or the group's last member
+                                     (copied at the call) */
+} journal_checkpoint_request;
+/* Leases the append position to a worker job that writes the group at
+ * the end of the image. BUSY while another job runs or a group is open;
+ * SUSPENDED unless HEALTHY. Once the job is adopted, the group's COMMIT
+ * sequence is journal_checkpoint_committed(). */
+journal_err journal_checkpoint_start(journal *j,
+                                     const journal_checkpoint_request *req);
+/* The COMMIT sequence of the last adopted checkpoint group, 0 if none:
+ * the buffer is self-contained once durable_sequence reaches it. */
+uint64_t journal_checkpoint_committed(const journal *j);
+
+/* ---- Rotation ----
+ * A complete new image from live state: preamble with the allocators'
+ * high-waters, every generation declared, each buffer's text (BY_VALUE:
+ * a CHECKPOINT_BY_VALUE group; BY_REFERENCE: BASE then DELETE / INSERT /
+ * RESTORE_BASE_RANGE records describing the text over its ORIGINAL,
+ * whose generation must be declared here), its TARGET and VIEW, then
+ * TABS. Written and synced under a temporary name by a lease job,
+ * renamed over the journal, the directory synced; the UI then appends to
+ * the new image. Clears every suspension. Everything r points to (and
+ * the snapshots) must stay valid and unchanged until the job is adopted
+ * (journal_get_status shows a transport other than LEASE). */
+typedef enum journal_rotation_text {
+    JOURNAL_ROTATE_BY_VALUE = 0,
+    JOURNAL_ROTATE_BY_REFERENCE = 1
+} journal_rotation_text;
+typedef struct journal_rotation_buffer {
+    uint64_t buffer_id;
+    piece_snapshot *text;
+    journal_rotation_text mode;
+    uint64_t base_key;         /* BY_REFERENCE: ORIGINAL's generation (0:
+                                  empty origin) */
+    uint64_t content_id, saved_content_id;
+    uint32_t flags;            /* JOURNAL_CHECKPOINT_HAS_SAVED */
+    const journal_target *target; /* NULL: none */
+    const journal_view *view;     /* NULL: none */
+} journal_rotation_buffer;
+typedef struct journal_rotation {
+    const journal_generation *generations;
+    size_t generation_count;
+    const journal_rotation_buffer *buffers;
+    size_t buffer_count;
+    const journal_tabs_entry *tabs; /* NULL: no TABS record */
+    uint32_t tab_count, tab_active;
+} journal_rotation;
+/* BUSY while another job runs or a group is open. */
+journal_err journal_rotate_start(journal *j, const journal_rotation *r);
+
+/* ---- Sources ----
+ * Fills g->identity, prefix_len and prefix_crc32c from an open regular
+ * file: stat, then one read of its first min(size, 4096) B, then stat
+ * again, refusing (OS_E_BUSY) a file that changed across the read. The
+ * caller sets key, flags and location. */
+os_err journal_capture(os_file *fd, journal_generation *g);
+
+/* Opens a tree whose ORIGINAL is the size bytes of fd, which recovery has
+ * verified against its declaration (and re-verifies after the call).
+ * NULL in journal_recover selects the built-in opener: a private copy
+ * read in full (piece_open_copy). A mapped opener belongs to L2 file. */
+typedef piece_err (*journal_open_source_fn)(void *ctx, piece_reserve *r,
+                                            os_file *fd, uint64_t size,
+                                            piece_tree **out);
+
+/* ---- Recovery ----
+ * Validate, then repair, then plan, then apply: forward reads of the
+ * image through one 1 MiB record buffer (wire section 3's reader cost).
+ *  1. The preamble first: refused (TRUNCATED, FOREIGN, UNSUPPORTED,
+ *     INVALID) means the file is renamed aside intact and nothing is
+ *     read further (REFUSED). Never truncated.
+ *  2. The record stream (journal_stream_next) to its first failure.
+ *     A TORN TAIL -- the input ends inside the failing record or inside
+ *     an open group, and no CRC-valid record starts after the failing
+ *     header -- was never acknowledged (wire section 8): truncated in
+ *     place (REPAIRED). ANYTHING ELSE (a complete record failing, or
+ *     valid records after a "torn" one) may hide acknowledged edits:
+ *     the whole file is copied aside byte for byte (synced), a new image
+ *     holding exactly the valid prefix replaces the name (SET_ASIDE).
+ *     If the copy cannot be made the file is left untouched (DAMAGED).
+ *  3. Plan over the committed prefix: the declaration table (a
+ *     conflicting redeclaration distrusts its key), each buffer's origin
+ *     (the last BASE, or the committed CHECKPOINT_BY_VALUE with the
+ *     greatest covered sequence when that is not before the BASE), last
+ *     TARGET, VIEW and TABS.
+ *  4. Install origins: an empty origin, a checkpoint's literal text, or
+ *     a BASE generation opened by its declared location and verified
+ *     (identity projection and prefix witness, before and after). A
+ *     buffer whose origin is a checkpoint never opens its BASE.
+ *  5. Apply each buffer's text records after its origin in sequence
+ *     order, a group's members under one piece checkpoint per tree.
+ *     RESTORE_BASE_RANGE by reference when its key is the tree's
+ *     verified ORIGINAL, else by value from its own verified source.
+ * A BASE (or by-value restore source) that is missing or not its
+ * declared identity makes the buffer UNRESOLVED_BASE, in every path:
+ * nothing is applied to that file, and every literal the journal holds
+ * for the buffer after its origin is offered. A record that cannot apply
+ * (bounds, no origin, undeclared or distrusted key) makes it
+ * INCONSISTENT, likewise with literals. Trees without history: piece is
+ * called directly. Setup only (allocates, blocks). */
+typedef enum journal_image_verdict {
+    JOURNAL_IMAGE_ABSENT = 0, /* no file under the name */
+    JOURNAL_IMAGE_CLEAN,
+    JOURNAL_IMAGE_REPAIRED,   /* torn tail truncated in place */
+    JOURNAL_IMAGE_SET_ASIDE,  /* original kept as set_aside; name holds
+                                 the valid prefix */
+    JOURNAL_IMAGE_DAMAGED,    /* damage, and it could not be set aside */
+    JOURNAL_IMAGE_REFUSED     /* preamble refused; kept as set_aside */
+} journal_image_verdict;
+typedef enum journal_buffer_verdict {
+    JOURNAL_BUFFER_RECOVERED = 0,
+    JOURNAL_BUFFER_UNRESOLVED_BASE,
+    JOURNAL_BUFFER_INCONSISTENT
+} journal_buffer_verdict;
+typedef enum journal_origin_kind {
+    JOURNAL_ORIGIN_NONE = 0,
+    JOURNAL_ORIGIN_BASE,
+    JOURNAL_ORIGIN_CHECKPOINT
+} journal_origin_kind;
+typedef struct journal_literal {
+    uint64_t sequence, destination;
+    const uint8_t *bytes;   /* owned by the recovery */
+    size_t len;
+} journal_literal;
+typedef struct journal_recovered_buffer {
+    uint64_t id;
+    journal_buffer_verdict verdict;
+    piece_tree *tree;       /* RECOVERED; take it by setting this NULL */
+    journal_origin_kind origin;
+    uint64_t base_key;      /* ORIGIN_BASE: the tree's ORIGINAL */
+    uint64_t origin_sequence; /* BASE's sequence or the covered sequence */
+    uint64_t content_id;      /* at the origin */
+    uint64_t saved_content_id;
+    uint32_t checkpoint_flags;
+    const journal_literal *literals; /* not RECOVERED */
+    size_t literal_count;
+    bool has_target;
+    journal_target target;  /* path owned by the recovery */
+    bool has_view;
+    journal_view view;      /* opaque bytes owned by the recovery */
+} journal_recovered_buffer;
+struct journal_recovery {
+    journal_image_verdict verdict;
+    journal_codec_err failure;      /* the first failure (OK if none) */
+    char set_aside[OS_NAME_MAX];    /* SET_ASIDE / REFUSED: name in dir */
+    uint64_t file_bytes;            /* the file as found */
+    uint64_t valid_bytes;           /* committed prefix, preamble included */
+    uint64_t last_sequence;
+    os_identity image;              /* the inode journal_open continues */
+    uint64_t generation_high_water, buffer_high_water;
+    journal_recovered_buffer *buffers;
+    size_t buffer_count;
+    bool has_tabs;
+    journal_tabs_entry *tabs;
+    uint32_t tab_count, tab_active;
+    base_arena arena_;              /* private */
+};
+journal_err journal_recover(journal_recovery *out, const os_dir *dir,
+                            const char *name, piece_reserve *reserve,
+                            journal_open_source_fn open_source, void *ctx);
+/* Closes every tree not taken and frees the recovery's storage. */
+void journal_recovery_release(journal_recovery *rec);
+
 #endif
 
 

@@ -228,6 +228,13 @@ LDFLAGS_find_timeout_test := -Wl,--wrap=work_should_stop
 # journal codec (L2-2a): CRC32C hardware/portable selection is forced in the
 # suite through the base CPU predicate (no env switch, harvest 2.3).
 LDFLAGS_journal_codec_test := -Wl,--wrap=base_cpu_has_sse42
+# journal runtime (L2-2b): write, sync and rename faults are injected at the
+# os seam beneath the journal; the suites build against the piece model until
+# the real tree (v2-0fv.7b) lands on v2, as undo and find did.
+LDFLAGS_journal_test := -Wl,--wrap=os_file_pwrite_once,--wrap=os_file_sync_data
+LDFLAGS_journal_kill_test := -Wl,--wrap=os_file_pwrite_once,--wrap=os_rename_at
+$(foreach c,rel san tsan,$(foreach t,journal_test journal_kill_test,$(eval $(B)/$(c)/tests/$(t): $(B)/$(c)/tests/piece_model.o)))
+$(B)/fuzz/journal_recover_fuzz: $(B)/fuzz/tests/piece_model.o
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/bench/find_bench))
 # Undo likewise uses the frozen piece model until 7b. Its suite observes the
 # span/count arrays offered to the batch planner and can refuse a replay step.
@@ -279,6 +286,11 @@ $(foreach c,rel san tsan,$(eval $(call FIND_BENCH,$(c))))
 
 $(B)/rel/bench/undo_bench: $(B)/rel/bench/undo_bench.o $(call libs_of,rel,L1 L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
+
+# journal runtime bench (L2-2b): the piece model until the real tree lands
+# on v2; the release malloc guard is linked in for the G1 measurement.
+$(B)/rel/bench/journal_bench: $(B)/rel/bench/journal_bench.o $(B)/rel/tests/piece_model.o $(call libs_of,rel,L2 L1 L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(REL_GUARD) $(LDLIBS) -o $@
 
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.

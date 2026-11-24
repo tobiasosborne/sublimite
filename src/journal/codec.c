@@ -791,6 +791,114 @@ journal_codec_err journal_tabs_decode(const journal_frame *frame,
     return JOURNAL_CODEC_OK;
 }
 
+/* ---- incremental structural validation (section 7) ----
+ * One explicit phase replaces the group booleans; journal_stream_validate
+ * below is exactly a loop of journal_stream_next. */
+void journal_stream_init(journal_stream_state *s)
+{
+    ASSERT(s != NULL);
+    *s = (journal_stream_state){.phase = JOURNAL_STREAM_OUTSIDE, .expected = 1};
+}
+
+/* The section-7 verdict for a decoded non-PAD record in phase s->phase;
+ * fills the checkpoint counters it starts or advances into *n. */
+static bool structural_ok(const journal_stream_state *s, const journal_frame *f,
+                          journal_stream_state *n)
+{
+    switch (s->phase) {
+    case JOURNAL_STREAM_OUTSIDE:
+        return f->type != JOURNAL_REC_GROUP_COMMIT &&
+               f->type != JOURNAL_REC_CHECKPOINT_BY_VALUE;
+    case JOURNAL_STREAM_GROUP_EMPTY:
+        if (f->type == JOURNAL_REC_GROUP_BEGIN || f->type == JOURNAL_REC_GROUP_COMMIT)
+            return false;
+        if (f->type == JOURNAL_REC_CHECKPOINT_BY_VALUE) {
+            journal_checkpoint chk;
+            if (journal_checkpoint_decode(f, &chk) != JOURNAL_CODEC_OK ||
+                chk.covered_sequence >= s->group_sequence)
+                return false;
+            n->chk_buffer = f->buffer_id;
+            n->chk_text_len = chk.text_len;
+            n->chk_sum = 0;
+        }
+        return true;
+    case JOURNAL_STREAM_GROUP:
+        return f->type != JOURNAL_REC_GROUP_BEGIN &&
+               f->type != JOURNAL_REC_CHECKPOINT_BY_VALUE;
+    case JOURNAL_STREAM_CHECKPOINT:
+        if (f->type == JOURNAL_REC_GROUP_COMMIT) return s->chk_sum == s->chk_text_len;
+        if (f->type == JOURNAL_REC_INSERT) {
+            journal_insert ins;
+            if (journal_insert_decode(f, &ins) != JOURNAL_CODEC_OK ||
+                f->buffer_id != s->chk_buffer || ins.destination != s->chk_sum ||
+                (uint64_t)ins.len > s->chk_text_len - s->chk_sum)
+                return false;
+            n->chk_sum = s->chk_sum + (uint64_t)ins.len;
+            return true;
+        }
+        if (f->type == JOURNAL_REC_TARGET) return f->buffer_id == s->chk_buffer;
+        return false;
+    case JOURNAL_STREAM_CHECKPOINT_TARGET:
+        return f->type == JOURNAL_REC_GROUP_COMMIT && s->chk_sum == s->chk_text_len;
+    }
+    return false;
+}
+
+static journal_stream_phase next_phase(journal_stream_phase p, journal_record_type t)
+{
+    if (t == JOURNAL_REC_GROUP_BEGIN) return JOURNAL_STREAM_GROUP_EMPTY;
+    if (t == JOURNAL_REC_GROUP_COMMIT) return JOURNAL_STREAM_OUTSIDE;
+    switch (p) {
+    case JOURNAL_STREAM_OUTSIDE: return JOURNAL_STREAM_OUTSIDE;
+    case JOURNAL_STREAM_GROUP_EMPTY:
+        return t == JOURNAL_REC_CHECKPOINT_BY_VALUE ? JOURNAL_STREAM_CHECKPOINT
+                                                    : JOURNAL_STREAM_GROUP;
+    case JOURNAL_STREAM_GROUP: return JOURNAL_STREAM_GROUP;
+    case JOURNAL_STREAM_CHECKPOINT:
+        return t == JOURNAL_REC_TARGET ? JOURNAL_STREAM_CHECKPOINT_TARGET
+                                       : JOURNAL_STREAM_CHECKPOINT;
+    case JOURNAL_STREAM_CHECKPOINT_TARGET: return JOURNAL_STREAM_CHECKPOINT_TARGET;
+    }
+    return p;
+}
+
+journal_codec_err journal_stream_next(journal_stream_state *s,
+                                      const uint8_t *bytes, size_t len,
+                                      journal_frame *out)
+{
+    ASSERT(s != NULL && out != NULL);
+    ASSERT(bytes != NULL || len == 0);
+    if (s->expected == 0) return JOURNAL_CODEC_SEQUENCE; /* after UINT64_MAX */
+    journal_frame f;
+    journal_codec_err err = journal_record_decode(bytes, len, s->offset, s->expected, &f);
+    if (err != JOURNAL_CODEC_OK) return err;
+    journal_stream_state n = *s;
+    n.offset = s->offset + f.total_len;
+    if (f.type == JOURNAL_REC_PAD) {
+        if (n.phase == JOURNAL_STREAM_OUTSIDE) n.valid = n.offset;
+        *s = n;
+        *out = f;
+        return JOURNAL_CODEC_OK;
+    }
+    if (!structural_ok(s, &f, &n)) return JOURNAL_CODEC_INVALID;
+    if (f.type == JOURNAL_REC_GROUP_BEGIN) {
+        n.group_at = s->offset;
+        n.group_sequence = f.sequence;
+    }
+    n.phase = next_phase(s->phase, f.type);
+    n.open_records = s->open_records + 1;
+    n.open_last_sequence = f.sequence;
+    n.expected = f.sequence == UINT64_MAX ? 0 : f.sequence + 1;
+    if (n.phase == JOURNAL_STREAM_OUTSIDE) {
+        n.valid = n.offset;
+        n.records = n.open_records;
+        n.last_sequence = n.open_last_sequence;
+    }
+    *s = n;
+    *out = f;
+    return JOURNAL_CODEC_OK;
+}
+
 /* ---- whole-image structural validation ---- */
 journal_codec_err journal_stream_validate(const uint8_t *bytes, size_t len,
                                           journal_stream_result *out)
@@ -805,112 +913,17 @@ journal_codec_err journal_stream_validate(const uint8_t *bytes, size_t len,
     }
     const uint8_t *stream = bytes + JOURNAL_PREAMBLE_BYTES;
     size_t stream_len = len - JOURNAL_PREAMBLE_BYTES;
-    size_t off = 0;              /* current stream offset */
-    size_t valid_off = 0;        /* end of the certified prefix */
-    uint64_t expected = 1;       /* next non-PAD sequence */
-    bool in_group = false;
-    size_t group_at = 0;         /* BEGIN's stream offset */
-    uint64_t group_records = 0, group_last = 0; /* counters at BEGIN */
-    uint64_t group_begin_seq = 0;
-    bool group_has_member = false;
-    bool checkpoint = false, checkpoint_target_seen = false;
-    uint64_t chk_buffer = 0, chk_text_len = 0, chk_sum = 0;
-
-    while (off < stream_len) {
+    journal_stream_state s;
+    journal_stream_init(&s);
+    while (s.offset < stream_len) {
         journal_frame frame;
-        if (expected == 0) { /* last sequence was UINT64_MAX; none follow */
-            err = JOURNAL_CODEC_SEQUENCE;
-            break;
-        }
-        err = journal_record_decode(stream + off, stream_len - off,
-                                    (uint64_t)off, expected, &frame);
+        err = journal_stream_next(&s, stream + s.offset, stream_len - (size_t)s.offset, &frame);
         if (err != JOURNAL_CODEC_OK) break;
-        if (frame.type == JOURNAL_REC_PAD) {
-            off += frame.total_len;
-            if (!in_group) valid_off = off;
-            continue;
-        }
-        /* A structural verdict for this record, before counters move. */
-        bool structural_ok = true;
-        if (!in_group) {
-            structural_ok = frame.type != JOURNAL_REC_GROUP_COMMIT &&
-                            frame.type != JOURNAL_REC_CHECKPOINT_BY_VALUE;
-        } else if (frame.type == JOURNAL_REC_GROUP_BEGIN) {
-            structural_ok = false;
-        } else if (frame.type == JOURNAL_REC_GROUP_COMMIT) {
-            structural_ok = group_has_member &&
-                            (!checkpoint || chk_sum == chk_text_len);
-        } else if (!group_has_member) {
-            if (frame.type == JOURNAL_REC_CHECKPOINT_BY_VALUE) {
-                journal_checkpoint chk;
-                structural_ok =
-                    journal_checkpoint_decode(&frame, &chk) == JOURNAL_CODEC_OK &&
-                    chk.covered_sequence < group_begin_seq;
-                if (structural_ok) {
-                    checkpoint = true;
-                    chk_buffer = frame.buffer_id;
-                    chk_text_len = chk.text_len;
-                    chk_sum = 0;
-                }
-            }
-        } else if (checkpoint) {
-            if (checkpoint_target_seen) {
-                structural_ok = false;
-            } else if (frame.type == JOURNAL_REC_INSERT) {
-                journal_insert ins;
-                structural_ok =
-                    journal_insert_decode(&frame, &ins) == JOURNAL_CODEC_OK &&
-                    frame.buffer_id == chk_buffer &&
-                    ins.destination == chk_sum &&
-                    (uint64_t)ins.len <= chk_text_len - chk_sum;
-                if (structural_ok) chk_sum += (uint64_t)ins.len;
-            } else if (frame.type == JOURNAL_REC_TARGET) {
-                structural_ok = frame.buffer_id == chk_buffer;
-                if (structural_ok) checkpoint_target_seen = true;
-            } else {
-                structural_ok = false;
-            }
-        } else {
-            structural_ok = frame.type != JOURNAL_REC_CHECKPOINT_BY_VALUE;
-        }
-        if (!structural_ok) {
-            err = JOURNAL_CODEC_INVALID;
-            break;
-        }
-        if (frame.type == JOURNAL_REC_GROUP_BEGIN) {
-            in_group = true;
-            group_at = off;
-            group_begin_seq = frame.sequence;
-            group_records = out->records;
-            group_last = out->last_sequence;
-            group_has_member = false;
-            checkpoint = false;
-            checkpoint_target_seen = false;
-            chk_sum = 0;
-        } else if (in_group && frame.type != JOURNAL_REC_GROUP_COMMIT) {
-            group_has_member = true;
-        }
-        out->records++;
-        out->last_sequence = frame.sequence;
-        expected = frame.sequence == UINT64_MAX ? 0 : frame.sequence + 1;
-        off += frame.total_len;
-        if (frame.type == JOURNAL_REC_GROUP_COMMIT) {
-            in_group = false;
-            valid_off = off;
-        } else if (!in_group) {
-            valid_off = off;
-        }
     }
-    if (err == JOURNAL_CODEC_OK && in_group) err = JOURNAL_CODEC_TRUNCATED;
-    if (err != JOURNAL_CODEC_OK && in_group) {
-        /* The whole group drops: prefix and counters as at its BEGIN. */
-        valid_off = group_at;
-        out->records = group_records;
-        out->last_sequence = group_last;
-    }
-    out->valid_bytes = JOURNAL_PREAMBLE_BYTES + valid_off;
+    if (err == JOURNAL_CODEC_OK && s.phase != JOURNAL_STREAM_OUTSIDE)
+        err = JOURNAL_CODEC_TRUNCATED; /* input ends inside a group */
+    out->valid_bytes = JOURNAL_PREAMBLE_BYTES + (size_t)s.valid;
+    out->records = s.records;
+    out->last_sequence = s.last_sequence;
     return err;
 }
-
-
-
