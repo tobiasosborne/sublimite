@@ -5,6 +5,24 @@ Read order: this file → `CLAUDE.md` → `docs/PLAN_V2.md`. Beads: `bd` in this
 branches: push each at every pause or session end; delete the remote branch once its bead lands on v2 (Tobias, 2026-11-24).
 
 ## Session 2 (2026-11-24 evening) — IN PROGRESS (worklog 2026-11-24 "Session 2")
+- BINDING RULE (Tobias, 22:00 CET, verbatim): "work up to but not exceeding pace on any provider. coordinate serial
+  work." The advisor's reading, which replaces every earlier lane count:
+  - At most one running job per provider. Landings go one at a time, in dependency order.
+  - No Claude worker starts until a reading taken at an event shows room >= 1.0. Claude-bound beads then run one after
+    the other. The coordinator's and the advisor's turns are the whole Claude spend: act only on landings, dispatches
+    and decisions; send one message per event that needs the advisor; no acknowledgements.
+  - Muse's 5-hour window counts. If it is ahead of pace at a Muse event, wip-commit the worker, push the wip branch,
+    and resume it at the first event after the window is at or behind pace. No polling.
+  - Serial chains:
+    - Codex: N2 (v2-zh6), then EDIT-CORE (developed after N2, v2-bkz and the piece reader land; it lands after 2b-1,
+      with reads on the wip).
+    - Claude, when room allows: the piece reader bead (reader + erratum (i) + the D1' deletion + the undo_commit
+      change; after the advisor signs Astra's D1' text), then 2b-1, 2b-2, 2b-3.
+    - Muse: L2-1 (running), then L2-3 once its dependencies exist.
+    - Later: EDIT-INTEGRATION, savectl, minimal L5, the Wave 1 exit list.
+  - Landed in session 2: 1.22–1.26. Signed: A27, A28, the wire + reader, the journal runtime section, edit.h, savectl.h,
+    all L2 briefs (L2-1, L2-2b1/2/3, L2-3, N2, edit-core, edit-integration), and S3 (reader + erratum (i)).
+    D1' is signed in principle; its text awaits the advisor.
 - Rules (advisor): one Opus lane on the critical path (second only at a dispatch-time Claude room >= 3; stop line 0.5);
   act on events only, never poll quota or children; Codex carries all non-fault/kill/truncation work (filter routing
   unchanged); 7b round 4 was its last design round — a send-back needs a correctness counter-example, taste and size go
