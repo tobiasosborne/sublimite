@@ -333,6 +333,22 @@ static bool valid_boundary(scan *s, uint64_t owner, uint64_t sequence)
            (at->type == JOURNAL_REC_BASE || is_command(at->type));
 }
 
+/* S is the saver's text at s. When s names its BASE, that BASE already
+ * fixes the content id, and for key 0 the empty text itself (witness
+ * size, and the CRC of empty, both zero). A claim that disagrees with
+ * either is a contradiction between records, not a binding question. */
+static bool snapshot_matches_base(scan *s, uint64_t owner,
+                                  const struct journal_save_prepared *p)
+{
+    if (!p->snapshot_sequence) return true;
+    const indexed_operation *at = lookup(&s->finals, p->snapshot_sequence, 0);
+    if (!at || at->type != JOURNAL_REC_BASE || at->plan.owner != owner) return true;
+    journal_frame frame = indexed_frame(s, at->plan.final);
+    if (p->saved_content_id != read64(frame.payload + 8)) return false;
+    return read64(frame.payload) != 0 ||
+           (p->witness.size == 0 && p->witness.content_crc32c == 0);
+}
+
 static bool index_prepare(scan *s, indexed_operation *op, const journal_save *save)
 {
     const struct journal_save_prepared *p = &save->prepared;
@@ -346,8 +362,11 @@ static bool index_prepare(scan *s, indexed_operation *op, const journal_save *sa
     /* Reserve the mentioned key even if the transaction evidence conflicts. */
     key = add_key(s, p->new_key);
     if (!key) return false;
-    if (p->new_key == p->previous_key || lookup(&s->tokens, op->plan.owner, save->token) ||
-        !valid_boundary(s, op->plan.owner, p->snapshot_sequence)) {
+    if (p->new_key == p->previous_key ||
+        p->new_key <= s->plan->prefix.preamble.generation_high_water ||
+        lookup(&s->tokens, op->plan.owner, save->token) ||
+        !valid_boundary(s, op->plan.owner, p->snapshot_sequence) ||
+        !snapshot_matches_base(s, op->plan.owner, p)) {
         op->plan.use = JOURNAL_UNRESOLVED;
         return true;
     }
@@ -383,6 +402,20 @@ static bool finish_matches(scan *s, const key_entry *key, const token_entry *tok
            decl.identity.index_high == p->witness.index_high &&
            decl.identity.size == p->witness.size &&
            same_path(decl.location, decl.location_len, p->path, p->path_len);
+}
+
+/* A preserved checkpoint secures the saver's text only together with
+ * every complete command after its covered boundary. One unresolved
+ * command in that suffix leaves the state unsecured. */
+static bool suffix_is_resolved(const scan *s, uint64_t owner, uint64_t covered)
+{
+    for (const journal_operation *op = s->plan->operations; op; op = op->next) {
+        const indexed_operation *indexed = (const indexed_operation *)op;
+        if (op->owner == owner && is_command(indexed->type) &&
+            op->final_sequence > covered && op->use == JOURNAL_UNRESOLVED)
+            return false;
+    }
+    return true;
 }
 
 static void index_terminal(scan *s, indexed_operation *op, const journal_save *save)
@@ -425,7 +458,8 @@ static void index_terminal(scan *s, indexed_operation *op, const journal_save *s
         if (preserved) {
             const indexed_operation *at = lookup(&s->finals, preserved, 0);
             if (!at || at->type != JOURNAL_REC_CHECKPOINT_COMMIT ||
-                at->plan.owner != out->owner || at->plan.use != JOURNAL_ELIGIBLE) {
+                at->plan.owner != out->owner || at->plan.use != JOURNAL_ELIGIBLE ||
+                !suffix_is_resolved(s, out->owner, at->covered)) {
                 out->use = JOURNAL_UNRESOLVED;
                 return;
             }

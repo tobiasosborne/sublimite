@@ -230,6 +230,7 @@ static bool payload_valid(journal_record_type type, const uint8_t *p, size_t n)
     case JOURNAL_REC_GENERATION: {
         if (n < 72 || rd64(p) == 0) return false;
         if (rd32(p + 56) != prefix_expected(rd64(p + 8 + 24))) return false;
+        if (rd32(p + 56) == 0 && rd32(p + 60) != 0) return false;
         if ((rd32(p + 64) & ~JOURNAL_GENERATION_VALUE_ONLY) != 0) return false;
         uint32_t loc_len = rd32(p + 68);
         return n == 72u + (size_t)loc_len && path_valid(p + 72, loc_len);
@@ -402,6 +403,7 @@ journal_codec_err journal_generation_encode(uint8_t *out, size_t cap,
 {
     ASSERT(out != NULL && out_len != NULL && in != NULL);
     if (in->key == 0 || in->prefix_len != prefix_expected(in->identity.size) ||
+        (in->prefix_len == 0 && in->prefix_crc32c != 0) ||
         (in->flags & ~JOURNAL_GENERATION_VALUE_ONLY) != 0 ||
         !path_valid(in->location, in->location_len))
         return JOURNAL_CODEC_INVALID;

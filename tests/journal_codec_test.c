@@ -1168,7 +1168,7 @@ static void test_cancelled_save(void)
 {
     img_base_only();
     journal_save prep = { .phase = JOURNAL_SAVE_PREPARED, .token = 1,
-        .prepared = { .new_key = 1, .snapshot_sequence = 1,
+        .prepared = { .new_key = 1, .snapshot_sequence = 1, .saved_content_id = 1,
             .witness = {1, 2, 0, 0, 0}, .path = (const uint8_t *)"/a",
             .path_len = sizeof "/a" - 1 } };
     size_t prepare = img_len;
@@ -1230,6 +1230,178 @@ static void test_checkpoint_metadata(void)
           "stale checkpoint metadata cannot replace the independent binding");
     CHECK(plan.owners && plan.owners->origins && plan.owners->origins->source == op,
           "stale metadata still leaves the checkpoint text eligible");
+}
+
+/* Astra wave1-N2 MUST-FIX 1-4: her byte-level inputs are the fixtures. */
+static void test_astra_n2(void)
+{
+    /* 1 (v2-c42): GENERATION key 1, identity volume 1 / inode low 2 /
+     * size 0, prefix_len 0 but prefix CRC 1, path "/a": total 106 B. */
+    {
+        uint8_t pay[74] = {0}, rec[128];
+        put64(pay, 1); put64(pay + 8, 1); put64(pay + 16, 2);
+        put32(pay + 60, 1); put32(pay + 68, 2);
+        pay[72] = '/'; pay[73] = 'a';
+        size_t rn = raw_record(rec, JOURNAL_REC_GENERATION, 1, 0, pay, sizeof pay);
+        journal_frame frame;
+        CHECK(rn == 106, "Astra 1 frame is 106 B");
+        CHECK(journal_record_decode(rec, rn, 0, 1, &frame) == JOURNAL_CODEC_INVALID,
+              "Astra 1 empty prefix needs CRC 0 (decode)");
+        journal_generation bad = { .key = 1, .identity = {1, 2, 0, 0, 0, 0},
+            .prefix_crc32c = 1, .location = (const uint8_t *)"/a", .location_len = 2 };
+        uint8_t out[128]; size_t pn = 0;
+        CHECK(journal_generation_encode(out, sizeof out, &pn, &bad) == JOURNAL_CODEC_INVALID,
+              "Astra 1 empty prefix needs CRC 0 (encode)");
+        img_reset(0, 9);
+        img_len += raw_record(img + img_len, JOURNAL_REC_GENERATION, 1, 0,
+                              pay, sizeof pay);
+        CHECK(journal_oracle_empty_prefix_crc(img, img_len) == JOURNAL_PREAMBLE_BYTES,
+              "Astra 1 oracle flags the GENERATION frame");
+        journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_INVALID);
+        CHECK(plan.prefix.valid_bytes == JOURNAL_PREAMBLE_BYTES &&
+              plan.prefix.records == 0 && plan.prefix.last_sequence == 0 &&
+              !plan.operations,
+              "Astra 1 INVALID at 32 with no declaration");
+    }
+
+    /* 2 (v2-o0t): preamble generation high-water 7, PREPARED new key 7. */
+    {
+        img_reset(7, 9);
+        journal_base base = { 0, 17 };
+        IMG_PAYLOAD(JOURNAL_REC_BASE, 9, journal_base_encode(pay_, sizeof pay_, &pn_, &base));
+        journal_save prep = { .phase = JOURNAL_SAVE_PREPARED, .token = 1,
+            .prepared = { .previous_key = 0, .new_key = 7, .snapshot_sequence = 1,
+                .saved_content_id = 17, .expected_presence = JOURNAL_ABSENT,
+                .witness = {1, 2, 0, 0, 0}, .path = (const uint8_t *)"/a",
+                .path_len = sizeof "/a" - 1 } };
+        size_t prepared = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &prep));
+        journal_generation gen = { .key = 7, .identity = {1, 2, 0, 0, 0, 0},
+            .location = prep.prepared.path, .location_len = prep.prepared.path_len };
+        IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0,
+                    journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+        journal_save fin = { .phase = JOURNAL_SAVE_FINISHED, .token = 1,
+            .finished = { .installed_key = 7, .snapshot_sequence = 1,
+                .saved_content_id = 17, .path = prep.prepared.path,
+                .path_len = prep.prepared.path_len } };
+        size_t finished = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &fin));
+        journal_base reuse = { 7, 17 };
+        size_t later = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_BASE, 10,
+                    journal_base_encode(pay_, sizeof pay_, &pn_, &reuse));
+        CHECK(journal_oracle_reused_new_key(img, img_len) == prepared,
+              "Astra 2 oracle flags reused new key 7");
+        journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+        CHECK(plan.prefix.valid_bytes == img_len && plan.prefix.records == 5,
+              "Astra 2 records stay in the physical prefix");
+        const journal_operation *op = operation_at(&plan, prepared);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED && !op->terminal,
+              "Astra 2 reused-key PREPARED claim is unresolved");
+        op = operation_at(&plan, finished);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED && !op->saved && !op->declaration,
+              "Astra 2 FINISHED neither activates nor gives saved evidence");
+        op = operation_at(&plan, later);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED,
+              "Astra 2 following BASE(7) gets no activation");
+    }
+
+    /* 3 (v2-kbj): BASE(0,17) at s=1, PREPARED claims id 23, size 1 "x". */
+    {
+        img_reset(0, 9);
+        journal_base base = { 0, 17 };
+        IMG_PAYLOAD(JOURNAL_REC_BASE, 9, journal_base_encode(pay_, sizeof pay_, &pn_, &base));
+        uint32_t x_crc = ref_crc32c((const uint8_t *)"x", 1);
+        journal_save prep = { .phase = JOURNAL_SAVE_PREPARED, .token = 1,
+            .prepared = { .previous_key = 0, .new_key = 1, .snapshot_sequence = 1,
+                .saved_content_id = 23, .expected_presence = JOURNAL_ABSENT,
+                .witness = {1, 2, 0, 1, x_crc}, .path = (const uint8_t *)"/a",
+                .path_len = sizeof "/a" - 1 } };
+        size_t prepared = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &prep));
+        journal_generation gen = { .key = 1, .identity = {1, 2, 0, 1, 0, 0},
+            .prefix_len = 1, .prefix_crc32c = x_crc,
+            .location = prep.prepared.path, .location_len = prep.prepared.path_len };
+        IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0,
+                    journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+        journal_save fin = { .phase = JOURNAL_SAVE_FINISHED, .token = 1,
+            .finished = { .installed_key = 1, .snapshot_sequence = 1,
+                .saved_content_id = 23, .path = prep.prepared.path,
+                .path_len = prep.prepared.path_len } };
+        size_t finished = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &fin));
+        CHECK(journal_oracle_snapshot_vs_base(img, img_len) == prepared,
+              "Astra 3 oracle flags snapshot against its BASE");
+        journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+        CHECK(plan.prefix.valid_bytes == img_len && plan.prefix.records == 4,
+              "Astra 3 physical prefix retained");
+        const journal_operation *op = operation_at(&plan, prepared);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED && !op->terminal,
+              "Astra 3 contradicting snapshot claim is unresolved");
+        op = operation_at(&plan, finished);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED && !op->saved,
+              "Astra 3 FINISHED gives no saved evidence for id 23");
+        CHECK(plan.owners && plan.owners->origins &&
+              plan.owners->origins->test == JOURNAL_VERIFIED_BASE &&
+              !plan.owners->origins->older,
+              "Astra 3 BASE origin retained, no installed origin");
+    }
+
+    /* 4 (v2-23u): checkpoint covered 1, unresolved restore at 5 is in
+     * its required suffix, so CANCELLED at 7 cannot consume token 1. */
+    {
+        img_reset(0, 9);
+        journal_base base = { 0, 17 };
+        IMG_PAYLOAD(JOURNAL_REC_BASE, 9, journal_base_encode(pay_, sizeof pay_, &pn_, &base));
+        img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+        journal_checkpoint chk = { 1, 17, 0, 0, 0 };
+        IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_BY_VALUE, 9,
+                    journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk));
+        img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+        uint64_t checkpoint_seq = img_seq;
+        journal_restore restore = { 0, 7, 0, 1 };
+        size_t bad_restore = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_RESTORE_BASE_RANGE, 9,
+                    journal_restore_encode(pay_, sizeof pay_, &pn_, &restore));
+        uint32_t x_crc = ref_crc32c((const uint8_t *)"x", 1);
+        journal_save prep = { .phase = JOURNAL_SAVE_PREPARED, .token = 1,
+            .prepared = { .previous_key = 0, .new_key = 8, .snapshot_sequence = 5,
+                .saved_content_id = 18, .expected_presence = JOURNAL_ABSENT,
+                .witness = {1, 2, 0, 1, x_crc}, .path = (const uint8_t *)"/a",
+                .path_len = sizeof "/a" - 1 } };
+        size_t prepared = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &prep));
+        journal_save cancel = { .phase = JOURNAL_SAVE_CANCELLED, .token = 1,
+            .cancelled = { .checkpoint_commit_sequence = checkpoint_seq,
+                .saved_content_id = 0, .outcome = JOURNAL_SAVE_CANCEL_CONFLICT,
+                .flags = 0 } };
+        size_t cancelled = img_len;
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, 9,
+                    journal_save_encode(pay_, sizeof pay_, &pn_, &cancel));
+        CHECK(journal_oracle_cancelled_bad_suffix(img, img_len) == cancelled,
+              "Astra 4 oracle flags CANCELLED with unresolved suffix");
+        journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+        CHECK(plan.prefix.valid_bytes == img_len && plan.prefix.records == 7,
+              "Astra 4 all seven records stay in the physical prefix");
+        const journal_operation *op = operation_at(&plan, bad_restore);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED,
+              "Astra 4 restore on undeclared key 7 is unresolved");
+        op = operation_at(&plan, cancelled);
+        CHECK(op && op->use == JOURNAL_UNRESOLVED && !op->checkpoint,
+              "Astra 4 CANCELLED stays unresolved");
+        op = operation_at(&plan, prepared);
+        CHECK(op && op->use == JOURNAL_ELIGIBLE && !op->terminal,
+              "Astra 4 PREPARED token is not consumed");
+        bool expected_branch = false, installed_branch = false;
+        if (plan.owners)
+            for (const journal_origin *o = plan.owners->origins; o; o = o->older) {
+                if (!o->source || o->source->final != prepared) continue;
+                if (o->test == JOURNAL_EXPECTED_BINDING) expected_branch = true;
+                if (o->test == JOURNAL_INSTALLED_WITNESS) installed_branch = true;
+            }
+        CHECK(expected_branch && installed_branch,
+              "Astra 4 both PREPARED branches are preserved");
+    }
 }
 
 static void test_workspace(void)
@@ -1299,6 +1471,7 @@ int main(void)
     test_operand_policy();
     test_cancelled_save();
     test_checkpoint_metadata();
+    test_astra_n2();
     test_workspace();
     free(plan_space);
     if (failures) {

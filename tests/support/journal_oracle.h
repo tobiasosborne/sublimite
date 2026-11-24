@@ -64,6 +64,160 @@ static bool journal_oracle_compare(const uint8_t *image, const size_t *offsets,
     return operation == NULL;
 }
 
+/* Astra N2 cases, derived flat from raw frame bytes (no reader calls).
+ * Each returns the file offset of the first offending frame, or 0.
+ * Fixed tables suffice: these model the small hand-built images only. */
+enum { JOURNAL_ORACLE_MAX_FRAMES = 256 };
+
+__attribute__((unused))
+static size_t journal_oracle_empty_prefix_crc(const uint8_t *image, size_t len)
+{
+    for (size_t at = JOURNAL_PREAMBLE_BYTES; at + JOURNAL_HEADER_BYTES <= len;) {
+        uint64_t total = journal_oracle_word(image + at + 4, 4);
+        if (total < JOURNAL_HEADER_BYTES || total > len - at) break;
+        const uint8_t *p = image + at + JOURNAL_HEADER_BYTES;
+        if (journal_oracle_word(image + at + 8, 4) == JOURNAL_REC_GENERATION &&
+            total - JOURNAL_HEADER_BYTES >= 72 &&
+            journal_oracle_word(p + 56, 4) == 0 &&
+            journal_oracle_word(p + 60, 4) != 0)
+            return at; /* Empty prefix: wire fixes its CRC at 0. */
+        at += (size_t)total;
+    }
+    return 0;
+}
+
+__attribute__((unused))
+static size_t journal_oracle_reused_new_key(const uint8_t *image, size_t len)
+{
+    if (len < JOURNAL_PREAMBLE_BYTES) return 0;
+    uint64_t high_water = journal_oracle_word(image + 12, 8);
+    for (size_t at = JOURNAL_PREAMBLE_BYTES; at + JOURNAL_HEADER_BYTES <= len;) {
+        uint64_t total = journal_oracle_word(image + at + 4, 4);
+        if (total < JOURNAL_HEADER_BYTES || total > len - at) break;
+        const uint8_t *p = image + at + JOURNAL_HEADER_BYTES;
+        if (journal_oracle_word(image + at + 8, 4) == JOURNAL_REC_SAVE &&
+            total - JOURNAL_HEADER_BYTES >= 136 &&
+            journal_oracle_word(p, 4) == JOURNAL_SAVE_PREPARED &&
+            journal_oracle_word(p + 20, 8) <= high_water)
+            return at; /* Fresh allocation must exceed the preamble mark. */
+        at += (size_t)total;
+    }
+    return 0;
+}
+
+__attribute__((unused))
+static size_t journal_oracle_snapshot_vs_base(const uint8_t *image, size_t len)
+{
+    uint64_t seq[JOURNAL_ORACLE_MAX_FRAMES], owner[JOURNAL_ORACLE_MAX_FRAMES];
+    uint64_t key[JOURNAL_ORACLE_MAX_FRAMES], content[JOURNAL_ORACLE_MAX_FRAMES];
+    size_t bases = 0;
+    for (size_t at = JOURNAL_PREAMBLE_BYTES; at + JOURNAL_HEADER_BYTES <= len;) {
+        uint64_t total = journal_oracle_word(image + at + 4, 4);
+        if (total < JOURNAL_HEADER_BYTES || total > len - at) break;
+        uint64_t type = journal_oracle_word(image + at + 8, 4);
+        const uint8_t *p = image + at + JOURNAL_HEADER_BYTES;
+        if (type == JOURNAL_REC_BASE && total - JOURNAL_HEADER_BYTES >= 16) {
+            if (bases == JOURNAL_ORACLE_MAX_FRAMES) return 0;
+            seq[bases] = journal_oracle_word(image + at + 16, 8);
+            owner[bases] = journal_oracle_word(image + at + 24, 8);
+            key[bases] = journal_oracle_word(p, 8);
+            content[bases++] = journal_oracle_word(p + 8, 8);
+        } else if (type == JOURNAL_REC_SAVE &&
+                   total - JOURNAL_HEADER_BYTES >= 136 &&
+                   journal_oracle_word(p, 4) == JOURNAL_SAVE_PREPARED) {
+            uint64_t s = journal_oracle_word(p + 28, 8);
+            for (size_t i = 0; i < bases; i++) {
+                if (seq[i] != s ||
+                    owner[i] != journal_oracle_word(image + at + 24, 8)) continue;
+                /* S is the saver's text at s: the BASE there fixes its id,
+                 * and key 0 fixes the empty text (size 0, CRC of empty 0). */
+                if (journal_oracle_word(p + 36, 8) != content[i] ||
+                    (key[i] == 0 && (journal_oracle_word(p + 120, 8) != 0 ||
+                                     journal_oracle_word(p + 128, 4) != 0)))
+                    return at;
+            }
+        }
+        at += (size_t)total;
+    }
+    return 0;
+}
+
+__attribute__((unused))
+static size_t journal_oracle_cancelled_bad_suffix(const uint8_t *image, size_t len)
+{
+    uint64_t declared[JOURNAL_ORACLE_MAX_FRAMES]; size_t declared_n = 0;
+    uint64_t fin_seq[JOURNAL_ORACLE_MAX_FRAMES], fin_owner[JOURNAL_ORACLE_MAX_FRAMES];
+    bool fin_bad[JOURNAL_ORACLE_MAX_FRAMES]; size_t finals = 0;
+    uint64_t chk_seq[JOURNAL_ORACLE_MAX_FRAMES], chk_owner[JOURNAL_ORACLE_MAX_FRAMES];
+    uint64_t chk_covered[JOURNAL_ORACLE_MAX_FRAMES]; size_t checkpoints = 0;
+    uint64_t slot_owner[JOURNAL_ORACLE_MAX_FRAMES]; size_t slots = 0;
+    bool slot_bad[JOURNAL_ORACLE_MAX_FRAMES], desc_seen[JOURNAL_ORACLE_MAX_FRAMES];
+    uint64_t desc_covered[JOURNAL_ORACLE_MAX_FRAMES];
+    for (size_t at = JOURNAL_PREAMBLE_BYTES; at + JOURNAL_HEADER_BYTES <= len;) {
+        uint64_t total = journal_oracle_word(image + at + 4, 4);
+        if (total < JOURNAL_HEADER_BYTES || total > len - at) break;
+        uint64_t type = journal_oracle_word(image + at + 8, 4);
+        uint64_t sequence = journal_oracle_word(image + at + 16, 8);
+        uint64_t who = journal_oracle_word(image + at + 24, 8);
+        const uint8_t *p = image + at + JOURNAL_HEADER_BYTES;
+        size_t slot = slots;
+        for (size_t i = 0; i < slots; i++)
+            if (slot_owner[i] == who) slot = i;
+        bool restore = type == JOURNAL_REC_RESTORE_BASE_RANGE ||
+                       type == JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE;
+        bool known = false;
+        if (restore)
+            for (size_t i = 0; i < declared_n; i++)
+                if (declared[i] == journal_oracle_word(p + 8, 8)) known = true;
+        if (type == JOURNAL_REC_GENERATION) {
+            if (declared_n == JOURNAL_ORACLE_MAX_FRAMES) return 0;
+            declared[declared_n++] = journal_oracle_word(p, 8);
+        } else if (type == JOURNAL_REC_COMMAND_BEGIN ||
+                   type == JOURNAL_REC_CHECKPOINT_BY_VALUE ||
+                   type == JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE) {
+            if (slot == slots) {
+                if (slots == JOURNAL_ORACLE_MAX_FRAMES) return 0;
+                slot_owner[slots] = who;
+                slot_bad[slots] = false;
+                desc_seen[slots++] = false;
+            }
+            if (type == JOURNAL_REC_COMMAND_BEGIN) slot_bad[slot] = false;
+            if (type == JOURNAL_REC_CHECKPOINT_BY_VALUE) {
+                desc_seen[slot] = true;
+                desc_covered[slot] = journal_oracle_word(p, 8);
+            }
+            if (restore && !known) slot_bad[slot] = true;
+        } else if (type == JOURNAL_REC_CHECKPOINT_COMMIT) {
+            if (checkpoints == JOURNAL_ORACLE_MAX_FRAMES) return 0;
+            chk_seq[checkpoints] = sequence;
+            chk_owner[checkpoints] = who;
+            chk_covered[checkpoints++] =
+                slot < slots && desc_seen[slot] ? desc_covered[slot] : 0;
+        } else if (journal_oracle_text(type) || type == JOURNAL_REC_COMMAND_COMMIT) {
+            if (finals == JOURNAL_ORACLE_MAX_FRAMES) return 0;
+            fin_seq[finals] = sequence;
+            fin_owner[finals] = who;
+            fin_bad[finals++] = type == JOURNAL_REC_COMMAND_COMMIT
+                ? slot < slots && slot_bad[slot] : restore && !known;
+        } else if (type == JOURNAL_REC_SAVE &&
+                   total - JOURNAL_HEADER_BYTES >= 36 &&
+                   journal_oracle_word(p, 4) == JOURNAL_SAVE_CANCELLED) {
+            uint64_t preserved = journal_oracle_word(p + 12, 8);
+            for (size_t i = 0; i < checkpoints; i++) {
+                if (chk_seq[i] != preserved || chk_owner[i] != who) continue;
+                /* The checkpoint secures text only with every complete
+                 * command after its covered boundary. */
+                for (size_t j = 0; j < finals; j++)
+                    if (fin_owner[j] == who && fin_seq[j] > chk_covered[i] &&
+                        fin_seq[j] < sequence && fin_bad[j])
+                        return at;
+            }
+        }
+        at += (size_t)total;
+    }
+    return 0;
+}
+
 static const journal_record_type journal_oracle_script[] = {
     JOURNAL_REC_COMMAND_BEGIN, JOURNAL_REC_COMMAND_DELETE,
     JOURNAL_REC_CHECKPOINT_BEGIN, JOURNAL_REC_CHECKPOINT_BY_VALUE,
