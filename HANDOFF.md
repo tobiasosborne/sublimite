@@ -3,58 +3,64 @@
 Read order: this file → `CLAUDE.md` → `docs/PLAN_V2.md`. Beads: `bd` in this worktree resolves to the v2 database
 (prefix `v2`; docs/decisions/wave0-beads-and-oracle-pin.md §1). Push branch `v2` only, after every verified landing.
 
-## Session 1 (2026-11-22 night → 2026-11-23 morning, ThinkPad) — state as of the last commit
-
-### Wave 0 exit, first half: DONE — scaffold blockers closed
-W0.1 vendor (c0e9e2c) · W0.3a include DAG from compiler dependency files (865095b) · W0.3b nm symbol DAG (45921fb)
-· W0.3c fail-closed lanes, suite manifest `tests/lanes.mk`, tools registry (3f26948) · W0.4 app identity guard +
-isolation lint (10cec71). `make check` green.
+## Session 1 (2026-11-22 night → 2026-11-24 morning, ThinkPad) — ENDED on Tobias's "time to pause work now" (2026-11-24)
 
 ### Wave 0: GATE PASSED (2026-11-23 22:50 CET; advisor acknowledged)
-`make contract-gate` exit 0, run v1-20261123T215001Z-843898: PASS 96, XFAIL 1 (X3.over.roundtrip, A8 signature, dies in
-Undo after a journaled delete). Commit c16bfc2, [AC] Charging 86 %, load 0.84. Evidence committed under
-docs/gates/wave0/v1-20261123T215001Z-843898/ (gate.json, summary.txt, record.txt). Epic v2-he7 closed; backlogs .20,
-.25, .34 remain backlog.
-- What it means: the contract instrument is proven against v1 at the pin, with one reviewed expected failure.
-- What it does not mean: nothing yet about v2. The per-target predicates (the zero Law-2 counts on R1, R3, R4, R5, R6;
-  X3 as PASS) are what v2 will be held to when Wave 1 exits.
-- Timing for the next announcement: the run took 137 s wall (M), because the runner runs the cases in parallel on
-  displays :190–:195 (capacity, 115.6 s, is the critical path). Ask the Paris-talk thread for about five minutes, not
-  fifty. Use tools/run_gate.sh (start time, give-up time, derived quiet condition: no build/test processes, no foreign
-  job, 1-min load <= 2.8 = the regime the watchdogs were measured in).
-- W0.7 path: phase 1 B1–B5, B7 (0.79–0.83), X3 fences (0.84), phase 2 B6 (0.85, 0.86), phase 3 Astra runner read
-  GATE-READY (docs/reviews/wave0-runner-astra.md).
+`make contract-gate` exit 0, run v1-20261123T215001Z-843898: PASS 96, XFAIL 1 (X3.over.roundtrip: v1 dies in Undo after
+a journaled delete). Commit c16bfc2, [AC], load 0.84; evidence in docs/gates/wave0/v1-20261123T215001Z-843898/. Epic
+v2-he7 closed; backlogs .20, .25, .34 stay backlog. It proves the instrument against v1 at the pin; it says nothing yet
+about v2 (the per-target predicates — zero Law-2 counts on R1/R3/R4/R5/R6, X3 as PASS — are what Wave 1's exit holds v2
+to). The run takes ~137 s (parallel displays :190–:195): ask the Paris-talk thread for ~5 minutes. Use tools/run_gate.sh.
 
-### Wave 1 (L2/L5 unblocked by the Wave 0 gate, A10)
-Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream + one wait set (1.8, 1.11), fault ids
-(1.10, 1.12, 1.15), ASSERT migration (1.14), no test env vars + dead exports (1.20). Landed L1: scan (1.6), utf8 (1.7),
-indent (1.9, 1.13), piece 7a = frozen piece.h incl. Lines + flat model + model-run suite (1.16–1.18, erratum d028acf,
-piece_span_nl_join with undo), find (1.19), undo (1.21). lineidx removed (A19). Early leaves (A21): dnd (4.1).
-In flight (state at 02:31 CET 2026-11-24):
-- 7b real piece tree (v2-0fv.17): rounds 1–3 merged on review/7b2 (5633ba1), lanes green on the merged tree; Astra's third
-  read HOLD on I, J, K; the advisor replaced the admission rule (A26: exact at quiescence, four-step sequence). Round 4
-  (A26, a deletion round: remove piece_fund_exact's loop and predicates; I/A(1) traces assert retry success; J, K test
-  steps 4, 2, 1) is READY TO SEND to the warm 7b thread when Claude reads >= 2.0 behind; then Astra reads the new admission
-  section only; then 7b lands (merge review/7b2 + round 4 onto v2, lanes on the merged tree).
-- L2-2b journal runtime (v2-0fv.24): paused at a94af15 on its branch (compiles; next: mutation reds M4–M6); resumes on its
-  Opus thread after 7b lands and Claude is > 3 behind; then it switches from the piece model to the real tree.
-- Landed tonight: 0.87, 1.20, 1.21 undo, 2.0 L2-0a, 2.1 L2-2a, 4.1 dnd, 4.2 TOML. Briefs ready: L2-3, L2-1, v2-0fv.15.
-- Filed: v2-0fv.21 os export deletion + nm gate, .22 empty-tab footprint, .27 54-bit node-prefix packing.
-- Quota, last readings: Claude 89.0 % weekly, 1.4 behind (`quota` 02:29 CET), then HTTP 429 from `quota` at 02:31
-  (t3quota cache, age ~1 h: 89.0 %, 2.4 behind); Codex 7.0 %, 1.7 behind (02:31); Muse weekly 16 % with 5 d 23 h left,
-  ~1.5 over pace (01:30), 5-hour session 35 % (02:31). The coordinator's own turns consume Claude room at about the
-  accrual rate; a 2-minute quota poll for an hour (~30 full-context turns) ate the room it waited for. Do not poll.
-- Wake: the advisor scheduled itself for 05:05 CET (after the 03:45–05:00 no-build window): one `quota` read; if Claude
-  is >= 2.0 behind it messages the coordinator to dispatch the A26 round (and resume L2-2b if > 3.0 behind), else it
-  reschedules +90 min. Until then the coordinator does nothing.
-L2/L5 decisions: A19–A26; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
-L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md, wave1-L2-derivations.md, wave1-L2-q2-crash-consistency.md,
-wave1-L2-q2-protocol.md. Briefs live in docs/briefs/ named by bead and are committed with their dispatch.
+### Landed on v2 (all pushed)
+- L0: os 1.1, base 1.2, trace 1.3, work 1.4, ipc 1.5, os stream + wait set 1.8/1.11, fault ids 1.10/1.12/1.15, ASSERT 1.14,
+  no test env vars + dead exports 1.20 (82c3cc0), archive member-list fix 0.87 (010b69b).
+- L1: scan 1.6, utf8 1.7, indent 1.9/1.13, piece 7a frozen header + model + suite 1.16–1.18 (Lines frozen 6be1cb3, erratum
+  d028acf), find 1.19 (d11349c), undo 1.21 (e59461d). lineidx removed (A19).
+- L2: L2-0a os watch + metadata copy 2.0 (47701d6), L2-2a journal wire + pure codec 2.1 (3f0d196).
+- Early leaves (A21): dnd 4.1 (34cc2e8), TOML parser 4.2 (d121784).
 
-### Next session, in order
-1. Land whatever lanes left (each worktree is committed on its branch as "wip ..." or reported with a path).
-2. 7b landing (split read), then L2-1 file (after L2-0a) and the L2 briefs from the Q2 ruling; v2-0fv.21.
-3. Wave 1 exit numbers recorded in A22 (Q6 G1 under writeback; Q3 10 GiB recovery measurement in L2-2).
+### Paused, with where and what remains (resume each on its own thread; each checkout is a wip commit on its branch)
+1. 7b real piece tree (v2-0fv.17), Opus thread "W1 L1 piece 7b real tree (Opus, continues Sol wip)", worktree
+   /home/tobias/.t3/worktrees/sublimite-v2/t3-02ae434f-077e470154366fbf, wip e0b96ff (round 4). Rounds 1–3 merged and
+   lane-green on review/7b2 (5633ba1, my merged tree). Round 4 (A26: admission exact at quiescence, four-step sequence):
+   fixpoint deleted, piece_admit = steps 2–4, fast path needs companion storage, compound edits planned once (shadow
+   result), STORAGE contract in piece.h, new tests J/K1/K2 red->green, I and A(1) as retry-success contract tests; san/tsan
+   piece/undo suites green on the worker's tree. NOT done: decision §8.1 still says A25 (rewrite to A26; drop three round-3
+   mutants that target deleted code); check/check-tsan/fuzz-smoke not run; piece.c grew 2,811 -> 2,819 (the worker offers
+   two-stage compound planning to shrink it — an advisor call). Then: merge round 4's files onto review/7b2 (copy files;
+   git merge-file for any that v2 changed since), lanes on the merged tree, Astra reads the admission section only
+   (source, no execution), land.
+2. L2-2b journal runtime (v2-0fv.24), Opus thread "L2-2b journal runtime (Opus)", worktree
+   /home/tobias/.t3/worktrees/sublimite-v2/t3-de932866-2c152938cbe90882, wip a94af15. Compiles; next item: its mutation
+   reds M4–M6. Wire unchanged (no amendment). Built on the piece model; after 7b lands it moves to the real tree
+   (tests/piece_model.c is deleted in 7b round 2: the harness drives the pm_* model side by side).
+3. v2-0fv.21 os export deletion + nm gate (Sol thread "v2-0fv.21 os export deletion + nm gate (Sol)", worktree
+   /home/tobias/.t3/worktrees/sublimite-v2/t3-f672f5f8-c90c59b8e9d757d9, branch t3/audit-os-exports): paused; see its
+   decision file docs/decisions/v2-0fv.21.md in that checkout for done/missing (gate check_exports: ok on its tree).
+
+### Owed, in order
+1. 7b round 4 finish -> Astra's admission read -> 7b lands.  2. L2-2b (M4–M6, then the real tree, the two measurements).
+3. The advisor reads L2-3's brief (docs/briefs/L2-3-journal-save.md) after L2-2b lands; then L2-3.  4. L2-1 file
+(docs/briefs/L2-1-file.md).  5. v2-0fv.21 finish and land.  6. Then edit (v2-0fv.15, provisional brief), savectl, minimal
+L5, and the Wave 1 exit list (PLAN §6 + amendments A13, A19, A22–A26: the Law-2/G1 guard, the 131,072 B read gate, exact
+line queries after any edit, Q6's G1-under-writeback number, Q3's 10 GiB recovery measurement, the SIGKILL-at-every-save-
+step oracle, X3 as PASS on v2), then the whole-wave Astra deletion read before the gate.
+Filed and waiting: v2-0fv.22 empty-tab footprint, v2-0fv.27 54-bit node-prefix packing (deletion review).
+
+### Open questions for Tobias (the advisor carries them)
+- v1 findings to file in v1's tracker (worklog 2026-11-22/23: post-rename save conflict, >32 MiB delete+undo exit 1,
+  editor_session_test ivv_save race, test_install_omarchy EDITOR export, finding 9: R3's counting window allocates in
+  about one run in six).
+- The large-file external-replacement contract of A23 (PLAN's product-contract paragraph): unsaved difference can be lost
+  if another program replaces a file above the self-contained size and the editor is killed before its conflict
+  checkpoint; the conflict is always detected and reported.
+- The Codex pace rule (Codex ran far below pace all night because its work routes away from fault-heavy beads).
+
+### Quota at session end (one reading, 2026-11-24 06:45 CET)
+Claude weekly 92.0 % (1.9 behind pace, reset 17:00 CET), Fable weekly 68.0 %; Codex weekly 7.0 % (4.2 behind); Muse
+unreadable by `quota` ("server_sent_no_usage"; last read weekly 16 %, ~1.5 over pace at 01:30). Claude's used figure rose
+89 -> 91 between 02:30 and 05:05 with all our lanes idle: the account is shared with another consumer.
 
 ### Facts the next session needs
 - Quality bar (Tobias, 2026-11-23): genius-level engineering; push back on sloppy work. Owner-read every landing,
@@ -79,6 +85,10 @@ wave1-L2-q2-protocol.md. Briefs live in docs/briefs/ named by bead and are commi
   Astra is filtered, the Claude/Muse reviewer takes the source too. Muse and Gemini: up to pace only; Tobias rates Muse
   for review. Both Claude and Codex up to pace (Tobias, 2026-11-23); Opus stop line 2; four Opus lanes while Claude
   room > 4, two below.
+- Routing as of session end: Codex jobs that run or write fault/kill/truncation tests go to Claude or Muse (filtered
+  twice tonight: 7b on Sol, Astra's undo re-read); Muse ~1.5 over weekly pace at last reading, no Muse dispatch until it
+  is at pace; the Claude account is shared with another consumer, and the coordinator's own turns use about the accrual
+  rate — never poll quota or children; act on events.
 - Worker briefs carry: no rm -rf, no mktemp with a clean-up trap, nothing outside the checkout is created or removed,
   HOME for any tool that writes caches is under the checkout's build/, build under build/, report instead of running
   anything that needs approval; never profile the oracle (perf record -N if ever). T3 thread timestamps are UTC.
