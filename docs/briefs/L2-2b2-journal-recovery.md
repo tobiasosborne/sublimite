@@ -82,6 +82,10 @@ Acceptance (each a test, red first):
   - B's command among A's members;
   - abort, then a new command.
 - Unknown version or required feature: refused and set aside without truncation.
+- THE ORACLE COVERS THE WIRE (advisor, from 1.29's lesson: the oracle shared all four N2 defects because its generator
+  never emitted GENERATION, BASE or SAVE): the flat oracle's generator emits every record type and role of the signed
+  wire, and the report lists, per type, how many generated cases contained it. A type with zero is a failed
+  acceptance line.
 - Repair:
   - a torn final record is repaired in place;
   - a complete record with one flipped bit, followed by valid records, leaves the original bytes byte-identical under

@@ -81,6 +81,10 @@ Acceptance (each a test, red first; stop the process at every step, under K, and
 - A peer's undo by reference is mid-emission (prepared, not committed) when the save captures. At every later stop, the
   peer recovers its text without the displaced file.
 - Each classified result class is produced by a test.
+- THE ORACLE COVERS THE WIRE (advisor, from 1.29's lesson: the oracle shared all four N2 defects because its generator
+  never emitted GENERATION, BASE or SAVE): the flat oracle's generator emits every record type and role of the signed
+  wire, and the report lists, per type, how many generated cases contained it. A type with zero is a failed
+  acceptance line.
 - Law2 on any typing-path call you add.
 - docs/decisions/L2-3-journal-save.md: each mechanism with its invariant, the simplest alternative and the defeating
   counter-example.

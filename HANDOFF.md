@@ -27,6 +27,9 @@ branches: push each at every pause or session end; delete the remote branch once
       the four fixes and their tests only. No further Muse dispatch tonight without asking the advisor.
     - L2-1's adversarial source read: a fresh Opus reviewer in the Claude queue, after v2-40h and before 2b-1, each at
       Claude room >= 1.0. Then the advisor's owner read, and L2-1 lands (review/l2-1 1ce753a, lanes green).
+    - L2-1 Opus review question (advisor): does file take messages from the shared mailbox by selective receive
+      (work_mailbox_receive)? If so, how is that consistent with one UI dispatcher (Q7)? A second consumer is a
+      finding against L2-1. After L2-1 lands, the export gate decides work_mailbox_receive's temporary reservation.
     - L2-1 MERGE ITEMS (advisor, 2026-11-24):
       (1) the file-suite permission assertion (v2-677 landed in os as 1.28);
       (2) a new destination gets 0666 & ~umask, by fchmod after the temp's private 0600 creation, so no step is wider
