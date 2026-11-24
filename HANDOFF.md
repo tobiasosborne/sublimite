@@ -27,6 +27,13 @@ branches: push each at every pause or session end; delete the remote branch once
       the four fixes and their tests only. No further Muse dispatch tonight without asking the advisor.
     - L2-1's adversarial source read: a fresh Opus reviewer in the Claude queue, after v2-40h and before 2b-1, each at
       Claude room >= 1.0. Then the advisor's owner read, and L2-1 lands (review/l2-1 1ce753a, lanes green).
+    - L2-1 MERGE ITEMS (advisor, 2026-11-24):
+      (1) the file-suite permission assertion (v2-677 landed in os as 1.28);
+      (2) a new destination gets 0666 & ~umask, by fchmod after the temp's private 0600 creation, so no step is wider
+          than the final mode. It is a deliberate deviation from v1's 0644-regardless-of-umask (v1 file.c:908/919 at
+          6fec2e8; the advisor adds it to v1's backlog), recorded in docs/decisions/L2-1-file.md with the reason: it
+          agrees with v1 under umask 022 and never widens past the user's umask. Assertions: umask 022 gives 0644,
+          umask 077 gives 0600, and the temp is never wider than the result.
     - Codex (serial): v2-677 permission bits (Sol, running; fix in os_file_copy_metadata, test in os_persist_test; the
       file-suite assertion is added by the L2-1 merge). Then Astra answers her ten L5 questions as errata (section
       "Errata proposed by the L5 spec" in wave1-app-spec.md). The advisor reads the L5 spec and the errata together.
