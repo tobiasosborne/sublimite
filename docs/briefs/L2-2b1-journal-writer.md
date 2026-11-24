@@ -95,6 +95,9 @@ Acceptance (each a test, red first):
 - Measurement 1 (A22, Q6's Wave 1 exit number): input-to-submit median and tail with the append, during ordinary typing
   and under heavy writeback from another process, stamped [bat]/[AC] + load. The load generator is a child the bench
   owns and reaps. If the tail fails G1, report it.
+- The cost of JOURNAL_LITERAL_LIMIT's one-page choice (advisor, at signature of the runtime section), as tracked
+  numbers, stamped: records and UI write calls per MiB of checkpoint, and the bytes per second the UI appends while
+  idle.
 - check-tsan on the journal suites. Fuzz: append sequences with interleaved producers and torn writes.
 
 Rules:

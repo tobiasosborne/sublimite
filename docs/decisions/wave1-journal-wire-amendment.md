@@ -1,6 +1,6 @@
 # Journal wire amendment and runtime header for joint signature
 
-STATUS (advisor, 2026-11-24): lines 1–286 (wire amendment and pure reader contract) SIGNED, with the saved-association rule added at FINISHED. The runtime section (from "Proposed runtime section") is NOT signed: R1–R6 pending.
+STATUS (advisor, 2026-11-24): the wire amendment and pure reader contract are SIGNED, with the saved-association rule added at FINISHED. The runtime section (from "Proposed runtime section") is SIGNED at d1fe59b: 21 functions, R1–R6 as cut, the literal-limit tag corrected, and piece_validate_fn approved (its erratum is its own bead). edit.h and savectl.h are not signed yet.
 
 This replaces the indicated paragraphs and declarations in `src/journal/journal.h` before the first on-disk release. Retain the preamble, field offsets, sizes, endian encoding, CRC coverage, identity witnesses, payload encoders and family/version refusal rules. Keep wire version 1 (G, pre-freeze amendment procedure). The following text belongs in the header. Numbers in names and section citations identify existing contracts. (G) denotes a format or product choice and (P) a consequence of the stated construction. [Signed A28](wave0-plan-amendments.md#a28-the-journal-write-model-advisor-2026-11-24-w1-with-repair-a-docsdecisionswave1-journal-write-modelmd) · [Landed header](../../src/journal/journal.h)
 
@@ -423,7 +423,9 @@ journal_err journal_append(journal *j, const journal_record *record,
 /* The journal owns the literal slicing policy and the declaration/restore
  * policy. Budget one wire page of bytes per literal write so a fair
  * single-record service step submits at most one page for that producer
- * (G, writer work per append). A full slice holds 4056 bytes
+ * (G, writer work per append: a waiting key waits for at most one
+ * page-sized write, and a torn frame is confined to one page's worth).
+ * Only the subtraction is physics. A full slice holds 4056 bytes
  * (P, 4096 bytes per wire page less the 32-byte frame header and the
  * 8-byte encoded destination). Short final slices use their actual size.
  * This encoder policy applies to all journals. Readers use the wire
