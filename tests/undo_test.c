@@ -439,6 +439,131 @@ static void one_span_mapped(void)
     ph_map_unref(&mp);
 }
 
+/* (P) One group, two records over "a\nb": replace 'a' with 'x', then
+ * append 'y'. Undo removes 'y' first, then restores 'a', so a rollback
+ * must rewind both mutations, not only the last one applied. */
+static void mapped_two_record_group(fixture *f)
+{
+    ASSERT(undo_begin(f->log, &first, false) == UNDO_OK);
+    ASSERT(undo_replace(f->log, 0, 1, (const uint8_t *)"x", 1) == UNDO_OK);
+    ASSERT(undo_replace(f->log, 3, 0, (const uint8_t *)"y", 1) == UNDO_OK);
+    ASSERT(undo_commit(f->log, &last) == UNDO_OK);
+    ASSERT(undo_get_stats(f->log).records == 2);
+}
+
+static fixture open_mapped_ab(ph_mapping *mp, bool *trust)
+{
+    const uint8_t sample[] = "a\nb";
+    fixture f;
+    ASSERT(ph_map_open(mp, sample, sizeof sample - 1));
+    ASSERT(piece_reserve_create(&f.reserve) == PIECE_OK);
+    ASSERT(piece_open_mapped(f.reserve, &mp->b, &f.tree) == PIECE_OK);
+    *trust = true;
+    ASSERT(undo_create(&f.log, f.tree, SIZE_MAX, trusted, trust) == UNDO_OK);
+    ASSERT(ph_lines_complete(f.tree, mp, "mapped prepared resolve"));
+    return f;
+}
+
+/* v2-hxt item 1 (v2-bmw deferred verification): the live validator
+ * refuses after a successful prepare and before the owner commit. */
+static void mapped_prepared_validator_refusal(void)
+{
+    ph_mapping mp;
+    bool trust;
+    fixture f = open_mapped_ab(&mp, &trust);
+    const piece_view *v = piece_tree_view(f.tree);
+    mapped_two_record_group(&f);
+    text_eq(v, "x\nby");
+    const uint64_t add = piece_add_length(f.tree);
+    undo_history h = undo_get_history(f.log);
+    undo_stats s = undo_get_stats(f.log);
+
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    ASSERT(memcmp(target, &first, sizeof first) == 0);
+    text_eq(v, "a\nb");
+    history_eq(f.log, h, s); /* counters stay at the entry boundary while prepared */
+
+    trust = false;
+    ASSERT(undo_commit(f.log, target) == UNDO_ERR_CONFLICT);
+    trust = true;
+    text_eq(v, "x\nby"); /* the whole group rolled back */
+    ASSERT(piece_add_length(f.tree) == add);
+    ASSERT(undo_replay_snapshot(f.log) == NULL); /* replay state reset to idle */
+    history_eq(f.log, h, s);
+
+    /* The same replay prepares and commits once the validator accepts. */
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
+    text_eq(v, "a\nb");
+    ASSERT(piece_add_length(f.tree) == add);
+    ASSERT(undo_get_history(f.log).undo_groups == 0 && undo_get_history(f.log).redo_groups == 1);
+    close_fixture(f);
+    ph_map_unref(&mp);
+}
+
+static void check_rank_eof(const piece_view *v); /* defined with late_fault_rollback below */
+
+/* v2-hxt item 2: the mapping's fault poll reports a fault before the
+ * resumed mutation, at the resumed mutation, and at the closing poll
+ * in the owner commit. Each is CONFLICT with whole-group rollback. The
+ * after-the-splice variant with a failing poll is late_fault_rollback. */
+static void mapped_fault_poll_conflicts(void)
+{
+    ph_mapping mp;
+    bool trust;
+    fixture f = open_mapped_ab(&mp, &trust);
+    const piece_view *v = piece_tree_view(f.tree);
+    mapped_two_record_group(&f);
+    const uint64_t add = piece_add_length(f.tree);
+    undo_history h = undo_get_history(f.log);
+    undo_stats s = undo_get_stats(f.log);
+    const undo_state *target;
+
+    /* Before the resumed mutation: yield, then fault the poll. */
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "x\nb");
+    ph_poll_set(PH_POLL_FAULTED);
+    target = &idle;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_CONFLICT);
+    ph_poll_set(PH_POLL_REAL);
+    ASSERT(!target);
+    text_eq(v, "x\nby");
+    ASSERT(piece_add_length(f.tree) == add && undo_replay_snapshot(f.log) == NULL);
+    history_eq(f.log, h, s);
+    check_rank_eof(v);
+
+    /* At the resumed mutation: the poll faults as the resumed splice lands. */
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "x\nb");
+    late_replay = PH_POLL_FAULTED;
+    target = &idle;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_CONFLICT);
+    late_replay = PH_POLL_REAL;
+    ph_poll_set(PH_POLL_REAL);
+    ASSERT(!target);
+    text_eq(v, "x\nby");
+    ASSERT(piece_add_length(f.tree) == add && undo_replay_snapshot(f.log) == NULL);
+    history_eq(f.log, h, s);
+    check_rank_eof(v);
+
+    /* Closing poll: prepare succeeds, the poll faults before commit. */
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    text_eq(v, "a\nb");
+    ph_poll_set(PH_POLL_FAULTED);
+    ASSERT(undo_commit(f.log, target) == UNDO_ERR_CONFLICT);
+    ph_poll_set(PH_POLL_REAL);
+    text_eq(v, "x\nby");
+    ASSERT(piece_add_length(f.tree) == add && undo_replay_snapshot(f.log) == NULL);
+    history_eq(f.log, h, s);
+    check_rank_eof(v);
+
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &first) == UNDO_OK);
+    text_eq(v, "a\nb");
+    close_fixture(f);
+    ph_map_unref(&mp);
+}
+
 static void threshold(void)
 {
     /* (G) 16 B per coalesced pair. Test one below, equal, and one above. */
@@ -913,6 +1038,54 @@ static void mapped_without_validator(void)
     if (undo_create(&f.log, f.tree, SIZE_MAX, NULL, NULL) == UNDO_OK) close_fixture(f);
 }
 
+/* v2-hxt item 3: caller-precondition (A15) death tests. Each violator
+ * runs in the forked child of assert_death; setup must not ASSERT. */
+static fixture prepared_one_record(void)
+{
+    fixture f = open_copy((const uint8_t *)"ab", 2);
+    ASSERT(insert_cmd(f.log, 2, (const uint8_t *)"c", 1, false, &first, &last) == UNDO_OK);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    return f; /* phase PREPARED: only reads, commit or abort are legal */
+}
+
+static void prepared_begin(void)
+{
+    fixture f = prepared_one_record();
+    (void)undo_begin(f.log, &idle, false);
+}
+
+static void prepared_replace(void)
+{
+    fixture f = prepared_one_record();
+    (void)undo_replace(f.log, 0, 0, (const uint8_t *)"x", 1);
+}
+
+static void prepared_prepare_again(void)
+{
+    fixture f = prepared_one_record();
+    const undo_state *target;
+    (void)undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target);
+}
+
+static void prepared_set_cap(void)
+{
+    fixture f = prepared_one_record();
+    undo_set_cap(f.log, SIZE_MAX);
+}
+
+static void opposite_direction_resume(void)
+{
+    fixture f = open_copy(NULL, 0);
+    ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"ab", 2) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"c", 1) == UNDO_OK);
+    ASSERT(undo_commit(f.log, &last) == UNDO_OK);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    (void)undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target);
+}
+
 static void wrote_during_yield(void)
 {
     fixture f = open_copy(NULL, 0);
@@ -1071,7 +1244,19 @@ int main(int argc, char **argv)
         ASSERT(assert_death(mapped_without_validator, "src/undo/undo.c",
                             "!piece_view_backing(piece_tree_view(tree)) || validate"));
         ASSERT(assert_death(wrote_during_yield, "src/undo/undo.c", "now == u->replay.guard"));
+        ASSERT(assert_death(opposite_direction_resume, "src/undo/undo.c",
+                            "u->phase == UNDO_IDLE || (u->phase == UNDO_REPLAYING && u->replay.direction == direction)"));
+        ASSERT(assert_death(prepared_begin, "src/undo/undo.c",
+                            "u && before && u->phase == UNDO_IDLE"));
+        ASSERT(assert_death(prepared_replace, "src/undo/undo.c",
+                            "u && u->phase == UNDO_OPEN && (bytes || len == 0)"));
+        ASSERT(assert_death(prepared_prepare_again, "src/undo/undo.c",
+                            "u->phase == UNDO_IDLE || (u->phase == UNDO_REPLAYING && u->replay.direction == direction)"));
+        ASSERT(assert_death(prepared_set_cap, "src/undo/undo.c",
+                            "u && cap_bytes != 0 && u->phase == UNDO_IDLE"));
         one_span_mapped();
+        mapped_prepared_validator_refusal();
+        mapped_fault_poll_conflicts();
         late_fault_rollback();
         external_store();
         typing_record();
