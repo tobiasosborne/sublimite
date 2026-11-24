@@ -1,7 +1,7 @@
 Bead L2-3: the L2 journal save transaction on A28. Save phases are appended records with barrier receipts; peer and
 conflict protection are checkpoint groups; there is no finish image and no exclusive section.
 
-Rewritten 2026-11-24 on A28; the advisor reads this brief before dispatch. sublimité v2 is a clean-slate C11 editor
+Rewritten 2026-11-24 on A28; SIGNED by the advisor 2026-11-24 with two additions. sublimité v2 is a clean-slate C11 editor
 rebuild. Your checkout is a worktree of /home/tobias/Projects/sublimite-v2 (branch v2). One worker, one bead: do exactly
 this scope, then stop. Routing: Claude or Muse, because the tests stop the process at every save step; never Codex.
 
@@ -29,6 +29,9 @@ Scope (A23 + A28):
 - PREPARE, in order:
   1. Capture the snapshot S and its boundary s, and the image. From capture on, journal any restore from the generation
      being replaced by value (VALUE_ONLY, A23 rule 3).
+     (Advisor, Astra §1.7.) VALUE_ONLY for the displaced generation applies across producers from capture on. That
+     includes a provisional command already emitting a reference to it: such a command is finished before the
+     relevant boundary, or aborted and restaged by value.
   2. Consume the file layer's synced temp and its witness (L2-1).
   3. For every OTHER journal-recorded buffer state whose BASE is the generation being replaced (live or
      closed-but-kept, including recovered drafts of the same target, rule 6), request a checkpoint group through
@@ -75,6 +78,8 @@ Acceptance (each a test, red first; stop the process at every step, under K, and
 - The piece-pool row "Source conflicts, rotation and history lifetime" at journal level, minus retention (A23): Select
   All -> Delete -> Save empty -> Undo -> stop/restart with different old and new BASE generations; mismatched
   generation.
+- A peer's undo by reference is mid-emission (prepared, not committed) when the save captures. At every later stop, the
+  peer recovers its text without the displaced file.
 - Each classified result class is produced by a test.
 - Law2 on any typing-path call you add.
 - docs/decisions/L2-3-journal-save.md: each mechanism with its invariant, the simplest alternative and the defeating
@@ -91,4 +96,5 @@ Rules:
 
 Acceptance lanes: nice make -j2 check (CONTRACT_CHECK_DISPLAYS from the coordinator), check-tsan, fuzz-smoke.
 
-Report: red/green per acceptance line, lines removed vs added, anything outside scope (report only).
+Report: red/green per acceptance line, lines removed vs added, the comment-free count per file
+(gcc -fpreprocessed -dD -E -P f | grep -c '[^[:space:]]') beside v1's save code, and anything outside scope (report only).
