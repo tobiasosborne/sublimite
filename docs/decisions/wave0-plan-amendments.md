@@ -379,11 +379,55 @@ latched); J and K test steps 4, 2 and 1. piece_fund_exact's loop and its predica
 ## Reopened, not yet amended (advisor, 2026-11-24; joint read of savectl 62c1441 and edit aa25e91)
 - A27 (savectl's PLAN 4.4 "orthogonal four axes" are observables, not stored fields) is DRAFTED in
   docs/decisions/wave1-savectl-spec.md and waits for W1.
-- The wire's group-contiguity rule (2.1, src/journal/journal.h) and Q7 (A22's "finish uses an exclusive lease and a
+- (RESOLVED by A28 below.) The wire's group-contiguity rule (2.1, src/journal/journal.h) and Q7 (A22's "finish uses an exclusive lease and a
   current complete checkpoint") are REOPENED by the advisor, with W1 as the proposal (docs/briefs/W1-journal-write-model.md;
   Astra's answer in docs/decisions/wave1-journal-write-model.md). Nothing lands on the wire until the advisor signs.
 - Signed the same day: the undo replay erratum (edit spec E1; owner-called commit/abort; undo_undo/undo_redo deleted),
   the default history cap 32,768 x c with c = 2 x sizeof(undo_slot) + 1 (529 B on LP64, a test asserts it; E5), and
   E3's principle (a by-value restore is streamed from pinned stores, never copied whole; scratch of at most one record).
   The piece.h reader for a provenanced span in pinned stores is filed only once the edit header is signed.
+
+## A28. The journal write model (advisor, 2026-11-24; W1 with repair (a); docs/decisions/wave1-journal-write-model.md)
+Supersedes Q7's exclusive sections (A22) and the wire's group-contiguity rule (2.1). Signed after Astra's §1.3 broke
+W1 as first written (two open checkpoints of one buffer share an indistinguishable COMMIT).
+1. One writer. Only the UI thread writes the named journal, one complete record per single-attempt write. Workers
+   encode from pinned snapshots and sync through a captured offset on the named inode. They never write or truncate it.
+2. Slots. Each buffer has one command slot and one checkpoint slot.
+   - A BEGIN opens a fresh instance of its slot and abandons the uncommitted instance of the same kind.
+   - A final marker closes the latest BEGIN of its (buffer, kind).
+   - A live command is abandoned only by its owner's abort.
+   - Records of other buffers, and the same buffer's commands among its checkpoint members, may lie anywhere between
+     members.
+3. Checkpoint requests. One is in flight per buffer.
+   - A request that the in-flight checkpoint satisfies (coverage and binding) coalesces with it.
+   - A request it cannot satisfy restarts it with a new BEGIN.
+   - No queue and no waiting.
+   - The UI rejects members and completions of an abandoned instance by producer identity before appending.
+4. Not repair (b): no group-instance id on members. Nothing needs two open checkpoints of one buffer, and (a) costs zero
+   wire bytes (P, Astra §2.2) and at most 2B slots of reader state (P, §2.6).
+5. The checkpoint boundary is at BEGIN, of a published snapshot only (§2.3). The RAM commit is bracketed (W1 d).
+   Save phases are append-only with the reader meaning of §2.4: the installed generation's declaration and the saver's
+   cutoff take effect together at a complete FINISHED, and an orphan declaration binds nothing.
+6. Fair service (§1.9). Each loop turn serves input first, then at least one ready record of each producer class in
+   rotation, then ready barriers. Admitted operations have reserved capacity to close. The claim is isolation and
+   progress, never elapsed time.
+7. Rotation is the only image switch. It is exact-match, performed by the writer, and deferred while any token, pinned
+   cutoff or open group is live (§2.7).
+8. Owner work assigned:
+   (i) §2.8: the PAD seal aligns the absolute FILE end, not the stream offset. This is a defect in landed 2.1, fixed in
+       the wire amendment.
+   (ii) §5.4: exceptional recovery after writeback loss, or sequence/budget exhaustion, while a token or group is live.
+       A fresh complete image with acknowledgments suspended is acceptable there, because typing has already stopped.
+       It is specified in the runtime brief, with headroom checked before a capture or group start.
+   (iii) §4.7: the self-contained size is re-derived from fair append service, not from lease occupancy.
+Remaining seams:
+- The three file handoffs (L2-1 brief).
+- The generation-membership fence (§1.7): a session-owner rule, which goes into the L5 app_buffers brief and savectl's
+  contract.
+- Classified journal publication results (narrowed, §3.7).
+- An inode-specific sync receipt (§3.8).
+Next:
+- N1: Astra writes the wire amendment, edit.h and savectl.h redrawn on A28 (all three to the advisor together).
+- N2: once signed, Sol takes the wire amendment plus the pure two-pass reader as one bead.
+- N3: the coordinator rewrites the L2-2b and L2-3 briefs on A28 (advisor reads both before dispatch).
 
