@@ -187,11 +187,11 @@ journal_codec_err journal_preamble_decode(const uint8_t *bytes, size_t len,
 
 size_t journal_pad_length(uint64_t stream_offset)
 {
-    uint64_t rest = stream_offset % JOURNAL_PAGE_BYTES;
-    if (rest == 0) return 0;
-    uint64_t need = JOURNAL_PAGE_BYTES - rest;
-    if (need < JOURNAL_HEADER_BYTES) need += JOURNAL_PAGE_BYTES;
-    return (size_t)need;
+    uint64_t residue = ((stream_offset % JOURNAL_PAGE_BYTES) + JOURNAL_PREAMBLE_BYTES)
+                     % JOURNAL_PAGE_BYTES;
+    if (residue == 0) return 0;
+    size_t length = JOURNAL_PAGE_BYTES - (size_t)residue;
+    return length < JOURNAL_HEADER_BYTES ? length + JOURNAL_PAGE_BYTES : length;
 }
 
 /* ---- per-payload validity (section 6), shared by encode and decode ---- */
@@ -236,6 +236,7 @@ static bool payload_valid(journal_record_type type, const uint8_t *p, size_t n)
     }
     case JOURNAL_REC_BASE:
         return n == 16;
+    case JOURNAL_REC_CHECKPOINT_TARGET:
     case JOURNAL_REC_TARGET: {
         if (n < 60) return false;
         uint32_t binding = rd32(p), presence = rd32(p + 4);
@@ -250,17 +251,23 @@ static bool payload_valid(journal_record_type type, const uint8_t *p, size_t n)
             return false;
         return path_valid(p + 60, path_len);
     }
+    case JOURNAL_REC_COMMAND_INSERT:
+    case JOURNAL_REC_CHECKPOINT_INSERT:
     case JOURNAL_REC_INSERT:
         return n >= 9;
+    case JOURNAL_REC_COMMAND_DELETE:
     case JOURNAL_REC_DELETE:
         return n == 16 && rd64(p + 8) != 0 &&
                rd64(p) <= UINT64_MAX - rd64(p + 8);
+    case JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE:
     case JOURNAL_REC_RESTORE_BASE_RANGE:
         return n == 32 && rd64(p + 8) != 0 && rd64(p + 24) != 0 &&
                rd64(p + 16) <= UINT64_MAX - rd64(p + 24) &&
                rd64(p) <= UINT64_MAX - rd64(p + 24);
-    case JOURNAL_REC_GROUP_BEGIN:
-    case JOURNAL_REC_GROUP_COMMIT:
+    case JOURNAL_REC_CHECKPOINT_BEGIN:
+    case JOURNAL_REC_COMMAND_BEGIN:
+    case JOURNAL_REC_CHECKPOINT_COMMIT:
+    case JOURNAL_REC_COMMAND_COMMIT:
         return n == 0;
     case JOURNAL_REC_CHECKPOINT_BY_VALUE:
         return n == 36 && (rd32(p + 32) & ~JOURNAL_CHECKPOINT_HAS_SAVED) == 0;
@@ -288,24 +295,9 @@ static bool payload_valid(journal_record_type type, const uint8_t *p, size_t n)
 
 static bool buffer_rule_ok(journal_record_type type, uint64_t buffer_id)
 {
-    switch (type) {
-    case JOURNAL_REC_PAD:
-    case JOURNAL_REC_GENERATION:
-    case JOURNAL_REC_GROUP_BEGIN:
-    case JOURNAL_REC_GROUP_COMMIT:
-    case JOURNAL_REC_TABS:
-        return buffer_id == 0;
-    case JOURNAL_REC_BASE:
-    case JOURNAL_REC_TARGET:
-    case JOURNAL_REC_INSERT:
-    case JOURNAL_REC_DELETE:
-    case JOURNAL_REC_RESTORE_BASE_RANGE:
-    case JOURNAL_REC_CHECKPOINT_BY_VALUE:
-    case JOURNAL_REC_SAVE:
-    case JOURNAL_REC_VIEW:
-        return buffer_id != 0;
-    }
-    return false;
+    bool session = type == JOURNAL_REC_PAD || type == JOURNAL_REC_GENERATION ||
+                   type == JOURNAL_REC_TABS;
+    return session == (buffer_id == 0);
 }
 
 journal_codec_err journal_record_encode(uint8_t *out, size_t cap,
@@ -317,7 +309,7 @@ journal_codec_err journal_record_encode(uint8_t *out, size_t cap,
                                         uint64_t stream_offset)
 {
     ASSERT(out != NULL && out_len != NULL);
-    if ((uint32_t)type > (uint32_t)JOURNAL_REC_TABS) return JOURNAL_CODEC_INVALID;
+    if ((uint32_t)type > (uint32_t)JOURNAL_REC_CHECKPOINT_TARGET) return JOURNAL_CODEC_INVALID;
     if (payload_len > 0 && payload == NULL) return JOURNAL_CODEC_INVALID;
     if (payload_len > (size_t)JOURNAL_MAX_RECORD_BYTES - JOURNAL_HEADER_BYTES)
         return JOURNAL_CODEC_INVALID;
@@ -331,6 +323,8 @@ journal_codec_err journal_record_encode(uint8_t *out, size_t cap,
     }
     if (!payload_valid(type, payload, payload_len)) return JOURNAL_CODEC_INVALID;
     size_t total = JOURNAL_HEADER_BYTES + payload_len;
+    if (stream_offset > UINT64_MAX - JOURNAL_PREAMBLE_BYTES - total)
+        return JOURNAL_CODEC_INVALID;
     if (cap < total) return JOURNAL_CODEC_NO_SPACE;
     memcpy(out, "SJR1", 4);
     wr32(out + 4, (uint32_t)total);
@@ -359,13 +353,15 @@ journal_codec_err journal_record_decode(const uint8_t *bytes, size_t len,
     uint32_t total = rd32(bytes + 4);
     if (total < JOURNAL_HEADER_BYTES || total > JOURNAL_MAX_RECORD_BYTES)
         return JOURNAL_CODEC_INVALID;
+    if (stream_offset > UINT64_MAX - JOURNAL_PREAMBLE_BYTES - total)
+        return JOURNAL_CODEC_INVALID;
     if (total > len) return JOURNAL_CODEC_TRUNCATED;
     journal_crc crc;
     crc_init(&crc);
     if (crc_record(&crc, bytes, total) != rd32(bytes + 12))
         return JOURNAL_CODEC_INVALID;
     uint32_t type_word = rd32(bytes + 8);
-    if (type_word > (uint32_t)JOURNAL_REC_TABS) return JOURNAL_CODEC_INVALID;
+    if (type_word > (uint32_t)JOURNAL_REC_CHECKPOINT_TARGET) return JOURNAL_CODEC_INVALID;
     journal_record_type type = (journal_record_type)type_word;
     uint64_t sequence = rd64(bytes + 16);
     uint64_t buffer_id = rd64(bytes + 24);
@@ -374,8 +370,8 @@ journal_codec_err journal_record_decode(const uint8_t *bytes, size_t len,
             (size_t)total != journal_pad_length(stream_offset))
             return JOURNAL_CODEC_INVALID;
     } else {
-        if (sequence != expected_sequence) return JOURNAL_CODEC_SEQUENCE;
         if (!buffer_rule_ok(type, buffer_id)) return JOURNAL_CODEC_INVALID;
+        if (sequence != expected_sequence) return JOURNAL_CODEC_SEQUENCE;
     }
     const uint8_t *payload = bytes + JOURNAL_HEADER_BYTES;
     size_t payload_len = (size_t)total - JOURNAL_HEADER_BYTES;
@@ -485,7 +481,10 @@ journal_codec_err journal_target_encode(uint8_t *out, size_t cap,
 journal_codec_err journal_target_decode(const journal_frame *frame, journal_target *out)
 {
     ASSERT(frame != NULL && out != NULL);
-    if (!frame_is(frame, JOURNAL_REC_TARGET)) return JOURNAL_CODEC_INVALID;
+    if ((frame->type != JOURNAL_REC_TARGET &&
+        frame->type != JOURNAL_REC_CHECKPOINT_TARGET) ||
+        !payload_valid(frame->type, frame->payload, frame->payload_len))
+        return JOURNAL_CODEC_INVALID;
     const uint8_t *p = frame->payload;
     out->binding = (journal_target_binding)rd32(p);
     out->presence = (journal_presence)rd32(p + 4);
@@ -511,7 +510,11 @@ journal_codec_err journal_insert_encode(uint8_t *out, size_t cap,
 journal_codec_err journal_insert_decode(const journal_frame *frame, journal_insert *out)
 {
     ASSERT(frame != NULL && out != NULL);
-    if (!frame_is(frame, JOURNAL_REC_INSERT)) return JOURNAL_CODEC_INVALID;
+    if ((frame->type != JOURNAL_REC_INSERT &&
+        frame->type != JOURNAL_REC_COMMAND_INSERT &&
+        frame->type != JOURNAL_REC_CHECKPOINT_INSERT) ||
+        !payload_valid(frame->type, frame->payload, frame->payload_len))
+        return JOURNAL_CODEC_INVALID;
     out->destination = rd64(frame->payload);
     out->bytes = frame->payload + 8;
     out->len = frame->payload_len - 8;
@@ -533,7 +536,10 @@ journal_codec_err journal_delete_encode(uint8_t *out, size_t cap,
 journal_codec_err journal_delete_decode(const journal_frame *frame, journal_delete *out)
 {
     ASSERT(frame != NULL && out != NULL);
-    if (!frame_is(frame, JOURNAL_REC_DELETE)) return JOURNAL_CODEC_INVALID;
+    if ((frame->type != JOURNAL_REC_DELETE &&
+        frame->type != JOURNAL_REC_COMMAND_DELETE) ||
+        !payload_valid(frame->type, frame->payload, frame->payload_len))
+        return JOURNAL_CODEC_INVALID;
     out->destination = rd64(frame->payload);
     out->len = rd64(frame->payload + 8);
     return JOURNAL_CODEC_OK;
@@ -558,7 +564,10 @@ journal_codec_err journal_restore_encode(uint8_t *out, size_t cap,
 journal_codec_err journal_restore_decode(const journal_frame *frame, journal_restore *out)
 {
     ASSERT(frame != NULL && out != NULL);
-    if (!frame_is(frame, JOURNAL_REC_RESTORE_BASE_RANGE)) return JOURNAL_CODEC_INVALID;
+    if ((frame->type != JOURNAL_REC_RESTORE_BASE_RANGE &&
+        frame->type != JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE) ||
+        !payload_valid(frame->type, frame->payload, frame->payload_len))
+        return JOURNAL_CODEC_INVALID;
     out->destination = rd64(frame->payload);
     out->generation_key = rd64(frame->payload + 8);
     out->source_offset = rd64(frame->payload + 16);
@@ -790,127 +799,3 @@ journal_codec_err journal_tabs_decode(const journal_frame *frame,
     }
     return JOURNAL_CODEC_OK;
 }
-
-/* ---- whole-image structural validation ---- */
-journal_codec_err journal_stream_validate(const uint8_t *bytes, size_t len,
-                                          journal_stream_result *out)
-{
-    ASSERT(out != NULL);
-    ASSERT(bytes != NULL || len == 0);
-    *out = (journal_stream_result){0};
-    journal_codec_err err = journal_preamble_decode(bytes, len, &out->preamble);
-    if (err != JOURNAL_CODEC_OK) {
-        *out = (journal_stream_result){0};
-        return err;
-    }
-    const uint8_t *stream = bytes + JOURNAL_PREAMBLE_BYTES;
-    size_t stream_len = len - JOURNAL_PREAMBLE_BYTES;
-    size_t off = 0;              /* current stream offset */
-    size_t valid_off = 0;        /* end of the certified prefix */
-    uint64_t expected = 1;       /* next non-PAD sequence */
-    bool in_group = false;
-    size_t group_at = 0;         /* BEGIN's stream offset */
-    uint64_t group_records = 0, group_last = 0; /* counters at BEGIN */
-    uint64_t group_begin_seq = 0;
-    bool group_has_member = false;
-    bool checkpoint = false, checkpoint_target_seen = false;
-    uint64_t chk_buffer = 0, chk_text_len = 0, chk_sum = 0;
-
-    while (off < stream_len) {
-        journal_frame frame;
-        if (expected == 0) { /* last sequence was UINT64_MAX; none follow */
-            err = JOURNAL_CODEC_SEQUENCE;
-            break;
-        }
-        err = journal_record_decode(stream + off, stream_len - off,
-                                    (uint64_t)off, expected, &frame);
-        if (err != JOURNAL_CODEC_OK) break;
-        if (frame.type == JOURNAL_REC_PAD) {
-            off += frame.total_len;
-            if (!in_group) valid_off = off;
-            continue;
-        }
-        /* A structural verdict for this record, before counters move. */
-        bool structural_ok = true;
-        if (!in_group) {
-            structural_ok = frame.type != JOURNAL_REC_GROUP_COMMIT &&
-                            frame.type != JOURNAL_REC_CHECKPOINT_BY_VALUE;
-        } else if (frame.type == JOURNAL_REC_GROUP_BEGIN) {
-            structural_ok = false;
-        } else if (frame.type == JOURNAL_REC_GROUP_COMMIT) {
-            structural_ok = group_has_member &&
-                            (!checkpoint || chk_sum == chk_text_len);
-        } else if (!group_has_member) {
-            if (frame.type == JOURNAL_REC_CHECKPOINT_BY_VALUE) {
-                journal_checkpoint chk;
-                structural_ok =
-                    journal_checkpoint_decode(&frame, &chk) == JOURNAL_CODEC_OK &&
-                    chk.covered_sequence < group_begin_seq;
-                if (structural_ok) {
-                    checkpoint = true;
-                    chk_buffer = frame.buffer_id;
-                    chk_text_len = chk.text_len;
-                    chk_sum = 0;
-                }
-            }
-        } else if (checkpoint) {
-            if (checkpoint_target_seen) {
-                structural_ok = false;
-            } else if (frame.type == JOURNAL_REC_INSERT) {
-                journal_insert ins;
-                structural_ok =
-                    journal_insert_decode(&frame, &ins) == JOURNAL_CODEC_OK &&
-                    frame.buffer_id == chk_buffer &&
-                    ins.destination == chk_sum &&
-                    (uint64_t)ins.len <= chk_text_len - chk_sum;
-                if (structural_ok) chk_sum += (uint64_t)ins.len;
-            } else if (frame.type == JOURNAL_REC_TARGET) {
-                structural_ok = frame.buffer_id == chk_buffer;
-                if (structural_ok) checkpoint_target_seen = true;
-            } else {
-                structural_ok = false;
-            }
-        } else {
-            structural_ok = frame.type != JOURNAL_REC_CHECKPOINT_BY_VALUE;
-        }
-        if (!structural_ok) {
-            err = JOURNAL_CODEC_INVALID;
-            break;
-        }
-        if (frame.type == JOURNAL_REC_GROUP_BEGIN) {
-            in_group = true;
-            group_at = off;
-            group_begin_seq = frame.sequence;
-            group_records = out->records;
-            group_last = out->last_sequence;
-            group_has_member = false;
-            checkpoint = false;
-            checkpoint_target_seen = false;
-            chk_sum = 0;
-        } else if (in_group && frame.type != JOURNAL_REC_GROUP_COMMIT) {
-            group_has_member = true;
-        }
-        out->records++;
-        out->last_sequence = frame.sequence;
-        expected = frame.sequence == UINT64_MAX ? 0 : frame.sequence + 1;
-        off += frame.total_len;
-        if (frame.type == JOURNAL_REC_GROUP_COMMIT) {
-            in_group = false;
-            valid_off = off;
-        } else if (!in_group) {
-            valid_off = off;
-        }
-    }
-    if (err == JOURNAL_CODEC_OK && in_group) err = JOURNAL_CODEC_TRUNCATED;
-    if (err != JOURNAL_CODEC_OK && in_group) {
-        /* The whole group drops: prefix and counters as at its BEGIN. */
-        valid_off = group_at;
-        out->records = group_records;
-        out->last_sequence = group_last;
-    }
-    out->valid_bytes = JOURNAL_PREAMBLE_BYTES + valid_off;
-    return err;
-}
-
-
-

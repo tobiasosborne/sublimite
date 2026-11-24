@@ -20,9 +20,11 @@
 #ifndef JOURNAL_JOURNAL_H
 #define JOURNAL_JOURNAL_H
 
+#include "base/base.h"
+
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 /* ---- 1. Conventions ------------------------------------------------------
  * Byte order is little-endian for every integer, fixed here, never the
@@ -30,12 +32,12 @@
  * no C struct is ever written or read as memory, and no padding exists
  * anywhere except a declared PAD record (section 4). Offsets in section 6
  * are payload offsets (byte 32 of the record). A journal file is one
- * 32 B preamble followed by a record stream. Positions, sequence numbers
- * and PAD alignment are image-local: stream offset 0 is the first record
- * byte (file offset 32 (P, the preamble size)), the first non-PAD record
- * has sequence 1, and a rotation writes a complete new image (new
- * preamble, sequences restart at 1) rather than editing this one. File
- * size and repair arithmetic charge the preamble separately (Q5).
+ * 32 B preamble followed by a record stream. Stream offset 0 is
+ * file offset JOURNAL_PREAMBLE_BYTES. Sequences count all non-PAD
+ * records in physical order, including abandoned members. An image
+ * is the complete file belonging to this preamble. A seal is a
+ * boundary after which a new append starts on a fresh wire page of
+ * that file. Rotation starts a new image with sequence 1.
  */
 
 /* ---- 2. Preamble (Q5 as amended, see the head note): 32 B, at file ----
@@ -75,9 +77,9 @@
  * Sequence: non-PAD records carry previous non-PAD sequence + 1, starting
  * at 1; PAD carries sequence 0 and does not advance it. A sequence of
  * UINT64_MAX can never be followed, so a writer refuses before wrap and a
- * reader treats a successor claim as out-of-sequence. Buffer id 0 is
- * reserved for "no buffer": exactly PAD, GENERATION, GROUP_BEGIN,
- * GROUP_COMMIT and TABS carry 0; every other type carries a nonzero id.
+ * reader treats a successor claim as out-of-sequence. Only PAD,
+ * GENERATION and TABS have owner zero. Every other record, including
+ * each marker and member, names its nonzero buffer in the header.
  *
  * Largest legal record: 1 MiB total, a corruption bound checked from
  * the length field before the length may size any read, copy or
@@ -112,27 +114,22 @@
 #define JOURNAL_PATH_MAX_BYTES 4095u
 
 /* ---- 4. Record types ------------------------------------------------------
- * Numbered densely from 0 in section 6's order, PAD first as framing.
- * This format shares no parser with v1, so v1's numbers buy nothing
- * here; a v1 importer maps numbers in its own table. Numbers are never
- * reused (from the Wave 1 freeze; until then, see the head note).
- * Every value above TABS is reserved.
+ * The type word determines role and payload without consulting a slot.
+ * Type numbers through TABS retain their payload families (G, landed
+ * assignments); 7 and 8 specialize the former generic markers as
+ * command markers. Subsequent numbers are successive unused values
+ * (G, one value per additional role below). All unlisted words are invalid.
  *
- * PAD (0) is framing, not content: sequence 0, buffer 0, payload all
- * zero, CRC as any record. The invariant it maintains: a synced
- * boundary ends on a JOURNAL_PAGE_BYTES boundary, so a later append
- * never rewrites a block that already holds durable records (a torn
- * writeback of a shared block could otherwise destroy synced bytes
- * while adding unsynced ones). A writer therefore emits exactly one
- * PAD immediately before a sync barrier, and only when the stream
- * offset is not already a multiple of 4096; an aligned boundary needs
- * no PAD. Its length is canonical: the smallest length of at least
- * the 32 B header that lands the offset on the next multiple of 4096
- * -- where the plain remainder is under 32 B, the PAD runs to the
- * multiple after that -- so a PAD is 32..4,127 B (P: 4096 + 32 - 1)
- * and its length is a function of the offset it sits at, which the
- * reader checks. A PAD may appear inside a group; it has no effect.
- * journal_pad_length() below is that function (0 = no PAD needed).
+ * For stream offset x, let r = ((x % P) + H) % P, where P is
+ * JOURNAL_PAGE_BYTES and H is JOURNAL_PREAMBLE_BYTES. This computes the
+ * absolute file-end residue without overflowing x + H. If r is zero the
+ * barrier needs no PAD and a PAD here is invalid. Otherwise d = P - r.
+ * Emit exactly one PAD of total length d if d >= JOURNAL_HEADER_BYTES,
+ * or d + P otherwise. Its sequence, owner and payload bytes are zero.
+ * Verify this same length on read. Checked file-position arithmetic must
+ * also accommodate the complete append. P = 4096 (G, existing wire block)
+ * and H = 32 (P, preamble layout). At x = 0 the seal costs 4064 bytes
+ * (P, P - H). At x = 4064 it costs zero (P, x + H = P).
  */
 typedef enum journal_record_type {
     JOURNAL_REC_PAD = 0,
@@ -142,12 +139,19 @@ typedef enum journal_record_type {
     JOURNAL_REC_INSERT = 4,
     JOURNAL_REC_DELETE = 5,
     JOURNAL_REC_RESTORE_BASE_RANGE = 6,
-    JOURNAL_REC_GROUP_BEGIN = 7,
-    JOURNAL_REC_GROUP_COMMIT = 8,
+    JOURNAL_REC_COMMAND_BEGIN = 7,
+    JOURNAL_REC_COMMAND_COMMIT = 8,
     JOURNAL_REC_CHECKPOINT_BY_VALUE = 9,
     JOURNAL_REC_SAVE = 10,
     JOURNAL_REC_VIEW = 11,
-    JOURNAL_REC_TABS = 12
+    JOURNAL_REC_TABS = 12,
+    JOURNAL_REC_COMMAND_INSERT = 13,
+    JOURNAL_REC_COMMAND_DELETE = 14,
+    JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE = 15,
+    JOURNAL_REC_CHECKPOINT_BEGIN = 16,
+    JOURNAL_REC_CHECKPOINT_COMMIT = 17,
+    JOURNAL_REC_CHECKPOINT_INSERT = 18,
+    JOURNAL_REC_CHECKPOINT_TARGET = 19
 } journal_record_type;
 
 /* ---- 5. Identities and generation keys ------------------------------------
@@ -178,7 +182,7 @@ typedef enum journal_record_type {
  * empty origin. Keys are allocated strictly monotonically; the
  * allocation high-water is carried in every rotation image's preamble,
  * and on reopen the allocator first advances past every key mentioned by
- * the image (GENERATION keys and SAVE new-generation keys), then refuses
+ * the image (including declaration, operand and SAVE keys), then refuses
  * (return code) rather than wrap at UINT64_MAX. A key therefore cannot
  * repeat: reuse would need the monotonic counter to move backwards or
  * wrap, and both are refused before allocation, in every build.
@@ -278,36 +282,34 @@ typedef enum journal_presence {
  * (P: 32 + 4 x 8), the signed piece-pool layout. In-range checks
  * against the source and text lengths are recovery's, after the key
  * resolves to a verified source (Q3).
- * GROUP_BEGIN (7) / GROUP_COMMIT (8): empty payload, total 32 B each
- * (P: header alone), so a group frame costs 64 B (P: 2 x 32) plus its
- * members. Groups never nest and are non-empty (section 7).
+ * COMMAND_BEGIN / COMMAND_COMMIT and CHECKPOINT_BEGIN /
+ * CHECKPOINT_COMMIT: empty payload, total 32 B each (P: header alone).
  */
 #define JOURNAL_DELETE_BYTES 48u
 #define JOURNAL_RESTORE_BASE_RANGE_BYTES 64u
-#define JOURNAL_GROUP_MARKER_BYTES 32u
+#define JOURNAL_MARKER_BYTES 32u
 /* CHECKPOINT_BY_VALUE (9) is a descriptor, legal only as the first
- * member of a group, followed inside the same group by INSERT slices
+ * member of a checkpoint slot, followed by CHECKPOINT_INSERT slices
  * that rebuild the whole text from an empty origin (section 7):
  *    0  u64  covered sequence: this image's last sequence whose effect
  *            for this buffer the checkpoint replaces (strictly before
- *            the group's GROUP_BEGIN sequence)
+ *            CHECKPOINT_BEGIN)
  *    8  u64  content id at the covered boundary
  *   16  u64  saved content id (meaningful only with HAS_SAVED)
  *   24  u64  text length: exact sum of the following slices' literals
  *   32  u32  flags below; other bits must be 0
  * Total 68 B (P: 32 + 36). The group costs text length + 40 B per slice
  * record + 132 B (P: 32 BEGIN + 68 descriptor + 32 COMMIT, each slice
- * adding its 32 B header and 8 B destination), plus a TARGET member
+ * adding its 32 B header and 8 B destination), plus a CHECKPOINT_TARGET member
  * when present. Recovery selects a committed checkpoint as the
  * buffer's text at its covered boundary and then applies, in sequence
- * order, that buffer's text records with sequence greater than covered
- * sequence wherever they sit relative to the group (they may precede
- * it physically, q2-protocol T2). Dirty is derived, never stored as
+ * order, that buffer's whole commands with final sequence greater than
+ * covered, even when finalized before CHECKPOINT_COMMIT (q2-protocol T2). Dirty is derived, never stored as
  * its own bit: no HAS_SAVED, or saved content id unequal to the
  * current one (Q10). Target binding and conflict state are TARGET's
  * facts alone, never restated here: a checkpoint that must move or
- * reaffirm the target carries a TARGET record as the last member of
- * its group (section 7), and a foreign replacement shows as the
+ * reaffirm the target carries a CHECKPOINT_TARGET as the last
+ * member of its slot (section 7), and a foreign replacement shows as the
  * expected identity in that TARGET not matching the file -- two
  * places for one fact could disagree.
  */
@@ -322,9 +324,8 @@ typedef enum journal_presence {
  * before the rename (A23 rule 2). Offsets after the common head:
  *   12  u64  previous generation key (0 = empty origin)
  *   20  u64  new generation key (nonzero, freshly allocated, not yet
- *            declared: it becomes resolvable only when a finish image
- *            declares it from the installed fd, so no RESTORE in this
- *            image may reference it)
+ *            declared at PREPARED; a subsequent declaration is staged
+ *            until the matching complete FINISHED)
  *   28  u64  snapshot sequence s (image-local; S is the saver's text
  *            through its last complete command boundary at capture)
  *   36  u64  saved content id (the content id at s)
@@ -342,29 +343,26 @@ typedef enum journal_presence {
  * a CRC32C over the whole saved stream recognize the installed temp.
  * CRC32C here is the same accidental-change witness the rest of the
  * format trusts, not collision resistance against a crafted file.
- * Recovery reads the destination's actual binding: matching the witness
- * selects replay from S, matching the expected identity (or the
- * expected absence) selects the old replay, anything else is an
- * unresolved conflict with bytes preserved (A23, T5 contract).
+ * Replay selects prior text on matching old expectation, S and its
+ * suffix on matching installed witness, or independent checkpoint
+ * and suffix when available on foreign binding (section 7).
  *
- * FINISHED, in the durably published finish image (or equivalently
- * closing the token out in a complete CURRENT image):
- *   12  u64  installed generation key (declared in that same image)
- *   20  u64  snapshot sequence (that image's own s)
+ * FINISHED, appended after the verified installed GENERATION:
+ *   12  u64  installed generation key
+ *   20  u64  snapshot sequence s from PREPARED
  *   28  u64  saved content id
  *   36  u32  destination path_len, then path bytes at 40
  * Total 72 + path_len B, at most 4,167 B (P: 32 + 40 + 4095).
  *
  * CANCELLED, after the namespace is reconciled and an independently
  * usable current representation is secured:
- *   12  u64  preserved checkpoint: sequence of its GROUP_COMMIT in
+ *   12  u64  preserved checkpoint: sequence of its CHECKPOINT_COMMIT in
  *            this image, or 0 if the prior representation still serves
  *   20  u64  saved content id (meaningful only with its flag)
  *   28  u32  outcome: JOURNAL_SAVE_CANCEL_* below
  *   32  u32  flags: JOURNAL_SAVE_CANCEL_HAS_SAVED, other bits 0
  * Total 68 B (P: 32 + 36). Cancellation never marks the buffer saved
- * (Q9); dropping the token in a complete CURRENT image carrying the
- * same state is equivalent (q2-protocol).
+ * (Q9). Select only a verified prior saved association.
  */
 typedef enum journal_save_phase {
     JOURNAL_SAVE_PREPARED = 1,
@@ -417,23 +415,106 @@ typedef enum journal_tabs_membership {
 #define JOURNAL_TABS_ENTRY_BYTES 12u
 #define JOURNAL_TABS_NO_ACTIVE UINT32_MAX
 
-/* ---- 7. Groups -------------------------------------------------------------
- * GROUP_BEGIN .. GROUP_COMMIT bound one contiguous multi-record command
- * or checkpoint. Groups never nest; BEGIN inside a group, COMMIT
- * without BEGIN, and an empty group (no non-PAD member) are invalid at
- * the offending record. PADs may sit inside a group and are not
- * members. Single-record commands carry no markers. Members take
- * effect whole or not at all: no member is delivered before its COMMIT
- * has validated (v1's group contract, kept). A CHECKPOINT_BY_VALUE
- * group has exactly the descriptor as first member, then INSERT
- * members only -- all for the descriptor's buffer, destinations
- * strictly cumulative from 0 (each INSERT starts where the previous
- * ended), the literal lengths summing -- with checked arithmetic,
- * never wrapping -- to exactly the descriptor's text length; an empty
- * text has no INSERT members -- and optionally one TARGET member for
- * the same buffer, last, restating its binding atomically with the
- * text (section 6). Any other shape makes the checkpoint group
- * invalid. A CHECKPOINT_BY_VALUE outside a group is invalid.
+/* ---- 7. Slots and SAVE decisions ----------------------------------------- */
+/* Markers have empty payloads. A role-specific INSERT, DELETE, range
+ * restore or TARGET uses exactly its standalone payload schema. A typed
+ * decoder accepts precisely the types assigned its schema. The frame
+ * always exposes the actual type. CHECKPOINT_BY_VALUE is exclusively the
+ * checkpoint descriptor. BASE, GENERATION, SAVE, VIEW and TABS always
+ * stand alone. A lone text operation uses a standalone text type.
+ *
+ * A slot is a pending list for one (buffer, kind), where kind is command
+ * or checkpoint. BEGIN replaces that slot alone. The BEGIN sequence
+ * identifies its instance during the scan. A member requires an open
+ * slot of its owner and kind. COMMIT closes the latest such BEGIN. Read
+ * the following grammars on that projection of the stream:
+ *
+ * command     = COMMAND_BEGIN command-member+ COMMAND_COMMIT
+ * checkpoint  = CHECKPOINT_BEGIN CHECKPOINT_BY_VALUE
+ *               CHECKPOINT_INSERT* CHECKPOINT_TARGET? CHECKPOINT_COMMIT
+ *
+ * A command member is COMMAND_INSERT, COMMAND_DELETE or
+ * COMMAND_RESTORE_BASE_RANGE. Apply its list in member order, atomically
+ * at COMMIT. A standalone text operation also retires a leftover command
+ * slot on its own buffer. Only the producer may abandon a live command.
+ * An abort needs no record. Its bytes can survive until replacement or EOF.
+ * PAD and unrelated records do not enter the list. In particular a key
+ * on the checkpoint's own buffer can complete between any two members.
+ *
+ * At checkpoint BEGIN the writer pins the published text and its last
+ * complete text boundary on that buffer, with current/saved identities
+ * and binding evidence. A provisional edit is ineligible. A descriptor
+ * repeats this covered sequence (zero for the initial empty boundary),
+ * strictly earlier than BEGIN. The slices start at zero and each starts
+ * at the checked sum of preceding literal lengths. They rebuild exactly
+ * the declared text length. Empty text has no slices. The optional last
+ * TARGET is atomic with completion. The text replaces history only
+ * through the covered boundary; complete suffix commands are retained,
+ * including commands finalized before checkpoint COMMIT. Metadata has its
+ * own effective order. Before COMMIT omit an obsolete optional restatement
+ * if still possible, otherwise supersede the checkpoint. A stale saved
+ * association cannot override a newer save decision.
+ *
+ * Each buffer has at most one active checkpoint producer. A new request
+ * joins it if its pinned coverage and binding satisfy the request;
+ * otherwise a fresh BEGIN supersedes it. No request waits in a queue.
+ * The UI compares producer identity before appending any delivery,
+ * including a final marker. A retired worker may release its pins but
+ * can never close the replacement's slot. No member carries an instance
+ * field. Additional framing is zero bytes (P, roles reuse the type word
+ * and owners reuse the header id). A one-byte key costs 41 bytes
+ * (P, 32-byte header plus 8-byte destination plus one literal).
+ *
+ * A token is the pair (saver buffer, nonzero SAVE token), unique for the
+ * transaction. PREPARED reserves its fresh new generation key. It records
+ * S, the synced temp's text, by its whole-content witness, the saver's
+ * covered boundary s and content id, and the prior destination expectation.
+ * At an open token the old expectation selects prior replay. A matching
+ * installed temp selects S plus commands finalized after s. A foreign
+ * binding selects independently usable checkpoint text and suffix when
+ * available, otherwise unresolved source and salvageable literal bytes.
+ * The reader represents these as conditional branches until observation.
+ *
+ * Append GENERATION for PREPARED's new key from the verified installed
+ * descriptor before FINISHED. Stage it under the unique new-key claim;
+ * until the matching final it reserves a key only. Neither BASE nor a
+ * range restore may use that staged key. FINISHED must match the token,
+ * key, s, content id and path and the preceding declaration must agree
+ * with the path and witness inode and size. Complete FINISHED activates
+ * the declaration and the saver's origin, binding and saved id at s in
+ * one plan operation. A saved association is adopted only together with a
+ * verified binding, live and in recovery (advisor, at signature): a
+ * complete FINISHED whose installed file is not at the path when it is
+ * verified yields an origin candidate, never a saved id. The live outcome
+ * is SAVE_FAILED with CHANGED: the saved id unknown, the buffer dirty and
+ * the conflict checkpoint written. There is no second terminal record.
+ * Dirty costs the user a prompt; clean could cost the text, because a
+ * clean buffer whose file changed is eligible for the silent reload of
+ * unmodified text. A later range needs the active, verified generation
+ * and must obey the permanent VALUE_ONLY policy. Ordinary redeclarations
+ * retain their strict identity and monotone flags. A pending or abandoned
+ * installed declaration never enables an operand. The allocator advances
+ * beyond all mentioned keys even if their declaration never activates.
+ *
+ * Derive affected peer bindings from the transaction's displaced target
+ * expectation and the session's binding index at the decision. On the
+ * installed branch detach still-displaced peers without replacing their
+ * independent text, suffix, view or saved identity with the saver's.
+ * On the prior branch keep prior bindings. A later independent binding
+ * update wins. An unconditional peer TARGET before FINISHED cannot stage
+ * this decision. For Keep or conflict use the checkpoint's atomic TARGET.
+ *
+ * CANCELLED resolves only its matching open token after namespace
+ * reconciliation. Its nonzero checkpoint sequence must name an earlier
+ * complete checkpoint COMMIT of that buffer that secures the preserved
+ * state (with its complete suffix and applicable binding). Zero selects
+ * a still-usable prior representation. Preserve only a verified prior
+ * saved association. Cancellation never installs the requested saved id.
+ * A complete terminal is effective for process recovery. A live success
+ * or irreversible dependent step needs verification and the matching
+ * durable barrier. Plan successive transactions before requiring any
+ * source that a later usable origin supersedes. Keep an independently
+ * usable checkpoint on foreign binding even after a previous finish.
  */
 
 /* ---- 8. Reader rules: validity, unknown things, torn tails, v1 ------------
@@ -447,17 +528,10 @@ typedef enum journal_tabs_membership {
  * refuses it as foreign, without repair; importing v1 is a separate
  * read-only tool, not this reader (Q5). Anything else is not a journal.
  *
- * Record stream: at each stream offset the reader requires a full
- * header, "SJR1", a length within [32, 1 MiB] and within the remaining
- * input, a matching CRC, the exact next sequence, the section-3
- * buffer-id rule, and a payload valid by section 6 (including every
- * "must be zero" field and every enum's known values). The first record
- * failing any check ends the valid prefix: the reader reports the
- * valid stream length and a corrupt mark, applies nothing at or after
- * the failure, and never resynchronizes by scanning for the next magic
- * -- lengths chain, so a skip could land inside a payload and apply
- * wrong text. Repair of an owned journal (truncation at the valid
- * prefix) is L2-2b's act after this validation, never the decoder's.
+ * Record stream: validate the framing, CRC, global sequence, owner and
+ * payload, then check the slot transition. Stop before the first bad
+ * record. The prefix is physical and retains all preceding complete
+ * frames, even where a slot remains open. Do not resynchronize.
  *
  * Unknown record type, ONE rule: refuse -- the record is invalid, the
  * valid prefix ends before it, and the bytes are preserved. There is
@@ -468,22 +542,12 @@ typedef enum journal_tabs_membership {
  * prefix. The same refuse-not-guess rule applies to unknown SAVE
  * phases, bindings, memberships, outcomes and flag bits.
  *
- * Torn tail (input ends mid-record or mid-group; indistinguishable in
- * pure bytes from a corrupt final record, and handled identically --
- * the valid prefix ends before it), one sentence per class:
- * - Preamble: torn means not a usable v2 journal; set aside intact.
- * - PAD: a torn PAD is dropped with no effect, like any PAD.
- * - Ungrouped text/metadata record: the torn record is dropped and the
- *   prefix before it stands (an edit is only ever acknowledged after
- *   its complete record was accepted, so a torn edit was never ACKed).
- * - Grouped records: a group with no validated COMMIT has no effect at
- *   all, including a torn CHECKPOINT_BY_VALUE group, whose buffer then
- *   keeps its prior representation.
- * - SAVE(PREPARED): a torn PREPARED counts as absent, and the rename it
- *   would authorize cannot have happened yet, because the rename waits
- *   for a sync through the complete record (A23 rule 2).
- * - VIEW / TABS: the torn update is lost, earlier metadata stands, and
- *   no text depends on it.
+ * EOF at a complete record boundary is OK, even with open slots.
+ * A partial last record yields TRUNCATED at its start. A complete bad
+ * record yields INVALID or SEQUENCE at its start. Preserve damage
+ * intact; only a demonstrably torn last record admits in-place repair.
+ * An incomplete slot has no logical effect. Semantic failures never
+ * authorize truncation of a physically valid prefix.
  *
  * Why a v2 journal is never offered to a v1 parser (A14): v2 lives in
  * the sublimite-v2 namespace (CLAUDE.md isolation rule), which v1 never
@@ -498,16 +562,10 @@ typedef enum journal_tabs_membership {
  */
 
 /* ---- Codec API (L2-2a) ----------------------------------------------------
- * The pure codec: encode, decode, validate. No file, no thread, no
- * piece type, and no allocation anywhere -- every output lives in
- * caller storage, and decoded slices borrow the caller's input bytes.
- * Pointer/output arguments are preconditions ASSERTed (A15); every
- * journal_codec_err below reports something input or capacity caused.
- * The codec validates everything one record, or one group's shape,
- * can prove on its own. Cross-record semantics -- generation
- * declaration tables and conflicts, unresolved keys, SAVE token
- * matching, text and source bounds -- are recovery's (L2-2b), on a
- * structurally valid prefix this codec has certified.
+ * The single-record codec allocates nothing and borrows caller bytes.
+ * The physical scanner and logical reader use caller arena storage.
+ * Pointer/output arguments are preconditions ASSERTed (A15); input and
+ * capacity failures are return codes. Neither API performs I/O.
  */
 typedef enum journal_codec_err {
     JOURNAL_CODEC_OK = 0,
@@ -545,8 +603,8 @@ void journal_preamble_encode(uint8_t out[JOURNAL_PREAMBLE_BYTES],
 journal_codec_err journal_preamble_decode(const uint8_t *bytes, size_t len,
                                           journal_preamble *out);
 
-/* The canonical PAD length at a stream offset (section 4):
- * 0 when no PAD is needed there. */
+/* Length to seal the absolute file end at stream_offset (section 4).
+ * Zero means the end is already aligned. */
 size_t journal_pad_length(uint64_t stream_offset);
 
 /* One decoded record: header fields plus a borrowed payload slice. */
@@ -562,8 +620,9 @@ typedef struct journal_frame {
 /* Frames header + payload into out, computing the CRC. Validates the
  * payload by section 6, the section-3 buffer-id rule, that a PAD's
  * length is canonical at stream_offset with an all-zero payload, and
- * that a non-PAD sequence is nonzero (PAD's is 0). Sequence chaining
- * across records is the caller's (and journal_stream_validate's).
+ * that a non-PAD sequence is nonzero (PAD's is 0). The full append
+ * must fit in a u64 file position including the preamble. Sequence chaining
+ * across records is the caller's (and journal_plan_read's).
  * On OK *out_len is the total record length. */
 journal_codec_err journal_record_encode(uint8_t *out, size_t cap,
                                         size_t *out_len,
@@ -585,13 +644,12 @@ journal_codec_err journal_record_decode(const uint8_t *bytes, size_t len,
 /* Typed payloads: one struct per section-6 payload, slices borrowed.
  * *_encode writes the payload bytes (no header) into out and sets
  * *out_len, validating the struct by section 6 (INVALID) and the
- * capacity (NO_SPACE). *_decode requires frame->type to match and
- * revalidates the payload; on error *out is untouched. A caller
+ * capacity (NO_SPACE). *_decode accepts exactly the roles assigned its
+ * schema and revalidates the payload. The frame exposes the actual type; on error *out is untouched. A caller
  * composes a whole record as payload-encode + journal_record_encode,
  * or reads one as journal_record_decode + payload-decode. PAD and
- * the group markers have no payload struct. CHECKPOINT_BY_VALUE's
- * rule of living only inside a group is a stream property (above),
- * not a payload one. */
+ * markers have no payload struct. Slot membership is validated by
+ * the whole-image scan. */
 typedef struct journal_generation {
     uint64_t key;
     journal_wire_identity identity;
@@ -746,28 +804,133 @@ journal_codec_err journal_tabs_decode(const journal_frame *frame,
                                       uint32_t cap, uint32_t *count_out,
                                       uint32_t *active_out);
 
-/* Validates a whole image (preamble + record stream) structurally:
- * preamble, then per record as journal_record_decode, plus section
- * 7's group shape and checkpoint coverage. On a preamble error that
- * error returns and *out is zero. Otherwise *out always describes
- * the valid prefix: OK when the whole input is one valid image
- * ending outside a group; TRUNCATED at a torn tail (valid_bytes ends
- * before the partial record, or before an unterminated group's
- * BEGIN); INVALID or SEQUENCE at the first bad record (before it, or
- * before its group's BEGIN). valid_bytes counts file bytes including
- * the preamble; records counts non-PAD records in the valid prefix.
- * Nothing is applied, written or repaired: this is the read a repair
- * (L2-2b) is allowed to trust. */
+/* Certifies the physical prefix, including slot grammar (sections 7–8).
+ * valid_bytes counts absolute file bytes up to the failing record or
+ * EOF. records and last_sequence include every accepted non-PAD, even
+ * abandoned members. */
 typedef struct journal_stream_result {
     journal_preamble preamble;
     size_t valid_bytes;
     uint64_t records;
     uint64_t last_sequence;
 } journal_stream_result;
-journal_codec_err journal_stream_validate(const uint8_t *bytes, size_t len,
-                                          journal_stream_result *out);
+/* The plan borrows its image and uses only the caller's workspace.
+ * Each operation is indexed once in final-sequence order. Its frame
+ * list names the exact payload frames in application order; final
+ * names the standalone frame or closing marker. Candidate links in
+ * each owner's plan run newest first. The source identifies a BASE,
+ * checkpoint, PREPARED or FINISHED by file offset. A candidate's
+ * covered sequence selects a suffix from the shared command list.
+ * Predicates select a verified declaration, matching old binding,
+ * matching installed witness or independent literals. A checkpoint
+ * remains usable only with a verified or independent suffix. Metadata
+ * and token operations in the same plan retain their effective order
+ * and ownership; resolve the selected branches before applying them.
+ */
+/* ELIGIBLE permits evaluation on its selected branch. STAGED marks an
+ * installed declaration whose activation belongs to FINISHED. UNRESOLVED
+ * preserves a complete operation with inconsistent token, declaration
+ * or operand evidence. It cannot authorize replay or saved status.
+ */
+typedef enum journal_use {
+    JOURNAL_ELIGIBLE, JOURNAL_STAGED, JOURNAL_UNRESOLVED
+} journal_use;
+/* Per-frame use is captured when the frame appears. An unresolved
+ * operation can also reflect an embargo added before its COMMIT.
+ * declaration names the required generation frame. A nonzero
+ * activation also requires the matching FINISHED's verified binding. */
+typedef struct journal_frame_ref {
+    size_t offset;
+    const struct journal_frame_ref *next;
+    journal_use use;
+    size_t declaration, activation;
+} journal_frame_ref;
+typedef enum journal_origin_test {
+    JOURNAL_VERIFIED_BASE, JOURNAL_EXPECTED_BINDING,
+    JOURNAL_INSTALLED_WITNESS, JOURNAL_INDEPENDENT_TEXT
+} journal_origin_test;
+/* Offsets are absolute; zero means absent. binding and saved name
+ * effective metadata evidence, guarded by the decision phase and, for
+ * saved, saved_test. A checkpoint descriptor with no HAS_SAVED carries
+ * an unknown association. CANCELLED can preserve only an already
+ * verified prior association with the same id. FINISHED requires the
+ * installed witness and declaration to verify at the path before its
+ * saved evidence can supply an id.
+ *
+ * terminal is set on PREPARED only for a matching accepted terminal.
+ * displaced names PREPARED's destination expectation for a conditional
+ * peer detach. At an open PREPARED's installed branch or its matching
+ * FINISHED, match still-bound peers by path and displaced identity at
+ * the decision, leaving their own text, view and saved identity intact.
+ * Apply eligible TARGETs in operation order. A checkpoint binding or
+ * saved restatement requires comparing its begin_sequence with the
+ * most recent effective binding and saved decisions for that owner.
+ */
+typedef struct journal_operation {
+    journal_use use;
+    uint64_t owner, final_sequence, begin_sequence;
+    size_t final;
+    const journal_frame_ref *frames;
+    const struct journal_operation *next;
+    const struct journal_operation *next_owner_command;
+    const struct journal_operation *prepared, *terminal, *checkpoint;
+    size_t binding, saved, declaration, displaced;
+    journal_origin_test saved_test;
+} journal_operation;
+/* A PREPARED expected-binding branch delegates to the older origins
+ * and their cutoffs. A foreign-binding branch considers independently
+ * usable checkpoints and suffixes before reporting unresolved source
+ * with literal evidence. A BASE candidate whose source is UNRESOLVED
+ * carries that dependency, including when no earlier origin exists.
+ * decision names the operation selecting this source, such as a
+ * CANCELLED that names a preserved checkpoint. */
+typedef struct journal_origin {
+    journal_origin_test test;
+    const journal_operation *source, *decision;
+    uint64_t covered;
+    const struct journal_origin *older;
+} journal_origin;
+typedef struct journal_owner_plan {
+    uint64_t owner;
+    const journal_origin *origins;
+    const journal_operation *commands;
+    const struct journal_owner_plan *next;
+} journal_owner_plan;
+typedef struct journal_logical_plan {
+    journal_stream_result prefix;
+    uint64_t generation_high_water, buffer_high_water;
+    const journal_operation *operations;
+    const journal_owner_plan *owners;
+} journal_logical_plan;
+
+/* Pass one certifies the prefix and indexes slots, owners, operations,
+ * declarations and tokens. Pass two describes origins and shares each
+ * owner's ordered command list between candidates. The borrowed
+ * image needs zero extra record window bytes (a file-backed reader
+ * may use one window up to JOURNAL_MAX_RECORD_BYTES). Each pass
+ * visits O(R) frames and O(image bytes) data, apart from index lookup.
+ *
+ * The planner returns the physical verdict with a plan for the certified prefix.
+ * Semantic problems are represented by unsatisfied dependencies on
+ * their operations; e.g. a mismatched FINISHED supplies no origin.
+ * On preamble refusal or NO_SPACE, restore the workspace mark and
+ * clear the output. On success or prefix damage the caller owns the
+ * plan until it resets the arena. Every result can be obtained from
+ * the same bytes and adequate workspace, without I/O or service state.
+ */
+journal_codec_err journal_plan_read(const uint8_t *image, size_t length,
+                                    base_arena *workspace,
+                                    journal_logical_plan *out);
+
+/* Conservative additional arena bytes for the given upper bounds.
+ * R includes physical non-PAD frames, B includes owners, D includes
+ * distinct declared or claimed keys and T includes distinct tokens.
+ * R pays for frame refs, operations, candidate links and the index
+ * by final sequence. B pays for one owner entry with two slot heads
+ * and its index. D and T pay for entries and their indexes. Tables
+ * grow geometrically. Storage is O(R + B + D + T) words, including
+ * alignment. Returns 0 if the bound is unrepresentable. */
+size_t journal_plan_workspace_size(size_t records, size_t buffers,
+                                   size_t keys, size_t tokens);
 
 #endif
-
-
-

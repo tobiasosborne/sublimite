@@ -9,7 +9,10 @@
 #include "os/os.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "support/journal_oracle.h"
 
 static int failures;
 #define CHECK(c, ...) do { if (!(c)) { failures++; \
@@ -70,6 +73,19 @@ static void img_reset(uint64_t gen_hw, uint64_t buf_hw)
     img_seq = 0;
 }
 static size_t img_stream_len(void) { return img_len - JOURNAL_PREAMBLE_BYTES; }
+static uint8_t *plan_space;
+static size_t plan_capacity;
+
+static journal_codec_err validate_stream(const uint8_t *bytes, size_t length,
+                                         journal_stream_result *out)
+{
+    base_arena arena = { plan_space, plan_capacity, 0 };
+    journal_logical_plan plan;
+    journal_codec_err err = journal_plan_read(bytes, length, &arena, &plan);
+    *out = plan.prefix;
+    return err;
+}
+
 /* Appends one framed record through the codec; returns its stream offset. */
 static size_t img_add(journal_record_type type, uint64_t buffer_id,
                       const uint8_t *payload, size_t n)
@@ -182,13 +198,15 @@ static void test_preamble(void)
 
 static void test_pad(void)
 {
-    CHECK(journal_pad_length(0) == 0, "pad at 0");
-    CHECK(journal_pad_length(4096) == 0, "pad aligned needs none");
-    CHECK(journal_pad_length(1) == 4095, "pad at 1");
-    CHECK(journal_pad_length(4064) == 32, "pad minimal header");
-    CHECK(journal_pad_length(4065) == 4127, "pad remainder under 32 runs long");
-    CHECK(journal_pad_length(4095) == 4097, "pad at 4095");
-    CHECK(journal_pad_length(4097) == 4095, "pad wraps periods");
+    /* (P) Absolute residue includes the 32-byte preamble. The
+     * exact-header and short cases are one stream byte apart. */
+    CHECK(journal_pad_length(0) == 4064, "PAD at stream zero");
+    CHECK(journal_pad_length(4032) == 32, "PAD fits exactly one header");
+    CHECK(journal_pad_length(4033) == 4127, "PAD short remainder runs long");
+    CHECK(journal_pad_length(4063) == 4097, "PAD one-byte remainder");
+    CHECK(journal_pad_length(4064) == 0, "absolute alignment needs no PAD");
+    CHECK(journal_pad_length(4096) == 4064, "PAD repeats after one page");
+    CHECK(journal_pad_length(UINT64_MAX) == 4065, "PAD residue avoids u64 wrap");
     static uint8_t zeros[8192];
     journal_frame frame;
     uint8_t out[8192]; size_t out_len = 0;
@@ -201,7 +219,7 @@ static void test_pad(void)
           frame.type == JOURNAL_REC_PAD && frame.sequence == 0,
           "PAD round trip");
     /* Encode rejects: nonzero PAD payload, non-canonical length. */
-    uint8_t nonzero[64] = {0}; nonzero[3] = 1;
+    uint8_t nonzero[JOURNAL_PAGE_BYTES] = {0}; nonzero[3] = 1;
     CHECK(journal_record_encode(out, sizeof out, &out_len, JOURNAL_REC_PAD, 0, 0,
                                 nonzero, journal_pad_length(64) - JOURNAL_HEADER_BYTES, 64)
           == JOURNAL_CODEC_INVALID, "PAD payload must be zero");
@@ -209,9 +227,18 @@ static void test_pad(void)
                                 zeros, 8, 64) == JOURNAL_CODEC_INVALID,
           "PAD non-canonical length rejected");
     /* Decode rejects a PAD at an aligned offset (writer emits none). */
-    size_t n = raw_record(out, JOURNAL_REC_PAD, 0, 0, zeros, 4064);
-    CHECK(journal_record_decode(out, n, 0, 1, &frame) == JOURNAL_CODEC_INVALID,
+    size_t n = raw_record(out, JOURNAL_REC_PAD, 0, 0, zeros, 4032);
+    CHECK(journal_record_decode(out, n, 0, 1, &frame) == JOURNAL_CODEC_OK,
+          "PAD at stream zero seals the absolute end");
+    CHECK(journal_record_decode(out, n, 4064, 1, &frame) == JOURNAL_CODEC_INVALID,
           "PAD at aligned offset invalid");
+    /* (P) Same residue as stream zero on the last representable page,
+     * but there is no room for the preamble and seal at that position. */
+    uint64_t last_page = UINT64_MAX - (JOURNAL_PAGE_BYTES - 1u);
+    CHECK(journal_record_decode(out, n, last_page, 1, &frame) == JOURNAL_CODEC_INVALID &&
+          journal_record_encode(out, sizeof out, &out_len, JOURNAL_REC_PAD, 0, 0,
+                                zeros, n - JOURNAL_HEADER_BYTES, last_page) == JOURNAL_CODEC_INVALID,
+          "full PAD append must fit absolute file position");
 }
 
 static void test_generation(void)
@@ -472,9 +499,11 @@ static void test_checkpoint_save_view_tabs(void)
     roundtrip_frame(JOURNAL_REC_TABS, 0, payload, n, &frame);
     CHECK(journal_tabs_decode(&frame, many_out, 1016, &count, &active) == JOURNAL_CODEC_OK &&
           count == 1016 && many_out[1015].buffer_id == 1016, "TABS capacity round trip");
-    /* Group markers round trip empty. */
-    roundtrip_frame(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0, &frame);
-    roundtrip_frame(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0, &frame);
+    /* Both owned marker pairs round trip with empty payloads. */
+    roundtrip_frame(JOURNAL_REC_COMMAND_BEGIN, 5, NULL, 0, &frame);
+    roundtrip_frame(JOURNAL_REC_COMMAND_COMMIT, 5, NULL, 0, &frame);
+    roundtrip_frame(JOURNAL_REC_CHECKPOINT_BEGIN, 5, NULL, 0, &frame);
+    roundtrip_frame(JOURNAL_REC_CHECKPOINT_COMMIT, 5, NULL, 0, &frame);
 }
 
 static void test_frame_rejections(void)
@@ -547,24 +576,24 @@ static void test_stream_valid(void)
     IMG_PAYLOAD(JOURNAL_REC_BASE, 9, journal_base_encode(pay_, sizeof pay_, &pn_, &base));
     journal_insert ins = { 4, (const uint8_t *)"!", 1 };
     IMG_PAYLOAD(JOURNAL_REC_INSERT, 9, journal_insert_encode(pay_, sizeof pay_, &pn_, &ins));
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
     journal_restore rst = { 5, 3, 0, 4 };
-    IMG_PAYLOAD(JOURNAL_REC_RESTORE_BASE_RANGE, 9,
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE, 9,
                 journal_restore_encode(pay_, sizeof pay_, &pn_, &rst));
     journal_delete del = { 0, 1 };
-    IMG_PAYLOAD(JOURNAL_REC_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
-    img_add(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0);
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
     /* PAD to the sync boundary, then one more record after it. */
     size_t pad = journal_pad_length((uint64_t)img_stream_len());
     static uint8_t zeros[8192];
     CHECK(pad > 0, "stream not accidentally aligned");
     img_add(JOURNAL_REC_PAD, 0, zeros, pad - JOURNAL_HEADER_BYTES);
-    CHECK(img_stream_len() % JOURNAL_PAGE_BYTES == 0, "PAD lands on boundary");
+    CHECK(img_len % JOURNAL_PAGE_BYTES == 0, "PAD lands on boundary");
     journal_view view = { 1, (const uint8_t *)"abc", 3 };
     IMG_PAYLOAD(JOURNAL_REC_VIEW, 9, journal_view_encode(pay_, sizeof pay_, &pn_, &view));
 
     journal_stream_result res;
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK, "stream valid");
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK, "stream valid");
     CHECK(res.valid_bytes == img_len && res.last_sequence == img_seq &&
           res.preamble.generation_high_water == 3 && res.preamble.buffer_high_water == 9,
           "stream result fields");
@@ -572,7 +601,7 @@ static void test_stream_valid(void)
 
     /* Header-only image is logically empty and valid. */
     img_reset(0, 0);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK &&
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK &&
           res.records == 0 && res.last_sequence == 0, "header-only image");
 
     /* Portable-encoded image validates on the hardware path and back. */
@@ -580,7 +609,7 @@ static void test_stream_valid(void)
     img_reset(1, 1);
     IMG_PAYLOAD(JOURNAL_REC_BASE, 9, journal_base_encode(pay_, sizeof pay_, &pn_, &base));
     force_portable = false;
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK,
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK,
           "portable image on hardware path");
 }
 
@@ -604,13 +633,13 @@ static void test_stream_torn_and_invalid(void)
     size_t at = img_stream_len();
     IMG_PAYLOAD(JOURNAL_REC_INSERT, 9, journal_insert_encode(pay_, sizeof pay_, &pn_, &ins));
     CHECK(at == base_end, "insert follows base");
-    CHECK(journal_stream_validate(img, img_len - 2, &res) == JOURNAL_CODEC_TRUNCATED,
+    CHECK(validate_stream(img, img_len - 2, &res) == JOURNAL_CODEC_TRUNCATED,
           "torn INSERT");
     CHECK(res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end && res.records == 1,
           "torn INSERT prefix");
     /* Corrupt (bad CRC) final record is indistinguishable in effect. */
     img[img_len - 1] ^= 1u;
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
           res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "corrupt tail");
 
     /* Torn PAD: dropped like any torn record. */
@@ -618,40 +647,61 @@ static void test_stream_torn_and_invalid(void)
     static uint8_t zeros[8192];
     size_t pad = journal_pad_length((uint64_t)img_stream_len());
     img_add(JOURNAL_REC_PAD, 0, zeros, pad - JOURNAL_HEADER_BYTES);
-    CHECK(journal_stream_validate(img, img_len - 10, &res) == JOURNAL_CODEC_TRUNCATED &&
+    CHECK(validate_stream(img, img_len - 10, &res) == JOURNAL_CODEC_TRUNCATED &&
           res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "torn PAD");
 
-    /* Torn group: nothing of the group counts. */
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
-    IMG_PAYLOAD(JOURNAL_REC_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_TRUNCATED &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end && res.records == 1,
-          "unterminated group torn at BEGIN");
-    /* Corrupt inside a committed-looking group: also dropped whole. */
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
+    /* An open command survives physically, along with another owner's key. */
+    img_base_only();
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    IMG_PAYLOAD(JOURNAL_REC_INSERT, 10, journal_insert_encode(pay_, sizeof pay_, &pn_, &ins));
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK &&
+          res.valid_bytes == img_len && res.records == img_seq, "open command at EOF");
+    /* Corruption stops at the offending member, with BEGIN retained. */
+    img_base_only();
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
     size_t member = img_len;
-    IMG_PAYLOAD(JOURNAL_REC_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
-    img_add(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0);
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
     img[member + 40] ^= 1u;
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "corrupt group member");
-    /* Nested BEGIN, stray COMMIT, empty group. */
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "nested group");
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "stray commit");
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
-    img_add(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "empty group");
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == member && res.last_sequence == 2, "corrupt command member");
+    img_base_only();
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK &&
+          res.valid_bytes == img_len, "replacement BEGIN is physical");
+    img_base_only();
+    size_t commit = img_len;
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == commit, "stray COMMIT");
+    img_base_only();
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    commit = img_len;
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == commit, "empty command COMMIT");
+
+    /* CRC-correct illegal combinations stop at this record. */
+    uint8_t literal[9] = {0};
+    const struct { uint32_t type; uint64_t owner; size_t length; } bad[] = {
+        {JOURNAL_REC_COMMAND_BEGIN, 0, 0}, {JOURNAL_REC_CHECKPOINT_COMMIT, 0, 0},
+        {JOURNAL_REC_COMMAND_INSERT, 0, sizeof literal},
+        {JOURNAL_REC_CHECKPOINT_INSERT, 10, sizeof literal},
+        {JOURNAL_REC_COMMAND_INSERT, 10, sizeof literal},
+        {JOURNAL_REC_CHECKPOINT_TARGET + 1u, 9, 0}
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        img_base_only();
+        img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+        size_t invalid = img_len;
+        img_len += raw_record(img + img_len, bad[i].type, img_seq + 1,
+                              bad[i].owner, literal, bad[i].length);
+        CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+              res.valid_bytes == invalid && res.last_sequence == img_seq,
+              "illegal type/role/owner vector %zu", i);
+    }
 
     /* Sequence gap: forge the second record's sequence, CRC refixed. */
     base_end = img_base_only();
@@ -660,95 +710,113 @@ static void test_stream_torn_and_invalid(void)
     put64(img + rec_at + 16, 99);
     put32(img + rec_at + 12, 0);
     put32(img + rec_at + 12, ref_crc32c(img + rec_at, img_len - rec_at));
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_SEQUENCE &&
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_SEQUENCE &&
           res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "stream sequence gap");
 
     /* A whole v1 stream is foreign, header and all. */
     uint8_t v1[64] = {0}; memcpy(v1, "JNL1", 4); put32(v1 + 4, 32);
-    CHECK(journal_stream_validate(v1, sizeof v1, &res) == JOURNAL_CODEC_FOREIGN &&
+    CHECK(validate_stream(v1, sizeof v1, &res) == JOURNAL_CODEC_FOREIGN &&
           res.valid_bytes == 0, "v1 stream foreign without repair");
     /* Garbage after a valid prefix is never resynchronized over. */
     base_end = img_base_only();
     memcpy(img + img_len, "SJR1garbagegarbagegarbagegarbag", 31);
-    CHECK(journal_stream_validate(img, img_len + 31, &res) == JOURNAL_CODEC_TRUNCATED &&
+    CHECK(validate_stream(img, img_len + 31, &res) == JOURNAL_CODEC_TRUNCATED &&
           res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "tail garbage stops prefix");
 }
 
-/* A checkpoint group for "hello" (5 B) in two slices, optional target. */
-static void img_checkpoint(uint64_t covered, uint64_t text_len,
-                           bool second_slice, bool with_target, bool target_then_insert)
+/* A checkpoint for "hello", split at the literal boundary hel|lo.
+ * Return the offset of the first impossible transition, or the final. */
+static size_t img_checkpoint(uint64_t covered, uint64_t text_len,
+                             bool second_slice, bool with_target, bool target_then_insert)
 {
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    size_t descriptor = img_len;
     journal_checkpoint chk = { covered, 3, 3, text_len, JOURNAL_CHECKPOINT_HAS_SAVED };
     IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_BY_VALUE, 9,
                 journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk));
     journal_insert s1 = { 0, (const uint8_t *)"hel", 3 };
-    IMG_PAYLOAD(JOURNAL_REC_INSERT, 9, journal_insert_encode(pay_, sizeof pay_, &pn_, &s1));
+    IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_INSERT, 9,
+                journal_insert_encode(pay_, sizeof pay_, &pn_, &s1));
+    journal_target target = { .binding = JOURNAL_TARGET_DETACHED, .presence = JOURNAL_PRESENT,
+        .expected = sample_identity(5), .path = (const uint8_t *)"/tmp/y", .path_len = 6 };
+    size_t target_at = img_len;
     if (target_then_insert) {
-        journal_target tgt = { .binding = JOURNAL_TARGET_BOUND, .presence = JOURNAL_ABSENT,
-            .expected = {0}, .path = (const uint8_t *)"/tmp/y", .path_len = 6 };
-        IMG_PAYLOAD(JOURNAL_REC_TARGET, 9, journal_target_encode(pay_, sizeof pay_, &pn_, &tgt));
+        IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_TARGET, 9,
+                    journal_target_encode(pay_, sizeof pay_, &pn_, &target));
     }
     if (second_slice) {
         journal_insert s2 = { 3, (const uint8_t *)"lo", 2 };
-        IMG_PAYLOAD(JOURNAL_REC_INSERT, 9, journal_insert_encode(pay_, sizeof pay_, &pn_, &s2));
+        IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_INSERT, 9,
+                    journal_insert_encode(pay_, sizeof pay_, &pn_, &s2));
     }
     if (with_target) {
-        journal_target tgt = { .binding = JOURNAL_TARGET_DETACHED, .presence = JOURNAL_PRESENT,
-            .expected = sample_identity(5), .path = (const uint8_t *)"/tmp/y", .path_len = 6 };
-        IMG_PAYLOAD(JOURNAL_REC_TARGET, 9, journal_target_encode(pay_, sizeof pay_, &pn_, &tgt));
+        IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_TARGET, 9,
+                    journal_target_encode(pay_, sizeof pay_, &pn_, &target));
     }
-    img_add(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0);
+    size_t final = img_len;
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    if (covered >= 2) return descriptor; /* Fixture's BASE is seq 1, BEGIN is seq 2. */
+    return target_then_insert ? target_at : final;
+}
+
+static journal_logical_plan read_plan(size_t length, journal_codec_err verdict)
+{
+    base_arena arena = { plan_space, plan_capacity, 0 };
+    journal_logical_plan plan;
+    CHECK(journal_plan_read(img, length, &arena, &plan) == verdict, "plan physical verdict");
+    return plan;
 }
 
 static void test_stream_checkpoint_and_save(void)
 {
     journal_stream_result res;
-    size_t base_end = img_base_only(); /* seq 1 used; BEGIN will be 2 */
+    img_base_only();
     img_checkpoint(1, 5, true, false, false);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK,
-          "checkpoint group valid");
-    base_end = img_base_only();
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK,
+          "checkpoint valid");
+    img_base_only();
     img_checkpoint(1, 5, true, true, false);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK,
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK,
           "checkpoint with TARGET last valid");
-    base_end = img_base_only();
-    img_checkpoint(1, 5, false, false, false); /* slices sum to 3, not 5 */
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "checkpoint coverage short");
-    base_end = img_base_only();
-    img_checkpoint(2, 5, true, false, false); /* covered == BEGIN sequence */
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "covered not before BEGIN");
-    base_end = img_base_only();
-    img_checkpoint(1, 5, true, false, true); /* TARGET not last */
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "TARGET must be last");
-    /* Checkpoint descriptor outside a group. */
-    base_end = img_base_only();
+    img_base_only();
+    size_t bad = img_checkpoint(1, 5, false, false, false); /* Only hel arrived. */
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == bad, "checkpoint coverage short");
+    img_base_only();
+    bad = img_checkpoint(2, 5, true, false, false); /* covered == BEGIN sequence */
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == bad, "covered not before BEGIN");
+    img_base_only();
+    bad = img_checkpoint(1, 5, true, false, true); /* TARGET before end of literal coverage. */
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == bad, "TARGET must be last");
+    img_base_only();
+    bad = img_len;
     journal_checkpoint chk = { 1, 3, 3, 0, 0 };
     IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_BY_VALUE, 9,
                 journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk));
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "checkpoint outside group");
-    /* Empty-text checkpoint: descriptor only, valid. */
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_INVALID &&
+          res.valid_bytes == bad, "checkpoint outside slot");
+    img_base_only();
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
     IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_BY_VALUE, 9,
                 journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk));
-    img_add(JOURNAL_REC_GROUP_COMMIT, 0, NULL, 0);
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK,
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK,
           "empty checkpoint valid");
-    /* Torn checkpoint group keeps the prior representation. */
-    base_end = img_base_only();
-    img_add(JOURNAL_REC_GROUP_BEGIN, 0, NULL, 0);
-    journal_checkpoint chk2 = { 1, 3, 3, 5, 0 };
+    size_t base_end = img_base_only();
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    chk.text_len = 5;
     IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_BY_VALUE, 9,
-                journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk2));
+                journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk));
     journal_insert s1 = { 0, (const uint8_t *)"hel", 3 };
-    IMG_PAYLOAD(JOURNAL_REC_INSERT, 9, journal_insert_encode(pay_, sizeof pay_, &pn_, &s1));
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_TRUNCATED &&
-          res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "torn checkpoint group");
+    IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_INSERT, 9,
+                journal_insert_encode(pay_, sizeof pay_, &pn_, &s1));
+    CHECK(validate_stream(img, img_len, &res) == JOURNAL_CODEC_OK &&
+          res.valid_bytes == img_len, "open checkpoint physically valid");
+    journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    CHECK(plan.owners && plan.owners->origins && !plan.owners->origins->older &&
+          plan.owners->origins->test == JOURNAL_VERIFIED_BASE, "open checkpoint has no effect");
 
     /* SAVE(PREPARED) torn counts as absent: prefix ends before it. */
     base_end = img_base_only();
@@ -758,19 +826,462 @@ static void test_stream_checkpoint_and_save(void)
             .expected = {0}, .witness = { 1, 2, 0, 0, 0 },
             .path = (const uint8_t *)"/tmp/z", .path_len = 6 } };
     IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &prep));
-    CHECK(journal_stream_validate(img, img_len - 3, &res) == JOURNAL_CODEC_TRUNCATED &&
+    CHECK(validate_stream(img, img_len - 3, &res) == JOURNAL_CODEC_TRUNCATED &&
           res.valid_bytes == JOURNAL_PREAMBLE_BYTES + base_end, "torn PREPARED absent");
-    /* Whole PREPARED then FINISHED validates as one stream. */
+    size_t prepared_end = img_len;
     journal_save fin = { .phase = JOURNAL_SAVE_FINISHED, .token = 1,
         .finished = { .installed_key = 1, .snapshot_sequence = 1,
             .saved_content_id = 1, .path = (const uint8_t *)"/tmp/z", .path_len = 6 } };
     IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &fin));
-    CHECK(journal_stream_validate(img, img_len, &res) == JOURNAL_CODEC_OK,
-          "PREPARED+FINISHED stream");
+    plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    const journal_operation *last = plan.operations;
+    while (last && last->next) last = last->next;
+    CHECK(last && last->use == JOURNAL_UNRESOLVED && last->saved == 0,
+          "FINISHED without declaration supplies no saved association");
+    const journal_origin *pending_origin = plan.owners ? plan.owners->origins : NULL;
+    CHECK(pending_origin && pending_origin->test == JOURNAL_INSTALLED_WITNESS &&
+          plan.operations && pending_origin->source == plan.operations->next &&
+          !pending_origin->source->saved,
+          "missing declaration keeps only PREPARED's conditional installed candidate");
+
+    img_len = prepared_end;
+    img_seq--;
+    const journal_generation gen = { .key = 1, .identity = {1, 2, 0, 0, 0, 0},
+        .location = prep.prepared.path, .location_len = prep.prepared.path_len };
+    size_t declaration = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0,
+                journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    CHECK(plan.operations && plan.operations->next && plan.operations->next->next &&
+          plan.operations->next->next->use == JOURNAL_STAGED,
+          "installed declaration is staged before FINISHED");
+    size_t finish_offset = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &fin));
+    plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    const journal_origin *origin = plan.owners ? plan.owners->origins : NULL;
+    CHECK(origin && origin->source->final == finish_offset && origin->covered == 1 &&
+          origin->test == JOURNAL_INSTALLED_WITNESS &&
+          origin->source->saved == finish_offset &&
+          origin->source->saved_test == JOURNAL_INSTALLED_WITNESS &&
+          origin->source->prepared && origin->source->prepared->terminal == origin->source &&
+          origin->source->displaced == origin->source->prepared->final,
+          "FINISHED gives origin and saved evidence guarded by installed-path verification");
+
+    journal_base installed = { 1, 1 };
+    size_t use = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_BASE, 10,
+                journal_base_encode(pay_, sizeof pay_, &pn_, &installed));
+    plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    last = plan.operations;
+    while (last && last->next) last = last->next;
+    CHECK(last && last->final == use && last->use == JOURNAL_ELIGIBLE &&
+          last->frames->declaration == declaration && last->frames->activation == finish_offset,
+          "later BASE requires the declaration and FINISHED's verified activation");
+}
+
+static void img_literal(journal_record_type type, uint64_t owner,
+                        uint64_t at, const char *text)
+{
+    journal_insert insert = { at, (const uint8_t *)text, strlen(text) };
+    IMG_PAYLOAD(type, owner, journal_insert_encode(pay_, sizeof pay_, &pn_, &insert));
+}
+
+static void img_descriptor(uint64_t owner, uint64_t covered, uint64_t length)
+{
+    journal_checkpoint chk = { covered, 1, 0, length, 0 };
+    IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_BY_VALUE, owner,
+                journal_checkpoint_encode(pay_, sizeof pay_, &pn_, &chk));
+}
+
+static journal_frame plan_frame(size_t offset)
+{
+    journal_frame frame = {0};
+    CHECK(journal_record_decode(img + offset, img_len - offset,
+                                offset - JOURNAL_PREAMBLE_BYTES,
+                                journal_oracle_word(img + offset + 16, 8),
+                                &frame) == JOURNAL_CODEC_OK, "valid plan frame");
+    return frame;
+}
+
+static void plan_text(const journal_logical_plan *plan, uint64_t owner,
+                      bool checkpoint, const char *expected)
+{
+    const journal_owner_plan *buffer = plan->owners;
+    while (buffer && buffer->owner != owner) buffer = buffer->next;
+    CHECK(buffer != NULL, "cut names owner %llu", (unsigned long long)owner);
+    if (!buffer) return;
+    const journal_origin *origin = buffer->origins;
+    bool by_value = origin && origin->test == JOURNAL_INDEPENDENT_TEXT;
+    CHECK(by_value == checkpoint, "cut selects owner %llu checkpoint %d",
+          (unsigned long long)owner, checkpoint);
+    char text[sizeof "x!?"] = {0}; /* Longest expected fixture text. */
+    size_t length = 0;
+    uint64_t cutoff = origin ? origin->covered : 0;
+    if (by_value) {
+        for (const journal_frame_ref *f = origin->source->frames; f; f = f->next) {
+            journal_frame frame = plan_frame(f->offset);
+            if (frame.type != JOURNAL_REC_CHECKPOINT_INSERT) continue;
+            journal_insert insert;
+            if (journal_insert_decode(&frame, &insert) != JOURNAL_CODEC_OK ||
+                insert.len >= sizeof text - length) {
+                CHECK(false, "exact checkpoint literals");
+                return;
+            }
+            memcpy(text + length, insert.bytes, insert.len);
+            length += insert.len;
+        }
+    }
+    for (const journal_operation *op = buffer->commands; op; op = op->next_owner_command) {
+        if (op->final_sequence <= cutoff) continue;
+        CHECK(op->use == JOURNAL_ELIGIBLE, "complete command is eligible");
+        for (const journal_frame_ref *f = op->frames; f; f = f->next) {
+            journal_frame frame = plan_frame(f->offset);
+            if (frame.type == JOURNAL_REC_COMMAND_DELETE) {
+                journal_delete del;
+                if (journal_delete_decode(&frame, &del) != JOURNAL_CODEC_OK ||
+                    del.destination > length || del.len > length - del.destination) {
+                    CHECK(false, "command DELETE fits trial text");
+                    return;
+                }
+                size_t end = (size_t)(del.destination + del.len);
+                memmove(text + del.destination, text + end, length - end);
+                length -= (size_t)del.len;
+            } else {
+                journal_insert ins;
+                if (journal_insert_decode(&frame, &ins) != JOURNAL_CODEC_OK ||
+                    ins.destination > length || ins.len >= sizeof text - length) {
+                    CHECK(false, "command INSERT fits trial text");
+                    return;
+                }
+                memmove(text + ins.destination + ins.len, text + ins.destination,
+                        length - (size_t)ins.destination);
+                memcpy(text + ins.destination, ins.bytes, ins.len);
+                length += ins.len;
+            }
+        }
+    }
+    CHECK(length == strlen(expected) && memcmp(text, expected, length) == 0,
+          "owner %llu expected %s, got %.*s", (unsigned long long)owner,
+          expected, (int)length, text);
+}
+
+static void check_cut(size_t end, uint64_t owner, bool checkpoint, const char *text)
+{
+    journal_logical_plan plan = read_plan(end, JOURNAL_CODEC_OK);
+    plan_text(&plan, owner, checkpoint, text);
+}
+
+static void test_checkpoint_replacement(void)
+{
+    /* §1.3: empty C, standalone restore of X, then D and one COMMIT.
+     * Fixture X exceeds the existing prefix witness by one byte. */
+    static char x[JOURNAL_PREFIX_BYTES + 2];
+    memset(x, 'x', sizeof x - 1);
+    img_reset(0, 0);
+    journal_generation gen = { .key = 7, .identity = sample_identity(sizeof x),
+        .prefix_len = JOURNAL_PREFIX_BYTES, .prefix_crc32c = journal_crc32c((uint8_t *)x, JOURNAL_PREFIX_BYTES),
+        .location = (const uint8_t *)"/x", .location_len = sizeof "/x" - 1 };
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0, journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    journal_base base = { 7, 1 };
+    IMG_PAYLOAD(JOURNAL_REC_BASE, 9, journal_base_encode(pay_, sizeof pay_, &pn_, &base));
+    journal_delete del = { sizeof x - 1, 1 };
+    IMG_PAYLOAD(JOURNAL_REC_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    del = (journal_delete){ 0, sizeof x - 1 };
+    IMG_PAYLOAD(JOURNAL_REC_DELETE, 9, journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    uint64_t empty = img_seq;
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    img_descriptor(9, empty, 0);
+    journal_restore restore = { 0, 7, 0, sizeof x - 1 };
+    IMG_PAYLOAD(JOURNAL_REC_RESTORE_BASE_RANGE, 9,
+                journal_restore_encode(pay_, sizeof pay_, &pn_, &restore));
+    uint64_t covered = img_seq;
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    size_t descriptor = img_len;
+    img_descriptor(9, covered, sizeof x - 1);
+    img_literal(JOURNAL_REC_CHECKPOINT_INSERT, 9, 0, x);
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    gen.flags = JOURNAL_GENERATION_VALUE_ONLY;
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0, journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    const journal_origin *origin = plan.owners ? plan.owners->origins : NULL;
+    CHECK(origin && origin->test == JOURNAL_INDEPENDENT_TEXT &&
+          origin->covered == covered && origin->source->frames->offset == descriptor &&
+          origin->older && !origin->older->older, "§1.3 only the replacement checkpoint committed");
+}
+
+static void test_named_cuts(void)
+{
+    /* §1.5 a–c: prefixes at complete record boundaries model the K/M cuts. */
+    img_base_only();
+    img_literal(JOURNAL_REC_INSERT, 9, 0, "x");
+    uint64_t a = img_seq;
+    img_literal(JOURNAL_REC_INSERT, 10, 0, "y");
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    img_descriptor(9, a, 1);
+    size_t before_keys = img_len;
+    img_literal(JOURNAL_REC_INSERT, 9, 1, "!");
+    img_literal(JOURNAL_REC_INSERT, 10, 1, "!");
+    check_cut(before_keys, 9, false, "x"); /* a/M: key lost. */
+    check_cut(img_len, 9, false, "x!"); /* b/K,M: incomplete A, both keys. */
+    check_cut(img_len, 10, false, "y!");
+    img_literal(JOURNAL_REC_CHECKPOINT_INSERT, 9, 0, "x");
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    size_t sealed = img_len;
+    check_cut(sealed, 9, true, "x!"); /* a/K,M: key inside checkpoint. */
+    img_literal(JOURNAL_REC_INSERT, 9, 2, "?");
+    check_cut(img_len, 9, true, "x!?"); /* c/K. */
+    check_cut(sealed, 9, true, "x!"); /* c/M. */
+
+    /* §1.5 d, e: B's atomic command and checkpoint finish during A's. */
+    img_base_only();
+    img_literal(JOURNAL_REC_INSERT, 9, 0, "x");
+    a = img_seq;
+    img_literal(JOURNAL_REC_INSERT, 10, 0, "y");
+    uint64_t b = img_seq;
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    img_descriptor(9, a, 1);
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 10, NULL, 0);
+    img_descriptor(10, b, 1);
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 10, NULL, 0);
+    journal_delete del = { 0, 1 };
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_DELETE, 10,
+                journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    img_literal(JOURNAL_REC_COMMAND_INSERT, 10, 0, "z");
+    size_t before_command = img_len;
+    check_cut(before_command, 9, false, "x");
+    check_cut(before_command, 10, false, "y");
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 10, NULL, 0);
+    check_cut(img_len, 10, false, "z");
+    img_literal(JOURNAL_REC_CHECKPOINT_INSERT, 10, 0, "y");
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 10, NULL, 0);
+    check_cut(img_len, 10, true, "z");
+    check_cut(img_len, 9, false, "x");
+    img_literal(JOURNAL_REC_CHECKPOINT_INSERT, 9, 0, "x");
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    check_cut(img_len, 9, true, "x");
+    check_cut(img_len, 10, true, "z");
+
+    /* §1.5 f: abandoned DELETE, then either kind of replacement. */
+    img_base_only();
+    img_literal(JOURNAL_REC_INSERT, 9, 0, "x");
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_DELETE, 9,
+                journal_delete_encode(pay_, sizeof pay_, &pn_, &del));
+    img_literal(JOURNAL_REC_INSERT, 10, 0, "y");
+    size_t abandoned = img_len;
+    uint64_t at_abort = img_seq;
+    check_cut(abandoned, 9, false, "x");
+    check_cut(abandoned, 10, false, "y");
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    img_literal(JOURNAL_REC_COMMAND_INSERT, 9, 1, "!");
+    check_cut(img_len, 9, false, "x");
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
+    check_cut(img_len, 9, false, "x!");
+    img_len = abandoned;
+    img_seq = at_abort;
+    img_literal(JOURNAL_REC_INSERT, 9, 1, "?");
+    check_cut(img_len, 9, false, "x?");
+}
+
+static void test_flat_oracle(void)
+{
+    /* Include the EOF offset as well as one offset for every frame. */
+    size_t offsets[JOURNAL_ORACLE_RECORDS + 1];
+    uint8_t schedule[JOURNAL_ORACLE_RECORDS];
+    for (size_t seed = 0; seed < sizeof schedule; seed++) {
+        for (size_t i = 0; i < sizeof schedule; i++)
+            schedule[i] = (uint8_t)((UINT64_C(0x9e3779b97f4a7c15) * (i + seed)) >> (i % 64));
+        size_t frames = journal_oracle_image(img, sizeof img, offsets, schedule, sizeof schedule);
+        CHECK(frames != 0, "oracle builds interleaved image");
+        if (!frames) return;
+        for (size_t i = 0; i <= frames; i++) {
+            journal_logical_plan plan = read_plan(offsets[i], JOURNAL_CODEC_OK);
+            CHECK(journal_oracle_compare(img, offsets, i, &plan),
+                  "flat oracle schedule %zu at prefix %zu", seed, i);
+        }
+    }
+}
+
+static const journal_operation *operation_at(const journal_logical_plan *plan, size_t offset)
+{
+    for (const journal_operation *op = plan->operations; op; op = op->next)
+        if (op->final == offset) return op;
+    CHECK(false, "complete operation at file offset %zu", offset);
+    return NULL;
+}
+
+static void test_operand_policy(void)
+{
+    img_base_only();
+    journal_generation gen = { .key = 7, .identity = sample_identity(1),
+        .prefix_len = 1, .location = (const uint8_t *)"/a", .location_len = sizeof "/a" - 1 };
+    journal_restore restore = { 0, 7, 0, 1 };
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE, 9,
+                journal_restore_encode(pay_, sizeof pay_, &pn_, &restore));
+    size_t declaration = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0,
+                journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    size_t first_commit = img_len;
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE, 9,
+                journal_restore_encode(pay_, sizeof pay_, &pn_, &restore));
+    gen.flags = JOURNAL_GENERATION_VALUE_ONLY;
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0,
+                journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    size_t second_commit = img_len;
+    img_add(JOURNAL_REC_COMMAND_COMMIT, 9, NULL, 0);
+    gen.flags = 0;
+    size_t redeclaration = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0,
+                journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    size_t after_embargo = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_RESTORE_BASE_RANGE, 9,
+                journal_restore_encode(pay_, sizeof pay_, &pn_, &restore));
+
+    /* An abandoned member's key and a TABS-only id still reserve space
+     * in the lineage. Neither requires a logical operation on its owner. */
+    img_add(JOURNAL_REC_COMMAND_BEGIN, 9, NULL, 0);
+    restore.generation_key = 99;
+    IMG_PAYLOAD(JOURNAL_REC_COMMAND_RESTORE_BASE_RANGE, 9,
+                journal_restore_encode(pay_, sizeof pay_, &pn_, &restore));
+    journal_tabs_entry entry = { 77, JOURNAL_TABS_OPEN };
+    IMG_PAYLOAD(JOURNAL_REC_TABS, 0,
+                journal_tabs_encode(pay_, sizeof pay_, &pn_, &entry, 1, 0));
+    journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    const journal_operation *op = operation_at(&plan, first_commit);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED && op->frames->use == JOURNAL_UNRESOLVED,
+          "declaration after member cannot authorize COMMIT");
+    op = operation_at(&plan, second_commit);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED && op->frames->use == JOURNAL_ELIGIBLE &&
+          op->frames->declaration == declaration, "COMMIT honors intervening embargo");
+    op = operation_at(&plan, redeclaration);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED, "redeclaration cannot remove embargo");
+    op = operation_at(&plan, after_embargo);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED, "standalone restore still embargoed");
+    CHECK(plan.generation_high_water == 99 && plan.buffer_high_water == 77,
+          "abandoned range operand and TABS entry count toward high-waters");
+}
+
+static void test_cancelled_save(void)
+{
+    img_base_only();
+    journal_save prep = { .phase = JOURNAL_SAVE_PREPARED, .token = 1,
+        .prepared = { .new_key = 1, .snapshot_sequence = 1,
+            .witness = {1, 2, 0, 0, 0}, .path = (const uint8_t *)"/a",
+            .path_len = sizeof "/a" - 1 } };
+    size_t prepare = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &prep));
+    journal_generation gen = { .key = 1, .identity = {1, 2, 0, 0, 0, 0},
+        .location = prep.prepared.path, .location_len = prep.prepared.path_len };
+    IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0, journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+    journal_base staged = { 1, 1 };
+    size_t before = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_BASE, 10, journal_base_encode(pay_, sizeof pay_, &pn_, &staged));
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    img_descriptor(9, 1, 0);
+    size_t checkpoint = img_len;
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    journal_save cancel = { .phase = JOURNAL_SAVE_CANCELLED, .token = 1,
+        .cancelled = { .checkpoint_commit_sequence = img_seq,
+            .outcome = JOURNAL_SAVE_CANCEL_CONFLICT } };
+    size_t orphan = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_SAVE, 10, journal_save_encode(pay_, sizeof pay_, &pn_, &cancel));
+    size_t terminal = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_SAVE, 9, journal_save_encode(pay_, sizeof pay_, &pn_, &cancel));
+    size_t after = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_BASE, 11, journal_base_encode(pay_, sizeof pay_, &pn_, &staged));
+
+    journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    const journal_operation *op = operation_at(&plan, orphan);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED && !op->prepared, "orphan terminal isolated by owner");
+    op = operation_at(&plan, terminal);
+    CHECK(op && op->use == JOURNAL_ELIGIBLE && op->prepared &&
+          op->prepared->final == prepare && op->prepared->terminal == op &&
+          op->checkpoint && op->checkpoint->final == checkpoint &&
+          op->saved_test == JOURNAL_EXPECTED_BINDING && !op->displaced,
+          "CANCELLED selects its checkpoint and can preserve only prior saved evidence");
+    op = operation_at(&plan, before);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED, "BASE cannot use a staged declaration");
+    op = operation_at(&plan, after);
+    CHECK(op && op->use == JOURNAL_UNRESOLVED, "CANCELLED cannot activate a declaration");
+}
+
+static void test_checkpoint_metadata(void)
+{
+    img_base_only();
+    img_add(JOURNAL_REC_CHECKPOINT_BEGIN, 9, NULL, 0);
+    img_descriptor(9, 1, 0);
+    journal_target target = { .binding = JOURNAL_TARGET_UNTITLED };
+    size_t independent = img_len;
+    IMG_PAYLOAD(JOURNAL_REC_TARGET, 9, journal_target_encode(pay_, sizeof pay_, &pn_, &target));
+    target = (journal_target){ .binding = JOURNAL_TARGET_BOUND,
+        .path = (const uint8_t *)"/old", .path_len = sizeof "/old" - 1 };
+    IMG_PAYLOAD(JOURNAL_REC_CHECKPOINT_TARGET, 9,
+                journal_target_encode(pay_, sizeof pay_, &pn_, &target));
+    size_t final = img_len;
+    img_add(JOURNAL_REC_CHECKPOINT_COMMIT, 9, NULL, 0);
+    journal_logical_plan plan = read_plan(img_len, JOURNAL_CODEC_OK);
+    const journal_operation *op = operation_at(&plan, independent);
+    CHECK(op && op->binding == independent, "independent TARGET remains effective");
+    op = operation_at(&plan, final);
+    CHECK(op && op->use == JOURNAL_ELIGIBLE && !op->binding && !op->saved,
+          "stale checkpoint metadata cannot replace the independent binding");
+    CHECK(plan.owners && plan.owners->origins && plan.owners->origins->source == op,
+          "stale metadata still leaves the checkpoint text eligible");
+}
+
+static void test_workspace(void)
+{
+    /* (P) One key and token per supported tab (1000 + 16), 5 frames per
+     * owner: PREPARED, declaration, both BEGINs and a command member. */
+    enum { buffers = 1000 + 16, records = 5 * buffers };
+    img_reset(0, 0);
+    for (uint64_t i = 1; i <= buffers; i++) {
+        journal_save prepared = { .phase = JOURNAL_SAVE_PREPARED, .token = 1,
+            .prepared = { .new_key = i, .witness = {1, i, 0, 0, 0},
+                .path = (const uint8_t *)"/a", .path_len = sizeof "/a" - 1 } };
+        journal_generation gen = { .key = i, .identity = {1, i, 0, 0, 0, 0},
+            .location = prepared.prepared.path, .location_len = prepared.prepared.path_len };
+        IMG_PAYLOAD(JOURNAL_REC_SAVE, i, journal_save_encode(pay_, sizeof pay_, &pn_, &prepared));
+        IMG_PAYLOAD(JOURNAL_REC_GENERATION, 0, journal_generation_encode(pay_, sizeof pay_, &pn_, &gen));
+        img_add(JOURNAL_REC_COMMAND_BEGIN, i, NULL, 0);
+        img_add(JOURNAL_REC_CHECKPOINT_BEGIN, i, NULL, 0);
+        img_literal(JOURNAL_REC_COMMAND_INSERT, i, 0, "x");
+    }
+    size_t bound = journal_plan_workspace_size(records, buffers, buffers, buffers);
+    uint8_t *memory = malloc(bound + 1);
+    CHECK(bound && memory, "workspace bound is representable");
+    if (!bound || !memory) { free(memory); return; }
+    memory[bound] = 0xA5;
+    base_arena arena = { memory, bound, 0 };
+    journal_logical_plan plan;
+    CHECK(journal_plan_read(img, img_len, &arena, &plan) == JOURNAL_CODEC_OK &&
+          plan.prefix.records == records && plan.buffer_high_water == buffers &&
+          plan.generation_high_water == buffers && arena.used <= bound &&
+          memory[bound] == 0xA5, "workspace bound at R, B, D, T");
+    CHECK(arena.used > 1, "populated workspace");
+    if (arena.used > 1) {
+        arena.size = arena.used - 1;
+        arena.used = 1;
+        CHECK(journal_plan_read(img, img_len, &arena, &plan) == JOURNAL_CODEC_NO_SPACE &&
+              arena.used == 1 && !plan.operations && !plan.owners && !plan.prefix.valid_bytes,
+              "undersized arena restores mark and certifies no boundary");
+    }
+    CHECK(journal_plan_workspace_size(SIZE_MAX, 0, 0, 0) == 0, "workspace checked overflow");
+    free(memory);
 }
 
 int main(void)
 {
+    /* The oracle script is longer than the other small images.
+     * Each frame can introduce at most one indexed owner, key or token.
+     * The large workspace fixture supplies its own arena. */
+    plan_capacity = journal_plan_workspace_size(JOURNAL_ORACLE_RECORDS, JOURNAL_ORACLE_RECORDS,
+                                               JOURNAL_ORACLE_RECORDS, JOURNAL_ORACLE_RECORDS);
+    plan_space = malloc(plan_capacity);
+    if (!plan_space) return 1;
     test_crc();
     test_preamble();
     test_pad();
@@ -782,6 +1293,14 @@ int main(void)
     test_stream_valid();
     test_stream_torn_and_invalid();
     test_stream_checkpoint_and_save();
+    test_checkpoint_replacement();
+    test_named_cuts();
+    test_flat_oracle();
+    test_operand_policy();
+    test_cancelled_save();
+    test_checkpoint_metadata();
+    test_workspace();
+    free(plan_space);
     if (failures) {
         fprintf(stderr, "journal_codec_test: %d failure(s)\n", failures);
         return 1;
