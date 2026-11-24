@@ -15,15 +15,15 @@
  *     VS16 and skin tones;
  *   - grapheme oracle: the first 512 units are segmented by a stateless
  *     UAX #29 implementation (its own GCB classifier, no shortcuts) and must
- *     equal utf8_grapheme_next; grapheme_prev from every cluster end and every
- *     unit end inside one returns the cluster start; utf8_cluster's width
+ *     equal first_grapheme; grapheme_prev from every cluster end and every
+ *     unit end inside one returns the cluster start; first_cluster's width
  *     equals the cluster-width rule of utf8.h evaluated on oracle classes;
  *   - resumable step: for random budgets and a random chunking (each call sees
  *     an exact-size copy of what is available, eof only on the last),
  *     utf8_grapheme_step and utf8_cluster_step equal the one-shot calls and no
  *     call exceeds budget + 3 bytes;
  *   - encode of arbitrary 32-bit values decodes back to the value or U+FFFD. */
-#include "utf8/utf8.h"
+#include "../tests/utf8_fixture.h"
 #include "utf8/tables.h"
 
 #include <stdlib.h>
@@ -189,13 +189,13 @@ static void oracle(const uint8_t *data, size_t size)
     for (size_t o = 0; o < pos[m];) {
         int j = i + 1;
         while (j < m && !ref_break(c, ib, j)) j++;
-        size_t g = utf8_grapheme_next(v + o, pos[m] - o);
+        size_t g = first_grapheme(v + o, pos[m] - o);
         REQUIRE(g == pos[j] - o);
         REQUIRE(utf8_grapheme_prev(v, o + g) == o);
         for (int k = i + 1; k < j; k++)                  /* unit ends inside the cluster */
             REQUIRE(utf8_grapheme_prev(v, pos[k]) == o);
         int w;
-        REQUIRE(utf8_cluster(v + o, pos[m] - o, &w) == g);
+        REQUIRE(first_cluster(v + o, pos[m] - o, &w) == g);
         REQUIRE(w == ref_cluster_width(u + i, c + i, j - i));
         o += g;
         i = j;
@@ -208,7 +208,7 @@ static void oracle(const uint8_t *data, size_t size)
 static void chunked(const uint8_t *data, size_t lim, size_t budget, size_t chunk, int cluster)
 {
     int wantw = 0, w = -1, r = UTF8_G_MORE;
-    size_t want = cluster ? utf8_cluster(data, lim, &wantw) : utf8_grapheme_next(data, lim);
+    size_t want = cluster ? first_cluster(data, lim, &wantw) : first_grapheme(data, lim);
     utf8_gseg g;
     utf8_cseg c;
     utf8_gseg_init(&g);
@@ -236,8 +236,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size == 0) {
-        REQUIRE(utf8_grapheme_next(data, 0) == 0);
-        REQUIRE(utf8_prev(data, 0) == 0);
+        REQUIRE(first_grapheme(data, 0) == 0);
+        REQUIRE(utf8_test_prev(data, 0) == 0);
         return 0;
     }
     uint8_t *unit = calloc(size + 1, 1);            /* unit[o] = 1 iff o is a unit boundary */
@@ -256,7 +256,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else {
             REQUIRE(s.len == 1 && s.cp == data[off] && data[off] >= 0x80);
             rebuilt[off] = (uint8_t)s.cp;           /* invalid: the original byte */
-            REQUIRE(utf8_cluster_width(data + off, rem) == 1);   /* never the width of scalar U+00xx */
+            REQUIRE(first_cluster_width(data + off, rem) == 1);   /* never the width of scalar U+00xx */
         }
         for (size_t k = 1; k < 4 && k < rem; k++) {  /* truncated view, own heap block */
             uint8_t *v = exact_copy(data + off, k);
@@ -264,26 +264,26 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             REQUIRE(t.cp == tr.cp && t.len == tr.len && t.valid == tr.valid && t.len <= k);
             free(v);
         }
-        int w = utf8_cell_width(s.cp);
-        REQUIRE(w >= 0 && w <= 2 && w == utf8_cell_width_table(s.cp));
+        int w = utf8_test_cell_width(s.cp);
+        REQUIRE(w >= 0 && w <= 2);
         REQUIRE(!s.valid || w == ref_width(s.cp));
         unit[off] = 1;
         off += s.len;
         units++;
-        REQUIRE(utf8_prev(data, off) == off - s.len);
+        REQUIRE(utf8_test_prev(data, off) == off - s.len);
     }
     unit[size] = 1;
     REQUIRE(memcmp(rebuilt, data, size) == 0);      /* byte-exact round trip, malformed input included */
     free(rebuilt);
     size_t back = 0;
     for (size_t o = size; o > 0; back++) {
-        size_t p = utf8_prev(data, o);
+        size_t p = utf8_test_prev(data, o);
         REQUIRE(p < o && unit[p]);
         o = p;
     }
     REQUIRE(back == units);
     for (off = 0; off < size;) {
-        size_t g = utf8_grapheme_next(data + off, size - off);
+        size_t g = first_grapheme(data + off, size - off);
         REQUIRE(g >= 1 && g <= size - off && unit[off + g]);
         uint8_t *source = exact_copy(data + off, g), *artwork = malloc(g);
         REQUIRE(artwork);

@@ -64,12 +64,12 @@ static bool same(const ipc_request *g, const model *m)
 }
 static void expect_ok(const uint8_t *w, size_t n, const model *m)
 {
-    ipc_request o; ipc_result rc=ipc_wire_decode(w,n,&o);
+    ipc_request o; ipc_result rc=ipc_test_wire_decode(w,n,&o);
     ASSERT(rc==IPC_OK && same(&o,m));
 }
 static void expect_proto(const uint8_t *w, size_t n)
 {
-    ipc_request o; ipc_result rc=ipc_wire_decode(w,n,&o);
+    ipc_request o; ipc_result rc=ipc_test_wire_decode(w,n,&o);
     ASSERT(rc==IPC_PROTOCOL);
     ASSERT(o.count==0 && o.cwd==NULL && o.stdin_data==NULL && o.stdin_size==0 && !o.wait && !o.has_stdin);
 }
@@ -99,7 +99,7 @@ static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, b
     if(g_srv_state==0) {
         snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"fuzz-%ld",(long)getpid());
         unsetenv("XDG_RUNTIME_DIR");
-        g_srv_state=ipc_server_init(&g_srv,NULL)==IPC_OK?1:-1;
+        g_srv_state=ipc_server_init_display(&g_srv,NULL,NULL)==IPC_OK?1:-1;
     }
     if(g_srv_state<0) return;
     ipc_seam_foreign_abstract=foreign;
@@ -126,7 +126,7 @@ static void e2e(const uint8_t *w, size_t n, const model *m, ipc_result expect, b
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     /* Part 1: raw bytes. */
-    ipc_request out={0}; ipc_result rc=ipc_wire_decode(data,size,&out);
+    ipc_request out={0}; ipc_result rc=ipc_test_wire_decode(data,size,&out);
     ASSERT(rc==IPC_OK || rc==IPC_PROTOCOL);
     if(rc==IPC_OK) {
         ASSERT(out.count<=IPC_MAX_PATHS && out.cwd!=NULL && out.cwd[0]=='/');
@@ -148,7 +148,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     }
     ipc_request q; to_request(&m,&q); q.new_instance=(sel&0x80u)!=0;
     uint8_t wire[4096], base[4096]; size_t n=0;
-    ASSERT(ipc_wire_encode(&q,base,sizeof base,&n)==IPC_OK);
+    ASSERT(ipc_test_wire_encode(&q,base,sizeof base,&n)==IPC_OK);
     ASSERT(n>=24 && get32(base+8)==n && memcmp(base,"EDIP",4)==0);
     expect_ok(base,n,&m);
     /* Offsets of the structural fields, derived from the model. */
@@ -191,20 +191,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                break; }
     default: if(m.stdin_size) { size_t i=arg%m.stdin_size; uint8_t b=(uint8_t)(arg2); wire[pos+i]=b; e.stdin_buf[i]=b; } break; /* payload byte */
     }
-    if(ambiguous) { ipc_request o; rc=ipc_wire_decode(wire,wn,&o); ASSERT(rc==IPC_OK||rc==IPC_PROTOCOL); want_ok=(rc==IPC_OK); if(want_ok) {/* a lucky parse: nothing exact to assert */} }
+    if(ambiguous) { ipc_request o; rc=ipc_test_wire_decode(wire,wn,&o); ASSERT(rc==IPC_OK||rc==IPC_PROTOCOL); want_ok=(rc==IPC_OK); if(want_ok) {/* a lucky parse: nothing exact to assert */} }
     else if(want_ok) expect_ok(wire,wn,&e);
     else expect_proto(wire,wn);
 
     /* Part 3: encoder contract. */
     uint8_t again[4096]; size_t n2=0;
-    ASSERT(ipc_wire_encode(&q,again,sizeof again,&n2)==IPC_OK && n2==n && memcmp(again,base,n)==0); /* deterministic, new_instance not serialized */
-    size_t sink_n=7; ASSERT(ipc_wire_encode(&q,again,(size_t)arg%n,&sink_n)==IPC_LIMIT && sink_n==0);
+    ASSERT(ipc_test_wire_encode(&q,again,sizeof again,&n2)==IPC_OK && n2==n && memcmp(again,base,n)==0); /* deterministic, new_instance not serialized */
+    size_t sink_n=7; ASSERT(ipc_test_wire_encode(&q,again,(size_t)arg%n,&sink_n)==IPC_LIMIT && sink_n==0);
     /* Requests the parser and decoder cannot produce, and input aliasing the
      * output, are caller bugs that die by ASSERT (A15): not encoder outcomes. */
 
     /* Part 4: end to end, deterministic 1/32 sample, only envelopes the server will answer. */
     if((mk&0x0cu)==0x0cu && ((arg2>>24)&7u)==3u && !ambiguous && wn>=24 && wn<=sizeof wire && (memcmp(wire,"EDIP",4)!=0 || get32(wire+8)==wn)) {
-        ipc_request o; ipc_result d=ipc_wire_decode(wire,wn,&o);
+        ipc_request o; ipc_result d=ipc_test_wire_decode(wire,wn,&o);
         ASSERT(d==IPC_OK || d==IPC_PROTOCOL);
         bool foreign=(sel&0x40u)!=0 && (arg&3u)==0;
         e2e(wire,wn,&e,d,foreign);

@@ -29,7 +29,7 @@ int main(void)
 {
     alarm(60); /* v1 fixture watchdog value, carried */
     const char *dir=test_ipc_isolate(); REQUIRE(dir!=NULL);
-    ipc_server server={0}; REQUIRE(ipc_server_init(&server,dir)==IPC_OK);
+    ipc_server server={0}; REQUIRE(ipc_server_init_display(&server,dir,NULL)==IPC_OK);
     /* G10 margin (edit-457.21 §14): the receive pool is 16x64 KiB + 2x1 MiB = 3 MiB (+ peer table);
      * the old 33.5 MB arena (32 x 1 MiB) must not come back. (P): the pool byte
      * count is arithmetic over the header constants. A miss is a note, not a
@@ -48,7 +48,7 @@ int main(void)
             uint64_t before=os_now_ns();
             if(write(start[1],&before,sizeof before)!=(ssize_t)sizeof before) _exit(2);
             close(start[1]);
-            _exit(ipc_client_send(dir,&r,2000)==IPC_OK?0:2);
+            _exit(ipc_client_send_display(dir,NULL,&r,2000)==IPC_OK?0:2);
         }
         close(start[1]); uint64_t before=0;
         REQUIRE(read(start[0],&before,sizeof before)==(ssize_t)sizeof before); close(start[0]);

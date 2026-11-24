@@ -1,4 +1,4 @@
-#include "find/find.h"
+#include "find_fixture.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -74,7 +74,7 @@ int main(void)
     const uint8_t zero = 0;
     const find_literal_options literal = {0};
     size_t emitted = 0;
-    find_visit visit = {.prefix_capacity = FIND_MAX_OFFSETS, .wanted = FIND_UNSET,
+    find_visit visit = {.prefix_capacity = FIND_FIXTURE_OFFSETS, .wanted = FIND_UNSET,
                         .emit = record, .user = &emitted};
     find_code code = find_literal_visit(&source, &zero, sizeof zero, literal, NULL, &visit);
     printf("mapped mid-find: recovered=%d pristine_polls=%zu polls=%zu code=%d emitted=%zu\n",
@@ -83,8 +83,8 @@ int main(void)
     CHECK(code == FIND_CANCELLED && emitted == 0 && visit.total == 0 && visit.visible == 0);
 
     restore();
-    find_result result;
-    CHECK(find_literal(&source, &zero, sizeof zero, literal, NULL, &result) == FIND_CANCELLED);
+    find_fixture_result result;
+    CHECK(find_fixture_literal(&source, &zero, sizeof zero, literal, NULL, &result) == FIND_CANCELLED);
     CHECK(recovered && !result.total && !result.stored);
     restore();
     find_match match;
@@ -94,7 +94,7 @@ int main(void)
     _Alignas(max_align_t) uint8_t program[FIND_MAX_PROGRAM_BYTES];
     _Alignas(max_align_t) uint8_t memory[FIND_MAX_SCRATCH_BYTES];
     find_regex *regex;
-    CHECK(find_regex_compile(program, sizeof program, &zero, sizeof zero, &regex, NULL) == FIND_OK);
+    CHECK(find_fixture_compile(program, sizeof program, &zero, sizeof zero, &regex, NULL) == FIND_OK);
     restore();
     CHECK(find_regex_visit(&source, regex, memory, sizeof memory, NULL, &visit) == FIND_CANCELLED);
     CHECK(recovered && !emitted && !visit.total && !visit.visible);
@@ -105,7 +105,7 @@ int main(void)
     CHECK(recovered && !done && !emitted && !visit.total && !visit.visible);
 
     /* (P) Once tainted, even a search which reads no input cannot succeed. */
-    CHECK(find_literal(&source, NULL, 0, literal, NULL, &result) == FIND_CANCELLED);
+    CHECK(find_fixture_literal(&source, NULL, 0, literal, NULL, &result) == FIND_CANCELLED);
     piece_snapshot_release(snapshot);
     piece_reserve_destroy(reserve);
     CHECK(owners == 0);

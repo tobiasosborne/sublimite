@@ -1,4 +1,4 @@
-#include "find/find.h"
+#include "find_fixture.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -26,10 +26,10 @@ static bool equal_bytes(const uint8_t *text, const uint8_t *needle, size_t n, bo
     return true;
 }
 
-static find_result oracle(const uint8_t *text, size_t len, const uint8_t *needle, size_t n,
+static find_fixture_result oracle(const uint8_t *text, size_t len, const uint8_t *needle, size_t n,
                           find_literal_options options)
 {
-    find_result result = {0};
+    find_fixture_result result = {0};
     if (!n || n > len) return result;
     for (size_t i = 0; i <= len - n;) {
         bool word = (!i || !ascii_word(text[i - 1])) &&
@@ -44,8 +44,8 @@ static find_result oracle(const uint8_t *text, size_t len, const uint8_t *needle
 }
 
 typedef struct visits {
-    find_capture ranges[FIND_MAX_OFFSETS];
-    uint64_t ordinals[FIND_MAX_OFFSETS];
+    find_capture ranges[FIND_FIXTURE_OFFSETS];
+    uint64_t ordinals[FIND_FIXTURE_OFFSETS];
     size_t count;
 } visits;
 
@@ -60,8 +60,8 @@ static bool capture(void *data, uint64_t ordinal, find_capture range)
 static int check_options(const find_source *source, const uint8_t *text, size_t len,
                          const uint8_t *needle, size_t n, find_literal_options options)
 {
-    find_result want = oracle(text, len, needle, n, options), got;
-    CHECK(find_literal(source, needle, n, options, NULL, &got) == FIND_OK);
+    find_fixture_result want = oracle(text, len, needle, n, options), got;
+    CHECK(find_fixture_literal(source, needle, n, options, NULL, &got) == FIND_OK);
     if (got.total != want.total)
         fprintf(stderr, "fold=%d word=%d len=%zu needle=%zu actual=%llu expected=%llu\n",
                 options.fold_ascii, options.whole_word, len, n,

@@ -7,7 +7,6 @@
 typedef struct cpu_probe {
     pthread_barrier_t *start;
     bool avx2;
-    bool popcnt;
     bool sse42;
 } cpu_probe;
 
@@ -17,7 +16,6 @@ static void probe_cpu(void *arg)
     int rc = pthread_barrier_wait(probe->start);
     ASSERT(rc == 0 || rc == PTHREAD_BARRIER_SERIAL_THREAD);
     probe->avx2 = base_cpu_has_avx2();
-    probe->popcnt = base_cpu_has_popcnt();
     probe->sse42 = base_cpu_has_sse42();
 }
 
@@ -35,20 +33,11 @@ static void test_cpu(void)
     ASSERT(pthread_barrier_destroy(&start) == 0);
 
     ASSERT(left.avx2 == right.avx2 && left.avx2 == base_cpu_has_avx2());
-    ASSERT(left.popcnt == right.popcnt && left.popcnt == base_cpu_has_popcnt());
     ASSERT(left.sse42 == right.sse42 && left.sse42 == base_cpu_has_sse42());
     /* The predicate reports the compiler runtime's own answer verbatim. */
     __builtin_cpu_init();
     ASSERT(left.sse42 == (__builtin_cpu_supports("sse4.2") != 0));
-    printf("cpu: avx2=%d popcnt=%d sse42=%d\n", (int)left.avx2, (int)left.popcnt,
-           (int)left.sse42);
-}
-
-static void test_version(void)
-{
-    const char *version = base_version();
-    ASSERT(version && *version);
-    puts(version);
+    printf("cpu: avx2=%d sse42=%d\n", (int)left.avx2, (int)left.sse42);
 }
 
 static void test_arena(void)
@@ -68,7 +57,7 @@ static void test_arena(void)
     base_arena_reset_to_mark(&arena, mark);
     ASSERT(base_arena_alloc(&arena, 1, 2 * page) == p);
     ASSERT(*p == 0xab);
-    base_arena_reset(&arena);
+    base_arena_reset_to_mark(&arena, 0);
     ASSERT(base_arena_mark(&arena) == 0);
     ASSERT(base_arena_alloc(&arena, SIZE_MAX, 1) == NULL);
     ASSERT(base_arena_alloc(&arena, capacity, 1) == arena.base);
@@ -91,10 +80,10 @@ static void test_pool(void)
     void *b = base_pool_get(&pool), *c = base_pool_get(&pool);
     ASSERT(b && c && a != b && b != c && a != c);
     ASSERT(base_pool_get(&pool) == NULL);
-    ASSERT(base_pool_count_live(&pool) == 3);
+    ASSERT(pool.live == 3);
     base_pool_put(&pool, a);
     base_pool_put(&pool, c);
-    ASSERT(base_pool_count_live(&pool) == 1);
+    ASSERT(pool.live == 1);
     ASSERT(base_pool_get(&pool) == c);
     ASSERT(base_pool_get(&pool) == a);
     base_pool_free(&pool);
@@ -115,10 +104,10 @@ static void test_pool(void)
     unsigned char *second = base_pool_get(&pool);
     base_pool_put(&pool, first); /* a free-list entry must not survive reset */
     base_pool_reset(&pool);
-    ASSERT(base_pool_count_live(&pool) == 0 && pool.base == reservation);
+    ASSERT(pool.live == 0 && pool.base == reservation);
     ASSERT(base_pool_get(&pool) == first && base_pool_get(&pool) == second);
     ASSERT(base_pool_get(&pool) != NULL && base_pool_get(&pool) == NULL);
-    ASSERT(base_pool_count_live(&pool) == 3);
+    ASSERT(pool.live == 3);
     base_pool_free(&pool);
     puts("pool: ok");
 }
@@ -137,7 +126,6 @@ int main(void)
     ASSERT(assert_death(put_foreign, "src/base/base.c",
                              "p->live != 0 && offset < p->fresh * p->stride && offset % p->stride == 0"));
     test_cpu();
-    test_version();
     test_arena();
     test_pool();
     puts("base_test: PASS");

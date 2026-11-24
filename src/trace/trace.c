@@ -79,14 +79,6 @@ void trace_record_at(uint64_t ns, enum trace_ev ev, uint32_t frame_id) {
     if (r != NULL) ring_put(r, ns, ev, frame_id);
 }
 
-void trace_reset(void) {
-    for (uint32_t i = 0; i < TRACE_MAX_THREADS; i++) {
-        g_rings[i].total = 0;
-    }
-    g_in_total = 0;
-    for (size_t i = 0; i < TRACE_STARTUP_COUNT; i++) atomic_store(&g_startup[i], 0);
-}
-
 static int write_all(os_file *f, const void *data, size_t len) {
     const unsigned char *next = data;
     while (len) {

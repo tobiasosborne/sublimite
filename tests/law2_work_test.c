@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* The v1 work-test per-job hang bound. */
+static const uint64_t hang_bound_ns = UINT64_C(5000000000);
+
 static bool guard_proven(void)
 {
     /* Force one counted allocation at release optimization, as in law2_trace_test. */
@@ -45,12 +48,11 @@ static void count_message(const work_msg *msg, void *arg)
 
 static void finish(const work_pool *pool, work_handle h)
 {
-    /* The v1 work-test per-job hang bound and poll cadence. */
-    uint64_t deadline = os_now_ns() + 5000000000ull;
+    uint64_t deadline = os_now_ns() + hang_bound_ns;
     ASSERT(h.epoch);
     while (!work_handle_finished(pool, h)) {
         ASSERT(os_now_ns() < deadline);
-        os_sleep_ns(1000000);
+        os_sleep_ns(1000000); /* v1 work-test poll cadence */
     }
 }
 
@@ -63,7 +65,7 @@ int main(void)
     _Atomic bool started = false;
     work_handle blocked = work_submit(&pool, (work_job){block_bulk, &started, 0, WORK_BULK});
     ASSERT(blocked.epoch);
-    uint64_t deadline = os_now_ns() + 5000000000ull; /* same v1 hang bound */
+    uint64_t deadline = os_now_ns() + hang_bound_ns;
     while (!atomic_load_explicit(&started, memory_order_acquire)) {
         ASSERT(os_now_ns() < deadline);
         os_sleep_ns(1000000);
@@ -80,7 +82,10 @@ int main(void)
             {publish, NULL, gen, WORK_FOREGROUND},
         };
         work_handle handles[sizeof jobs / sizeof jobs[0]];
-        ASSERT(work_submit_batch(&pool, jobs, sizeof jobs / sizeof jobs[0], handles) == 0);
+        for (size_t i = 0; i < sizeof jobs / sizeof jobs[0]; i++) {
+            handles[i] = work_submit(&pool, jobs[i]);
+            ASSERT(handles[i].epoch != 0);
+        }
         work_cancel(&pool, handles[0]);
         work_cancel(&pool, handles[0]); /* repeated cancellation is harmless */
         ASSERT(work_handle_finished(&pool, handles[0]));
@@ -98,14 +103,18 @@ int main(void)
         previous[1] = handles[2];
 
         size_t selected = 0, ordinary = 0;
-        ASSERT(work_mailbox_bind(&pool, handles[2], gen, count_message, &selected) == 0);
-        ASSERT(work_mailbox_receive_bounded(&pool, handles[2], gen, count_message,
-                                                &ordinary, WORK_MAILBOX_CAP, 0) == 1);
-        ASSERT(selected == 1 && ordinary == 0);
-        ASSERT(work_mailbox_bind(&pool, handles[2], gen, NULL, NULL) == 0);
+        deadline = os_now_ns() + hang_bound_ns;
+        while (!selected) {
+            (void)work_mailbox_receive(&pool, handles[2], gen, count_message, &selected);
+            ASSERT(os_now_ns() < deadline);
+        }
+        ASSERT(selected == 1);
         if (gen % 2u == 0) work_cancel(&pool, handles[1]);
         size_t expected = gen % 2u;
-        ASSERT(work_mailbox_drain_bounded(&pool, count_message, &ordinary, 1, 0) == expected);
+        while (work_mailbox_pending(&pool)) {
+            (void)work_mailbox_drain(&pool, count_message, &ordinary);
+            ASSERT(os_now_ns() < deadline);
+        }
         ASSERT(ordinary == expected && !work_mailbox_pending(&pool));
     }
     work_cancel(&pool, blocked);

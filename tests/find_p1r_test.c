@@ -54,9 +54,9 @@ static int dense_count(void)
     find_source source={text,sizeof text,NULL};
     find_literal_options fold={.fold_ascii=true};
     const uint8_t byte='a';
-    find_result result;
-    CHECK(find_literal(&source,&byte,sizeof byte,fold,NULL,&result)==FIND_OK);
-    CHECK(result.total==sizeof text && result.stored==FIND_MAX_OFFSETS);
+    find_fixture_result result;
+    CHECK(find_fixture_literal(&source,&byte,sizeof byte,fold,NULL,&result)==FIND_OK);
+    CHECK(result.total==sizeof text && result.stored==FIND_FIXTURE_OFFSETS);
     for (size_t i=0;i<result.stored;i++) CHECK(result.offsets[i]==i);
 
     find_visit visit={.wanted=FIND_UNSET,.emit=no_range,.emit_mask=dense_mask};
@@ -76,20 +76,20 @@ static int regex_retry_bound(void)
     const char *patterns[]={"a*b","aa*b","(a*)b"};
     for (size_t i=0;i<sizeof patterns/sizeof patterns[0];i++) {
         find_regex *regex;
-        CHECK(find_regex_compile(program,sizeof program,(const uint8_t *)patterns[i],
+        CHECK(find_fixture_compile(program,sizeof program,(const uint8_t *)patterns[i],
                                  strlen(patterns[i]),&regex,NULL)==FIND_OK);
         size_t previous=0;
         for (size_t n=FIND_POLL_UNITS;n<=sizeof text;n*=2) {
             probe p={0}; work_ctx context={.arg=&p};
             find_control control={.work=&context}; find_source source={text,n,NULL};
-            find_result result;
-            CHECK(find_regex_search(&source,regex,memory,sizeof memory,&control,&result)==FIND_ERR_LIMIT);
+            find_fixture_result result;
+            CHECK(find_fixture_regex(&source,regex,memory,sizeof memory,&control,&result)==FIND_ERR_LIMIT);
             CHECK(!result.total && !result.stored);
             /* (G) v1 P1R9 doubles length, allowing four end/batch polls. */
             CHECK(!previous || p.polls<=2*previous+4);
             previous=p.polls;
             find_match match;
-            CHECK(find_regex_next(&source,regex,0,memory,sizeof memory,&control,&match)==FIND_ERR_LIMIT);
+            CHECK(find_fixture_regex_next(&source,regex,0,memory,sizeof memory,&control,&match)==FIND_ERR_LIMIT);
             CHECK(!match.matched && match.whole.start==FIND_UNSET && match.groups==0);
             find_visit visit={.wanted=FIND_UNSET,.emit=no_range};
             CHECK(find_regex_stream_begin(&source,regex,memory,sizeof memory,false)==FIND_OK);
@@ -100,7 +100,7 @@ static int regex_retry_bound(void)
             } while (code==FIND_OK && !done);
             CHECK(code==FIND_ERR_LIMIT && !done && !visit.total && !visit.visible);
             p=(probe){.cancel_at=2}; /* (P) Pass the entry poll, stop inside work. */
-            CHECK(find_regex_search(&source,regex,memory,sizeof memory,&control,&result)==FIND_CANCELLED);
+            CHECK(find_fixture_regex(&source,regex,memory,sizeof memory,&control,&result)==FIND_CANCELLED);
             CHECK(!result.total && !result.stored);
         }
     }
@@ -122,10 +122,10 @@ static int rejected_overlap_is_linear(void)
         for (size_t n=sizeof text/2;n<=sizeof text;n*=2) {
             probe p={0}; work_ctx context={.arg=&p};
             find_control control={.work=&context};
-            find_source source={text,n,NULL}; find_result result;
+            find_source source={text,n,NULL}; find_fixture_result result;
             find_code code=force ?
-                find_test_literal_two_way(&source,needle,n/4,options,&control,&result) :
-                find_literal(&source,needle,n/4,options,&control,&result);
+                find_fixture_literal_two_way(&source,needle,n/4,options,&control,&result) :
+                find_fixture_literal(&source,needle,n/4,options,&control,&result);
             CHECK(code==FIND_OK && !result.total && !result.stored);
             /* (G) Same twofold bound and poll-rounding allowance as P1R9. */
             CHECK(!previous || p.polls<=2*previous+4);
@@ -169,7 +169,7 @@ static int regex_visit_equivalence(void)
     find_source source=find_fixture_source(f);
     for (size_t i=0;i<sizeof patterns/sizeof patterns[0];i++) {
         find_regex *regex;
-        CHECK(find_regex_compile(program,sizeof program,patterns[i],
+        CHECK(find_fixture_compile(program,sizeof program,patterns[i],
                                  strlen((const char *)patterns[i]),&regex,NULL)==FIND_OK);
         size_t stream_bytes=find_regex_stream_scratch_bytes(regex);
         CHECK(stream_bytes && stream_bytes<=sizeof memory);
@@ -187,8 +187,8 @@ static int regex_visit_equivalence(void)
             CHECK(code==FIND_OK && sync.total>0 && p.polls>1);
             size_t request_polls=p.polls;
             if (!word) {
-                find_result result;
-                CHECK(find_regex_search(&source,regex,memory,sizeof memory,NULL,&result)==FIND_OK);
+                find_fixture_result result;
+                CHECK(find_fixture_regex(&source,regex,memory,sizeof memory,NULL,&result)==FIND_OK);
                 CHECK(result.total==sync.total);
                 for (size_t j=0;j<expected.len;j++)
                     CHECK(result.offsets[expected.ordinals[j]]==expected.ranges[j].start);

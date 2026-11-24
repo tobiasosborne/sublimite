@@ -14,6 +14,7 @@ os_file_sync_data   L2-2b-journal-runtime # Journal safety suite's data-sync sea
 os_map_file         L2-1-file # Map files at or above the copy threshold.
 os_phys_mem_bytes   L2-1-file # Derive the file copy threshold from physical memory (wave1-L2-L5-harvest §1.2).
 os_rename_at        L2-1-file # Install the save temp atomically with NOREPLACE for an absent target.
+os_thread_self      L2-1-file # Mix worker identity with monotonic time in each exclusive-create temp name attempt.
 os_unmap            L2-1-file # Release unpublished mappings and final mapped backings.
 os_wake_fd          v2-0fv.13 # Add the work-pool wake descriptor to the application loop's root wait set.
 os_watch_add        L2-1-file # Watch the opened file's parent directory.
@@ -22,3 +23,78 @@ os_watch_fd         L2-1-file # Register watch readiness with the wait set.
 os_watch_init       L2-1-file # Initialize the file owner's watch queue.
 os_watch_read       L2-1-file # Consume change notifications for the watched entries.
 os_watch_remove     L2-1-file # Release a file's hold on the parent watch.
+
+# Wave 1 export triage.
+base_malloc_guard_active wave1-edit-spec # Proof obligations for the implementer. The release Law 2 observer must check that interposition is live.
+base_malloc_guard_begin wave1-edit-spec # Proof obligations for the implementer. The production-path observer opens the counting window at input ingress.
+base_malloc_guard_end wave1-edit-spec # Proof obligations for the implementer. The observer closes the window at actual submit and reads the allocation count.
+ipc_args_fini wave1-L0-harvest # §5.2 and §7 L0-6. Main releases the parsed request and its arena after launch or handoff.
+ipc_args_read_stdin wave1-L0-harvest # §5.2 and §7 L0-6. The CLI reads the stdin buffer for a dash operand before handing it to the editor. PLAN §3 also names stdin buffers.
+ipc_args_set_activation wave1-L0-harvest # §5.2 and §7 L0-6. The launcher copies activation data into the forwarded request. L0-6 explicitly retains this handoff.
+ipc_client_send_display wave1-L0-harvest # §5.2 and §7 L0-6. A secondary graphical launch forwards its request to the primary for the selected display.
+ipc_launcher_pair wave1-L0-harvest # §5.2, §5.6 and §7 L0-6. Main creates the launcher/UI pair for a primary or isolated --wait launch.
+ipc_launcher_wait wave1-L0-harvest # §5.2, §5.6 and §7 L0-6. The launcher waits for the UI to report closure or disconnect.
+ipc_parse_args wave1-L0-harvest # §5.2 and §7 L0-6. Main parses launch arguments including the file:line:col request.
+ipc_server_adopt_wait wave1-L0-harvest # §5.2, §5.6 and §7 L0-6. The UI adopts the launcher's wait channel and associates its token with the initial request.
+ipc_server_drain wave1-L0-harvest # §5.2 and §7 L0-6. The UI services a ready endpoint and dispatches the buffered requests. The W1 headless command stream is a separate transport.
+ipc_server_fd wave1-L0-harvest # §5.2 and §7 L0-6. The application loop registers the EDIP server's readiness descriptor for incoming open requests.
+ipc_server_fini wave1-L0-harvest # §5.2 and §7 L0-6. The primary or isolated UI releases the endpoint and client resources at shutdown.
+ipc_server_init_display wave1-L0-harvest # §5.2 and §7 L0-6. The graphical primary claims the endpoint for the same selected display.
+ipc_server_init_isolated wave1-L0-harvest # §5.2, §5.6 and §7 L0-6. A --new-instance UI accepts its own launcher channel without binding a shared endpoint.
+ipc_server_report_closed wave1-L0-harvest # §5.2, §5.6 and §7 L0-6. L5 completes the retained --wait token once the opened members have closed.
+ipc_server_token_live wave1-L0-harvest # §5.2, §5.6 and §7 L0-6. L5 sweeps wait associations after clients disconnect. The token-live obligation is explicit in §5.2.
+trace_dump wave1-L0-harvest # §3.2 and §7 “Out-of-scope / handed-off items”. The editor writes the EDTRACE1 timing and input dump consumed by the planned replay and latency tools.
+trace_fmt_dump_free wave1-L0-harvest # §3.2 and §7 “Out-of-scope / handed-off items”. The offline tools release the loaded dump and its owned arrays.
+trace_fmt_latencies wave1-L0-harvest # §3.2 and §7 “Out-of-scope / handed-off items”. The G1 analyzer pairs per-frame timestamps into latency samples.
+trace_fmt_load_dump wave1-L0-harvest # §3.2 and §7 “Out-of-scope / handed-off items”. The offline tools load a validated dump before replay or measurement.
+trace_fmt_pct wave1-L0-harvest # §3.2 and §7 “Out-of-scope / handed-off items”. The G1 analyzer reports the p50 and p99 of those samples.
+trace_input_clipboard wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves clipboard event metadata for replay.
+trace_input_filechange wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves file-change notifications for replay.
+trace_input_focus wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves focus transitions for replay.
+trace_input_key wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves key input for replay.
+trace_input_pointer wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves pointer motion and buttons for replay.
+trace_input_resize wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves surface-size changes for replay.
+trace_input_wheel wave1-L0-harvest # §3.2 and §7 L0-4. The UI ingress log preserves wheel deltas for replay.
+trace_record wave1-L0-harvest # §3.2 and §7 L0-4. The GUI pipeline records G1 timing events at the current monotonic time.
+trace_record_at wave1-L0-harvest # §3.2 and §7 L0-4. The GUI pipeline records an event with its original timestamp, including presentation feedback.
+trace_replay wave1-L0-harvest # §3.2 and §7 “Out-of-scope / handed-off items”. The replay tool delivers the recorded input log to its sink.
+work_cancel wave1-app-spec # app_buffers.h, Acquisition and counting. The buffer owner cancels stale mapped-count work on close or reload.
+work_continue wave1-app-spec # app_buffers.h, Acquisition and counting. A count job yields after a chunk and resumes on the same lease.
+work_handle_finished L2-1-file # Scope, Close bullet. Two-phase file close polls physical completion before releasing a job's backing.
+work_mailbox_drain wave1-app-spec # app_loop.h. The UI routes ordinary mailbox completions once per turn through its bounded dispatcher.
+work_mailbox_pending wave1-app-spec # app_loop.h. Before sleeping, the root loop checks remaining mail alongside runnable work and finished handles (also “Runnable work, fairness and wakes”).
+work_pool_init wave1-app-spec # app_loop.h. Headless app creation initializes the shared pool for bulk file, journal and count jobs. L0 dossier §4.2 names the basic constructor.
+work_pool_init_foreground wave1-L0-harvest # §4.2 and §4.3. The GUI enables the dedicated foreground lane for navigation while bulk work is occupied. §4.3 also names copied-file jumps.
+work_pool_shutdown wave1-app-spec # app_loop.h. App destruction retires and joins the owned pool. L0 dossier §4.2 names the consuming operation.
+work_pool_wake wave1-app-spec # app_loop.h. Main registers the pool wake descriptor in the root wait set.
+work_publish wave1-app-spec # app_buffers.h, Acquisition and counting. A count worker publishes its immutable chunk result to the owning UI.
+work_submit wave1-app-spec # app_buffers.h, Acquisition and counting. The mapped-open owner submits a WORK_BULK job with its retained backing.
+utf8_artwork_step wave1-L1-harvest # §2.2. The font fallback walks a cluster's scalars to obtain its unshaped artwork projection.
+utf8_cluster_artwork wave1-L1-harvest # §2.2. The GUI prepares a bounded artwork key from the bytes of a complete cluster. §2.2 names the whole-cluster projection.
+utf8_cluster_emoji v2-0fv.11 # Blast radius, every consumer of gcb_of, audited. Layout classifies the cluster before handing its complete bytes to glyph lookup.
+utf8_cluster_step wave1-L1-harvest # §2.2. Wrapped layout segments and measures clusters in bounded increments across input spans.
+utf8_emoji_class v2-0fv.11 # Blast radius, every consumer of gcb_of, audited. Font GSUB checks a scalar's emoji class when selecting whole-cluster artwork.
+utf8_grapheme_prev wave1-L1-harvest # §2.2. Cursor-left motion finds the previous cluster start on an already bounded span. §2.2 names backward grapheme segmentation.
+utf8_grapheme_step wave1-L1-harvest # §2.2. Viewport motion and grapheme repair segment a cluster with a resumable byte budget. The edit spec assigns repair to the caller after the proposed edit.h.
+indent_bracket_match v2-0fv.12 # §§2–3. GUI paint locates the bracket at the cursor and its mate in the visible window. §3 identifies paint as the consumer.
+indent_detect v2-0fv.12 # §§2–3. The buffer owner detects indentation and line-ending style on open, then supplies it to typing commands.
+indent_on_close_brace v2-0fv.12 # §§2–3. The closing-brace command computes its one-stop dedent before submitting the replacement.
+indent_on_enter v2-0fv.12 # §§2–3. The Return command copies the leading run and the detected line ending. The W1 edit harvest §4.3 names the typing operation.
+indent_trailing_ws v2-0fv.12 # §§2–3. GUI paint obtains trailing-blank ranges for the visible text window. L1 harvest §3.2 names the range query, and the landed §3 gives its current spelling.
+find_literal_next wave1-L2-L5-harvest # §4.3, view_skip_next_occurrence. The skip-next-occurrence plan needs the first following literal match at or after an offset. L1 harvest §7.2 names this single-match API.
+find_literal_visit wave1-L1-harvest # §§7.2–7.5. Find session and fif stream selected literal matches with native case and word options.
+find_regex_bytes wave1-L1-harvest # §§7.2–7.5. The caller funds opaque program storage before compiling a Wave 3 query.
+find_regex_captures wave1-L1-harvest # §§7.2–7.5. A replacement transaction obtains capture ranges by re-running the expression anchored at a chosen match.
+find_regex_compile_options wave1-L2-L5-harvest # §8, fif row. The fif worker compiles an option-aware regex against the unified find header.
+find_regex_next_budget wave1-L1-harvest # §§7.2–7.5. Wave 3 filtered regex enumeration carries the remaining work allowance across successive candidates. §7.3 names the caller-budgeted driver.
+find_regex_scratch_bytes v2-0fv.19 # Public contract. The replacement caller sizes the single-call workspace for anchored captures.
+find_regex_stream_begin wave1-L1-harvest # §§7.2–7.5. The find worker begins a resumable regex visit with a caller-funded workspace.
+find_regex_stream_scratch_bytes v2-0fv.19 # Public contract. The find worker sizes storage for the resumable regex visitor.
+find_regex_stream_step wave1-L1-harvest # §§7.2–7.5. The worker resumes that visit at NFA byte boundaries until completion.
+find_regex_visit wave1-L1-harvest # §§7.2–7.5. The Wave 3 consumers visit regex matches through the promoted visitor.
+find_regex_word_visit wave1-L1-harvest # §§7.2–7.5. Whole-word regex visits perform boundary filtering inside the shared matcher.
+find_regex_work_budget wave1-L1-harvest # §§7.2–7.5. The shared request budget bounds successive filtered regex retries. §7.3 names the budget initializer alongside its consuming driver.
+config_toml_parse LF-2-toml # The unit in one paragraph and opening scope. Wave 3 settings glue consumes the transactional TOML visitor. See the same-module qualification below.
+dnd_parse_uri_list LF-1-dnd # The module in one paragraph. The GUI drop handler decodes a text/uri-list payload into an IPC open request.
+
+work_mailbox_receive wave1-export-triage # Advisor decisions. Temporary pending the L2-1 file integration decision on selective receive.

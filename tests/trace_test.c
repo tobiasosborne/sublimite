@@ -2,6 +2,7 @@
 #include "assert_death.h"
 
 #include <unistd.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -66,7 +67,6 @@ static void joined_writer(trace_writer *writer) {
 }
 
 static void test_sequential_reuse(void) {
-    trace_reset();
     /* The first thread beyond capacity must still be able to record. */
     enum { THREADS = TRACE_MAX_THREADS + 1u };
     unsigned registered = 0;
@@ -124,7 +124,6 @@ static void record_second(void *arg) {
 }
 
 static void test_concurrent_reuse(void) {
-    trace_reset();
     _Atomic trace_race_phase phase = TRACE_RACE_START;
     os_thread a, b;
     ASSERT(os_thread_start(&a, record_first, &phase) == OS_OK);
@@ -150,7 +149,6 @@ static void hold_slot(void *arg) {
 }
 
 static void test_live_capacity(void) {
-    trace_reset();
     atomic_uint ready = 0;
     os_thread threads[TRACE_MAX_THREADS];
     for (size_t i = 0; i < TRACE_MAX_THREADS; i++) {
@@ -166,11 +164,7 @@ static void test_live_capacity(void) {
     trace_thread_release();
 }
 
-static void test_sparse_dump_and_reset(void) {
-    trace_reset();
-    ASSERT(trace_thread_register() == 0);
-    trace_record_at(1, TRACE_T2_MUTATION_DONE, 1);
-    trace_reset();
+static void test_sparse_dump(void) {
     ASSERT(trace_thread_register() == 0);
     trace_writer writer = {.frame = 2};
     joined_writer(&writer);
@@ -183,16 +177,16 @@ static void test_sparse_dump_and_reset(void) {
     ASSERT(dump.has_input && dump.nin == 0 && dump.in_dropped == 0);
     trace_fmt_dump_free(&dump);
 
-    trace_reset();
     trace_record_at(3, TRACE_STARTUP_FIRST_SUBMIT, 0);
     dump = load_snapshot();
-    ASSERT(dump.nrecs == 1 && dump.recs[0].thread == 0);
+    ASSERT(dump.nrecs == 2);
+    ASSERT(dump.recs[0].thread == 0);
     ASSERT(dump.recs[0].ev == TRACE_STARTUP_FIRST_SUBMIT && dump.recs[0].ns == 3);
+    ASSERT(dump.recs[1].thread == 1 && dump.recs[1].frame_id == writer.frame);
     trace_fmt_dump_free(&dump);
 }
 
 static void test_wrap(void) {
-    trace_reset();
     trace_record_at(1, TRACE_STARTUP_PROCESS_START, 0);
     trace_record_at(2, TRACE_STARTUP_PROCESS_START, 0);
     ASSERT(trace_thread_register() == 0);
@@ -270,7 +264,6 @@ static void test_timed_replay(void) {
 }
 
 static void record_fixture_events(void) {
-    trace_reset();
     ASSERT(trace_thread_register() == 0);
     trace_record_at(1, TRACE_STARTUP_PROCESS_START, 0);
     trace_record_at(2, TRACE_T0_INGRESS, 1);
@@ -401,19 +394,36 @@ static void percentile_zero(void) {
     (void)trace_fmt_pct(&value, 1, 0);
 }
 
-int main(void) {
+static void test_wire_fixtures(void) {
     char fixture[FIXTURE_SIZE];
-    /* Before any thread exists: the death child forks a one-thread process. */
-    ASSERT(assert_death(percentile_zero, "src/trace/trace_stats.c", "pct >= 1 && pct <= 100"));
-    test_sequential_reuse();
-    test_concurrent_reuse();
-    test_live_capacity();
-    test_sparse_dump_and_reset();
-    test_wrap();
-    test_latency_pairs();
-    test_timed_replay();
     test_legacy_v1_loads(fixture);
     test_malformed(fixture);
+}
+
+static void run_isolated(void (*test)(void)) {
+    /* The parent never records; each child starts with empty trace history. */
+    pid_t child = fork();
+    ASSERT(child >= 0);
+    if (child == 0) {
+        test();
+        exit(EXIT_SUCCESS);
+    }
+    int status;
+    ASSERT(waitpid(child, &status, 0) == child);
+    ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
+}
+
+int main(void) {
+    /* Before any thread exists: the death child forks a one-thread process. */
+    ASSERT(assert_death(percentile_zero, "src/trace/trace_stats.c", "pct >= 1 && pct <= 100"));
+    run_isolated(test_sequential_reuse);
+    run_isolated(test_concurrent_reuse);
+    run_isolated(test_live_capacity);
+    run_isolated(test_sparse_dump);
+    run_isolated(test_wrap);
+    test_latency_pairs();
+    test_timed_replay();
+    run_isolated(test_wire_fixtures);
     puts("trace_test: PASS");
     return 0;
 }

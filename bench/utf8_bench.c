@@ -2,9 +2,9 @@
  * exits 0; a timed call that returns a wrong answer exits 1.
  *
  * Rows:
- *   decode_width_500   decode + utf8_cell_width of 500 scalars
- *   grapheme_500       utf8_grapheme_next over the same windows
- *   cluster_500        utf8_cluster (length + width) over the same windows
+ *   decode_sum_500   decode 500 scalars and sum their values
+ *   grapheme_500       first_grapheme over the same windows
+ *   cluster_500        first_cluster (length + width) over the same windows
  *   step_<chain>       one utf8_grapheme_step call at UTF8_GRAPHEME_BUDGET from
  *                      the start of a pathological cluster (the UI-slice cost)
  *   step_<chain>_total the whole cluster across budgeted calls, as ns/byte:
@@ -17,7 +17,7 @@
  * the class per run of 1..40 scalars, the way text arrives in words; "iid"
  * windows draw it per scalar, an adversarial case for the branch predictor.
  * WINDOWS distinct windows are cycled so no single window is learned. */
-#include "utf8/utf8.h"
+#include "../tests/utf8_fixture.h"
 #include "os/os.h"
 #include "trace/trace.h"
 
@@ -81,13 +81,13 @@ static uint32_t pick(int iid, uint32_t *run_k, uint32_t *run_left)
     return 0x1F300 + r % 0x150;
 }
 
-static uint64_t decode_width(const uint8_t *p, size_t n)
+static uint64_t decode_sum(const uint8_t *p, size_t n)
 {
     uint64_t w = 0;
     size_t off = 0;
     for (int k = 0; k < SCALARS && off < n; k++) {
         utf8_step s = utf8_decode(p + off, n - off);
-        w += (uint64_t)utf8_cell_width(s.cp);
+        w += s.cp;
         off += s.len;
     }
     return w + off;
@@ -97,7 +97,7 @@ static uint64_t graphemes(const uint8_t *p, size_t n)
 {
     uint64_t c = 0;
     for (size_t off = 0; off < n; c++)
-        off += utf8_grapheme_next(p + off, n - off);
+        off += first_grapheme(p + off, n - off);
     return c;
 }
 
@@ -106,7 +106,7 @@ static uint64_t clusters(const uint8_t *p, size_t n)
     uint64_t c = 0;
     for (size_t off = 0; off < n;) {
         int w;
-        off += utf8_cluster(p + off, n - off, &w);
+        off += first_cluster(p + off, n - off, &w);
         c += (uint64_t)w;
     }
     return c;
@@ -124,14 +124,14 @@ static void run_mix(const char *mix, int iid, uint8_t *text, size_t *start)
     }
     start[WINDOWS] = n;
     printf("mix %s: %d windows x %d scalars, %.2f B/scalar\n", mix, WINDOWS, SCALARS, (double)n / (WINDOWS * SCALARS));
-    for (int w = 0; w < WINDOWS; w++) sink += decode_width(text + start[w], start[w + 1] - start[w]);   /* warm */
+    for (int w = 0; w < WINDOWS; w++) sink += decode_sum(text + start[w], start[w + 1] - start[w]);   /* warm */
 
     char name[64];
     for (int i = 0; i < SAMPLES; i++) {
         int w = i % WINDOWS;
-        TIME(i, sink += decode_width(text + start[w], start[w + 1] - start[w]));
+        TIME(i, sink += decode_sum(text + start[w], start[w + 1] - start[w]));
     }
-    snprintf(name, sizeof name, "decode_width_500_%s", mix);
+    snprintf(name, sizeof name, "decode_sum_500_%s", mix);
     report(name, SAMPLES, SCALARS, "scalar");
     for (int i = 0; i < SAMPLES; i++) {
         int w = i % WINDOWS;
@@ -175,14 +175,14 @@ static void step_rows(const char *chain, const uint8_t *b, size_t n)
     report(name, LONG_SAMPLES, (double)n, "byte");
     for (int i = 0; i < LONG_SAMPLES; i++) {
         size_t len = 0;
-        TIME(i, len = utf8_grapheme_next(b, n));
+        TIME(i, len = first_grapheme(b, n));
         wrong |= len != n;
     }
     snprintf(name, sizeof name, "step_%s_unbounded", chain);
     report(name, LONG_SAMPLES, (double)n, "byte");
 
     utf8_cseg c;
-    int w = 0, want = utf8_cluster_width(b, n);
+    int w = 0, want = first_cluster_width(b, n);
     for (int i = 0; i < SAMPLES; i++) {
         utf8_cseg_init(&c);
         TIME(i, sink += (uint64_t)utf8_cluster_step(&c, b, n, UTF8_GRAPHEME_BUDGET, 1, &used, &w) + used);
@@ -201,7 +201,7 @@ static void step_rows(const char *chain, const uint8_t *b, size_t n)
     snprintf(name, sizeof name, "cstep_%s_total", chain);
     report(name, LONG_SAMPLES, (double)n, "byte");
     for (int i = 0; i < LONG_SAMPLES; i++)
-        TIME(i, sink += (uint64_t)utf8_cluster_width(b, n));
+        TIME(i, sink += (uint64_t)first_cluster_width(b, n));
     snprintf(name, sizeof name, "cstep_%s_unbounded", chain);
     report(name, LONG_SAMPLES, (double)n, "byte");
 }
@@ -245,7 +245,7 @@ int main(void)
             puts("utf8_bench: chain buffer unavailable");
             return 0;
         }
-        wrong |= utf8_grapheme_next(b, n) != n;                /* one cluster */
+        wrong |= first_grapheme(b, n) != n;                /* one cluster */
         step_rows(L[i].name, b, n);
         free(b);
     }

@@ -12,12 +12,11 @@ extern void *__libc_realloc(void *, size_t);
  * An increment and end's exchange have a single modification order even when
  * an allocator on another thread races with the owner closing the window. */
 static _Atomic size_t guard_count = SIZE_MAX;
-static _Thread_local unsigned guard_exempt_depth;
 
 static void count_call(void)
 {
     size_t count = atomic_load_explicit(&guard_count, memory_order_relaxed);
-    if (count == SIZE_MAX || guard_exempt_depth) return;
+    if (count == SIZE_MAX) return;
     while (count < SIZE_MAX - 1 &&
            !atomic_compare_exchange_weak_explicit(&guard_count, &count, count + 1,
                                                   memory_order_relaxed, memory_order_relaxed)) {}
@@ -53,13 +52,9 @@ size_t base_malloc_guard_end(void)
     return atomic_exchange_explicit(&guard_count, SIZE_MAX, memory_order_relaxed);
 }
 
-void base_malloc_guard_exempt_begin(void) { guard_exempt_depth++; }
-void base_malloc_guard_exempt_end(void) { guard_exempt_depth--; }
 #else
 /* Sanitizer runtimes interpose the allocator themselves. */
 bool base_malloc_guard_active(void) { return false; }
 void base_malloc_guard_begin(void) {}
 size_t base_malloc_guard_end(void) { return 0; }
-void base_malloc_guard_exempt_begin(void) {}
-void base_malloc_guard_exempt_end(void) {}
 #endif

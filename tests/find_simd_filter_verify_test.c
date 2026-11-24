@@ -24,7 +24,7 @@ static bool word(uint8_t b)
 { return (lowercase(b)>='a' && lowercase(b)<='z') || (b>='0' && b<='9') || b=='_'; }
 
 static void naive(const uint8_t *h,size_t hn,const uint8_t *nd,size_t n,
-                  find_literal_options options,find_result *r)
+                  find_literal_options options,find_fixture_result *r)
 {
     r->total=0; r->stored=0;
     if (n==0) return;
@@ -36,22 +36,22 @@ static void naive(const uint8_t *h,size_t hn,const uint8_t *nd,size_t n,
             while (k<n && lowercase(h[i+k])==lowercase(nd[k])) k++;
         } else if (memcmp(h+i,nd,n)==0) k=n;
         if (k==n && boundary) {
-            if (r->stored<FIND_MAX_OFFSETS) r->offsets[r->stored++]=i;
+            if (r->stored<FIND_FIXTURE_OFFSETS) r->offsets[r->stored++]=i;
             r->total++; i+=n;
         } else i++;
     }
 }
-static int same(const find_result *a,const find_result *b)
+static int same(const find_fixture_result *a,const find_fixture_result *b)
 { return a->total==b->total && a->stored==b->stored && memcmp(a->offsets,b->offsets,a->stored*sizeof a->offsets[0])==0; }
 
-static find_result got, want;
+static find_fixture_result got, want;
 static int check_mode(const find_source *s,const uint8_t *h,size_t hn,const uint8_t *nd,size_t n,
                       find_literal_options options)
 {
     naive(h,hn,nd,n,options,&want);
     for (int mode=0;mode<2;mode++) {
-        find_code code=mode ? find_test_literal_two_way(s,nd,n,options,NULL,&got)
-                            : find_literal(s,nd,n,options,NULL,&got);
+        find_code code=mode ? find_fixture_literal_two_way(s,nd,n,options,NULL,&got)
+                            : find_fixture_literal(s,nd,n,options,NULL,&got);
         CHECK(code==FIND_OK);
         if (!same(&got,&want)) {
             fprintf(stderr,"mismatch mode=%d fold=%d word=%d hn=%zu n=%zu got=%llu want=%llu\n",
@@ -228,12 +228,12 @@ static int cancellation(void)
     CHECK(h&&nd); memset(h,'a',n); memset(nd,'a',n); nd[n-1]='b';
     atomic_bool flag; atomic_init(&flag,true);
     find_control c={0}; c.cancel=&flag;
-    find_source s={h,n,NULL}; find_result r;
-    CHECK(find_literal(&s,nd,n, (find_literal_options){0},&c,&r)==FIND_CANCELLED && r.total==0 && r.stored==0);
-    CHECK(find_test_literal_two_way(&s,nd,n, (find_literal_options){0},&c,&r)==FIND_CANCELLED);
+    find_source s={h,n,NULL}; find_fixture_result r;
+    CHECK(find_fixture_literal(&s,nd,n, (find_literal_options){0},&c,&r)==FIND_CANCELLED && r.total==0 && r.stored==0);
+    CHECK(find_fixture_literal_two_way(&s,nd,n, (find_literal_options){0},&c,&r)==FIND_CANCELLED);
     find_match m; CHECK(find_literal_next(&s,nd,n, (find_literal_options){0},0,&c,&m)==FIND_CANCELLED && !m.matched);
     atomic_store(&flag,false);
-    CHECK(find_literal(&s,nd,n, (find_literal_options){0},&c,&r)==FIND_OK && r.total==0);
+    CHECK(find_fixture_literal(&s,nd,n, (find_literal_options){0},&c,&r)==FIND_OK && r.total==0);
     free(h); free(nd); return 0;
 }
 static int vector_boundaries(void)

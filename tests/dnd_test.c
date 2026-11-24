@@ -285,7 +285,7 @@ int main(void)
                                         entry_limit, path_limit, storage_and_errors};
     int result = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        base_arena_reset(&arena);
+        base_arena_reset_to_mark(&arena, 0);
         if (cases[i](&arena)) { result = 1; break; }
     }
     base_arena_free(&arena);

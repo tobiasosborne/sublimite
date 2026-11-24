@@ -55,7 +55,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
             }
             break;
         case ARENA_RESET:
-            base_arena_reset(&arena);
+            base_arena_reset_to_mark(&arena, 0);
             used = 0;
             break;
         case POOL_GET: {
@@ -83,7 +83,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
         }
         size_t count = 0;
         for (unsigned j = 0; j < POOL_SLOTS; j++) count += live[j];
-        ASSERT(base_pool_count_live(&pool) == count);
+        ASSERT(pool.live == count);
         ASSERT(base_arena_mark(&arena) == used);
     }
 

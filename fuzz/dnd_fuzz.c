@@ -86,7 +86,7 @@ static void raw_bytes(const uint8_t *data, size_t size, base_arena *arena)
     size_t required = arena->used;
     size_t capacity = size ? data[0] % (required + 1u) : 0;
     size_t original = arena->size;
-    base_arena_reset(arena);
+    base_arena_reset_to_mark(arena, 0);
     arena->size = capacity;
     result = dnd_parse_uri_list(data, size, "thinkpad", arena, &request, &counts);
     if (capacity < required) {
@@ -135,7 +135,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* (P) IPC_MAX_PATHS retained entries, each including NUL in IPC_PATH_CAP. */
     if (base_arena_init(&arena, IPC_MAX_PATHS * IPC_PATH_CAP)) return 0;
     raw_bytes(data, size, &arena);
-    base_arena_reset(&arena);
+    base_arena_reset_to_mark(&arena, 0);
     encoded_bytes(data, size, &arena);
     base_arena_free(&arena);
     return 0;

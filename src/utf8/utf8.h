@@ -72,54 +72,16 @@ static inline utf8_step utf8_decode(const uint8_t *p, size_t n)
     return s;
 }
 
-/* Start offset of the unit that ends at off, consistent with forward
- * segmentation by utf8_decode (off must be a unit boundary of base[0..off)).
- * Reads only base[off-4 .. off-1]. off == 0 returns 0. */
-size_t utf8_prev(const uint8_t *base, size_t off);
-
 /* Encode a scalar into out; returns 1..4. Surrogates and cp > U+10FFFF encode
  * U+FFFD (EF BF BD). */
 size_t utf8_encode(uint32_t cp, uint8_t out[4]);
-
-/* Out-of-line table path of utf8_cell_width; same result for every cp. */
-int utf8_cell_width_table(uint32_t cp);
-
-/* Terminal cells for one scalar: 0 for Mn/Me/Mc/Cf, Default_Ignorable,
- * variation selectors and emoji skin-tone modifiers; 2 for East Asian
- * Wide/Fullwidth and Emoji_Presentation (zero wins where both apply); 1
- * otherwise, including controls and anything > U+10FFFF (the renderer draws
- * controls as placeholders). Below U+0300 the only table entry is U+00AD (Cf);
- * tests/utf8_test.c checks that and every code point. © U+00A9 and ® U+00AE
- * are Extended_Pictographic but not Emoji_Presentation: width 1 alone, 2 with
- * VS16 (utf8_cluster). Unassigned code points follow the same tables, not a
- * blanket 1: U+2FFFD (EAW=W) is 2 and U+E01F0 (Default_Ignorable) is 0. This
- * is the width of a scalar; invalid bytes are not scalars and need width 1
- * from the caller (utf8_cluster does it); clusters use utf8_cluster_width. */
-static inline int utf8_cell_width(uint32_t cp)
-{
-    if (cp < 0x300)
-        return cp != 0xAD;
-    return utf8_cell_width_table(cp);
-}
-
-/* Byte length of the extended grapheme cluster at p[0..n) per UAX #29
- * (Unicode 15.1) rules GB3..GB13 including GB9c (Indic conjuncts), with the
- * real Grapheme_Cluster_Break=Control table. An invalid byte is a one-byte
- * cluster and acts as Control to its neighbours (a break before and after it).
- * Returns 0 iff n == 0; otherwise 1..n and always a unit boundary. Passes all
- * 1187 cases of vendor/ucd/GraphemeBreakTest.txt (tests/utf8_test.c). Cost is
- * linear in the cluster length, which is unbounded (a base plus a million
- * marks is one cluster); UI-thread callers use utf8_grapheme_step. */
-size_t utf8_grapheme_next(const uint8_t *p, size_t n);
 
 /* Start of the grapheme cluster that contains byte off-1 of base[0..off),
  * segmenting forward from the nearest certain break (invalid byte, CR,
  * Control, or LF after a non-CR) at or before it, or from base[0]. When off
  * is a cluster boundary (the usual cursor-left case) this is the start of the
- * cluster ending at off, i.e. exactly the cluster utf8_grapheme_next would
- * have stepped over. off must be a unit boundary of base[0..off), and base[0]
- * a cluster start. Reads only base[0..off-1]. off == 0 returns 0. Unbounded
- * like utf8_grapheme_next. */
+ * cluster ending at off. off must be a unit boundary of base[0..off), and base[0]
+ * a cluster start. Reads only base[0..off-1]. off == 0 returns 0. Work is unbounded. */
 size_t utf8_grapheme_prev(const uint8_t *base, size_t off);
 
 /* ---- Resumable, budgeted segmentation ----
@@ -168,33 +130,6 @@ static inline void utf8_gseg_init(utf8_gseg *g) { memset(g, 0, sizeof *g); }
  * is its own cluster (fresh g) or ends the current one without being consumed. */
 int utf8_grapheme_step(utf8_gseg *g, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used);
 
-/* 1 iff UAX #29 puts a cluster break between units x and y (x directly
- * before y) for EVERY left context of x, so forward segmentation may start
- * at y with fresh state. Conservative: 0 when x is Prepend, Extend or ZWJ
- * (GB9b, GB9c, GB11 context), x and y are both RI (GB12/13), the pair is
- * CR LF, y is Extend/ZWJ/SpacingMark, or a Hangul GB6-8 pair. Invalid units
- * act as Control (a break on both sides), as in utf8_grapheme_next. */
-int utf8_break_certain(utf8_step x, utf8_step y);
-
-/* Terminal cells of the first cluster of p[0..n), and its byte length
- * (== utf8_grapheme_next). Rule (layout uses this, not a sum of scalar widths):
- *   - invalid byte, CR, LF, Control (incl. tab): 1 (the renderer draws a
- *     placeholder; tab stops are the layout's business);
- *   - otherwise take the first scalar with utf8_cell_width > 0 (so Prepend,
- *     Cf and marks in front of a base are skipped); none: 0;
- *   - if that scalar is Hangul (L, V, T, LV, LVT) the cluster is 2, however
- *     many jamo follow (an orphan V or T block is also 2);
- *   - if the base has width 1 and is Extended_Pictographic (© and ® included)
- *     and the cluster contains VS16 (U+FE0F) or a ZWJ followed by an
- *     Extended_Pictographic scalar, or the base is [0-9#*] and the cluster
- *     contains U+20E3: 2;
- *   - else the base width (flags, modifier sequences: the base's 2).
- * VS15 (U+FE0E) does not narrow a wide base. Always 0..2. */
-size_t utf8_cluster(const uint8_t *p, size_t n, int *width);
-
-/* Width part of utf8_cluster for the cluster at p[0..n). */
-int utf8_cluster_width(const uint8_t *p, size_t n);
-
 /* Unshaped artwork key for one already segmented cluster. Copy to out,
  * omitting U+200D, U+FE0E/U+FE0F and U+1F3FB..U+1F3FF. If the first
  * nonzero-width scalar is Extended_Pictographic, stop at its first ZWJ so
@@ -223,18 +158,7 @@ int utf8_emoji_class(uint32_t cp);   /* PICT, RI or 0 */
  * a GSUB ligature before applying utf8_artwork_step itself. */
 int utf8_cluster_emoji(const uint8_t *p, size_t len);
 
-/* ---- Budgeted cluster + width ----
- * utf8_cluster / utf8_cluster_width are unbounded (they run utf8_grapheme_next
- * and then a linear width scan), so layout on a UI slice uses this: the
- * grapheme step API with the cluster-width rule folded in, consuming the span
- * each call completes. The width is decided from the first scalar with a
- * nonzero width and then only the VS16 / ZWJ+ExtPict / keycap followers
- * matter; once the answer cannot change the rest of the cluster is segmented
- * but not scanned. Result identical to utf8_cluster on completion for every
- * budget and every chunking (tests and fuzz check it).
- * Usage as utf8_grapheme_step: init once, call at p + len until UTF8_G_END
- * (refill on UTF8_G_MORE); *width is written only on UTF8_G_END.
- * Fields are private; invariants in docs/decisions/v2-0fv.11.md. */
+/* Zero-initialize once per cluster. Fields are private. */
 typedef struct {
     utf8_gseg seg;
     uint8_t phase;      /* width automaton: seek base / base waits for a follower / decided */
@@ -242,8 +166,20 @@ typedef struct {
 
 static inline void utf8_cseg_init(utf8_cseg *c) { memset(c, 0, sizeof *c); }
 
-/* Like utf8_grapheme_step (same budget, eof and *used contract) and, on
- * UTF8_G_END, *width = the cluster width, 0..2, as utf8_cluster reports it. */
+/* Like utf8_grapheme_step. On UTF8_G_END, *width is the terminal cell count
+ * of the cluster. The width rule uses the cluster as a whole:
+ *   - invalid byte, CR, LF, Control (incl. tab): 1 (the renderer draws a
+ *     placeholder; tab stops are the layout's business);
+ *   - otherwise take the first scalar with positive cell width (so Prepend,
+ *     Cf and marks in front of a base are skipped); none: 0;
+ *   - if that scalar is Hangul (L, V, T, LV, LVT) the cluster is 2, however
+ *     many jamo follow (an orphan V or T block is also 2);
+ *   - if the base has width 1 and is Extended_Pictographic (© and ® included)
+ *     and the cluster contains VS16 (U+FE0F) or a ZWJ followed by an
+ *     Extended_Pictographic scalar, or the base is [0-9#*] and the cluster
+ *     contains U+20E3: 2;
+ *   - else the base width (flags, modifier sequences: the base's 2).
+ * VS15 (U+FE0E) does not narrow a wide base. Always 0..2. */
 int utf8_cluster_step(utf8_cseg *c, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used, int *width);
 
 #endif

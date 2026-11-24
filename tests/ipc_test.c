@@ -65,19 +65,19 @@ static void parser(const char *dir)
 static void wire_tests(void)
 {
     uint8_t wire[8192]; size_t n=0; ipc_request r=request(true,true), out={0};
-    ASSERT(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
-    ASSERT(ipc_wire_decode(wire,n,&out)==IPC_OK && out.wait && out.has_stdin && out.stdin_size==5);
-    for(size_t i=0;i<n;i++) ASSERT(ipc_wire_decode(wire,i,&out)==IPC_PROTOCOL);
-    wire[n]=0; ASSERT(ipc_wire_decode(wire,n+1,&out)==IPC_PROTOCOL);
-    wire[0]^=1u; ASSERT(ipc_wire_decode(wire,n,&out)==IPC_PROTOCOL);
+    ASSERT(ipc_test_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
+    ASSERT(ipc_test_wire_decode(wire,n,&out)==IPC_OK && out.wait && out.has_stdin && out.stdin_size==5);
+    for(size_t i=0;i<n;i++) ASSERT(ipc_test_wire_decode(wire,i,&out)==IPC_PROTOCOL);
+    wire[n]=0; ASSERT(ipc_test_wire_decode(wire,n+1,&out)==IPC_PROTOCOL);
+    wire[0]^=1u; ASSERT(ipc_test_wire_decode(wire,n,&out)==IPC_PROTOCOL);
 }
 static void roundtrip(const char *dir, bool wait, bool input)
 {
-    ipc_server s={0}; ipc_result init_rc=ipc_server_init(&s,dir);
+    ipc_server s={0}; ipc_result init_rc=ipc_server_init_display(&s,dir,NULL);
     if(init_rc!=IPC_OK) fprintf(stderr,"init rc=%d errno=%d (%s)\n",(int)init_rc,errno,strerror(errno));
     ASSERT(init_rc==IPC_OK);
     pid_t child=fork(); ASSERT(child>=0);
-    if(child==0) { ipc_request r=request(wait,input); ipc_result rc=ipc_client_send(dir,&r,CLIENT_TIMEOUT_MS);
+    if(child==0) { ipc_request r=request(wait,input); ipc_result rc=ipc_client_send_display(dir,NULL,&r,CLIENT_TIMEOUT_MS);
         if(rc!=IPC_OK) fprintf(stderr,"roundtrip: ipc_result=%d expected=%d\n",(int)rc,(int)IPC_OK);
         _exit(rc==IPC_OK?0:2); }
     capture c={0};
@@ -114,10 +114,10 @@ static void drain_ready(ipc_server *s, capture *c)
 }
 static void fragmented(const char *dir)
 {
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_OK); capture c={0};
-    ipc_server other={0}; ASSERT(ipc_server_init(&other,dir)==IPC_EXISTS);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_OK); capture c={0};
+    ipc_server other={0}; ASSERT(ipc_server_init_display(&other,dir,NULL)==IPC_EXISTS);
     int fd=raw_connect(dir); uint8_t bytes[8192], response[8]; size_t n=0; ipc_request r=request(false,true);
-    ASSERT(ipc_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
+    ASSERT(ipc_test_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
     ASSERT(write(fd,bytes,7)==7); drain_ready(&s,&c); ASSERT(c.calls==0);
     ASSERT(write(fd,bytes+7,17)==17); drain_ready(&s,&c); ASSERT(c.calls==0);
     ASSERT(write(fd,bytes+24,n-24)==(ssize_t)(n-24)); drain_ready(&s,&c); ASSERT(c.calls==1);
@@ -131,9 +131,9 @@ static void fragmented(const char *dir)
 
 static void wait_tokens(const char *dir)
 {
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_OK); capture c={0};
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_OK); capture c={0};
     int fds[2]; ipc_token tokens[2]; uint8_t bytes[8192], response[8]; size_t n=0;
-    ipc_request r=request(true,false); ASSERT(ipc_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
+    ipc_request r=request(true,false); ASSERT(ipc_test_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
     for(size_t i=0;i<2;i++) {
         fds[i]=raw_connect(dir); ASSERT(write(fds[i],bytes,n)==(ssize_t)n);
         drain_ready(&s,&c); tokens[i]=c.token;
@@ -153,13 +153,13 @@ static void endpoint_validation(const char *dir)
 {
     char path[IPC_PATH_CAP]; ASSERT(snprintf(path,sizeof path,"%s/" EDIT_APP_ID "-%lu.sock",dir,(unsigned long)getuid())>0);
     int fd=open(path,O_CREAT|O_WRONLY,0600); ASSERT(fd>=0); close(fd);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_INVALID); struct stat st; ASSERT(stat(path,&st)==0 && S_ISREG(st.st_mode)); ASSERT(unlink(path)==0);
-    ASSERT(chmod(dir,0755)==0); ASSERT(ipc_server_init(&s,dir)==IPC_INVALID); ASSERT(chmod(dir,0700)==0);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_INVALID); struct stat st; ASSERT(stat(path,&st)==0 && S_ISREG(st.st_mode)); ASSERT(unlink(path)==0);
+    ASSERT(chmod(dir,0755)==0); ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_INVALID); ASSERT(chmod(dir,0700)==0);
     ASSERT(unsetenv("XDG_RUNTIME_DIR")==0);
     /* v1's test hook is inert in v2: the abstract name is ipc's derivation
      * plus only the seam's tail (v2-0fv.20). */
     ASSERT(setenv("EDIT_IPC_NAMESPACE","stale-hook",1)==0);
-    ASSERT(ipc_server_init(&s,NULL)==IPC_OK);
+    ASSERT(ipc_server_init_display(&s,NULL,NULL)==IPC_OK);
     char saved[sizeof ipc_seam_namespace], name[108];
     ASSERT(snprintf(saved,sizeof saved,"%s",ipc_seam_namespace)>0);
     int n=snprintf(name,sizeof name,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),saved);
@@ -168,13 +168,13 @@ static void endpoint_validation(const char *dir)
     ASSERT(getsockname(os_listener_fd(&s.listener),(struct sockaddr *)&bound,&len)==0);
     ASSERT(bound.sun_path[0]=='\0' && len==offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n);
     ASSERT(memcmp(bound.sun_path+1,name,(size_t)n)==0);
-    ipc_server other={0}; ASSERT(ipc_server_init(&other,NULL)==IPC_EXISTS);
+    ipc_server other={0}; ASSERT(ipc_server_init_display(&other,NULL,NULL)==IPC_EXISTS);
     ASSERT(unsetenv("EDIT_IPC_NAMESPACE")==0);
     n=snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s-o",saved);
     ASSERT(n>0 && (size_t)n<sizeof ipc_seam_namespace);
     roundtrip(NULL,false,true); /* Independent abstract server AND client. */
     ASSERT(snprintf(ipc_seam_namespace,sizeof ipc_seam_namespace,"%s",saved)>0);
-    ASSERT(ipc_server_init(&other,NULL)==IPC_EXISTS); ipc_server_fini(&s);
+    ASSERT(ipc_server_init_display(&other,NULL,NULL)==IPC_EXISTS); ipc_server_fini(&s);
     ASSERT(setenv("XDG_RUNTIME_DIR",dir,1)==0);
 }
 
@@ -190,7 +190,7 @@ static ipc_result close_now(const ipc_request *r, ipc_token token, void *ctx)
 }
 static void callback_results(const char *dir, bool reject)
 {
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_OK);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_OK);
     callback_state state={&s,0};
     /* Accept a partial request before releasing the real client. A token is
      * assigned on accept, so it cannot prove the callback has sent an ACK. */
@@ -199,7 +199,7 @@ static void callback_results(const char *dir, bool reject)
     pid_t child=fork(); ASSERT(child>=0);
     if(child==0) { close(pending); close(start[1]); char b;
         ASSERT(read(start[0],&b,1)==1); close(start[0]);
-        ipc_request r=request(true,false); ipc_result rc=ipc_client_send(dir,&r,CLIENT_TIMEOUT_MS);
+        ipc_request r=request(true,false); ipc_result rc=ipc_client_send_display(dir,NULL,&r,CLIENT_TIMEOUT_MS);
         ipc_result expected=reject?IPC_REJECTED:IPC_OK;
         if(rc!=expected) fprintf(stderr,"callback_results: reject=%d ipc_result=%d expected=%d (IPC_TIMEOUT=%d)\n",reject,(int)rc,(int)expected,(int)IPC_TIMEOUT);
         _exit(rc==expected?0:2); }
@@ -223,7 +223,7 @@ static void stale(const char *dir)
     char leaf[64]; ASSERT(snprintf(leaf,sizeof leaf,EDIT_APP_ID "-%lu.sock",(unsigned long)getuid())>0);
     struct sockaddr_un a; int dfd; fs_addr(&a,dir,leaf,&dfd);
     int fd=socket(AF_UNIX,SOCK_STREAM,0); ASSERT(fd>=0); ASSERT(bind(fd,(struct sockaddr *)&a,sizeof a)==0); close(dfd); close(fd);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_OK); ipc_server_fini(&s);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_OK); ipc_server_fini(&s);
 }
 static void race(const char *dir)
 {
@@ -231,7 +231,7 @@ static void race(const char *dir)
     pid_t children[2];
     for(size_t i=0;i<2;i++) { children[i]=fork(); ASSERT(children[i]>=0); if(children[i]==0) {
         close(start[1]); close(result[0]); close(finish[1]); char b; if(read(start[0],&b,1)!=1) _exit(3);
-        ipc_server s={0}; ipc_result rc=ipc_server_init(&s,dir); b=rc==IPC_OK?'S':rc==IPC_EXISTS?'C':'E';
+        ipc_server s={0}; ipc_result rc=ipc_server_init_display(&s,dir,NULL); b=rc==IPC_OK?'S':rc==IPC_EXISTS?'C':'E';
         if(write(result[1],&b,1)!=1) _exit(3);
         if(read(finish[0],&b,1)!=1) _exit(3);
         if(rc==IPC_OK) ipc_server_fini(&s);
@@ -285,7 +285,7 @@ static int pump(ipc_server *s, ipc_open_callback cb, void *ctx, int timeout_ms)
 static pid_t spawn_client(const char *runtime, bool wait, ipc_result expected)
 {
     pid_t child=fork(); ASSERT(child>=0);
-    if(child==0) { ipc_request r=request(wait,false); ipc_result rc=ipc_client_send(runtime,&r,CLIENT_TIMEOUT_MS);
+    if(child==0) { ipc_request r=request(wait,false); ipc_result rc=ipc_client_send_display(runtime,NULL,&r,CLIENT_TIMEOUT_MS);
         if(rc!=expected) fprintf(stderr,"client: ipc_result=%d expected=%d\n",(int)rc,(int)expected);
         _exit(rc==expected?0:2); }
     return child;
@@ -293,14 +293,6 @@ static pid_t spawn_client(const char *runtime, bool wait, ipc_result expected)
 static void reap_ok(pid_t child)
 {
     int status; ASSERT(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
-}
-static void t_result_text(void)
-{
-    ASSERT(strcmp(ipc_result_string(IPC_REJECTED), "running instance rejected the open request") == 0);
-    ASSERT(strcmp(ipc_result_string(IPC_LIMIT), "request or editor capacity limit exceeded") == 0);
-    ASSERT(strcmp(ipc_result_string(IPC_BUSY), "running instance is busy") == 0);
-    for (ipc_result rc = IPC_OK; rc <= IPC_REJECTED; rc++) ASSERT(*ipc_result_string(rc));
-    puts("ipc_test: descriptive IPC result text passed");
 }
 static void serve_one(ipc_server *s, capture *c)
 {
@@ -314,8 +306,8 @@ static void t_wire_alias(const char *dir)
 {
     (void)dir;
     ipc_request src=request(true,true); uint8_t a[256], b[256]; size_t na=0, nb=0; ipc_request d={0};
-    ASSERT(ipc_wire_encode(&src,a,sizeof a,&na)==IPC_OK && ipc_wire_decode(a,na,&d)==IPC_OK);
-    ASSERT(ipc_wire_encode(&d,b,sizeof b,&nb)==IPC_OK && nb==na && memcmp(a,b,na)==0);
+    ASSERT(ipc_test_wire_encode(&src,a,sizeof a,&na)==IPC_OK && ipc_test_wire_decode(a,na,&d)==IPC_OK);
+    ASSERT(ipc_test_wire_encode(&d,b,sizeof b,&nb)==IPC_OK && nb==na && memcmp(a,b,na)==0);
 }
 
 /* 17: table-driven wire validation with required results. */
@@ -323,7 +315,7 @@ static void t_wire_table(const char *dir)
 {
     (void)dir;
     static uint8_t good[8192], mut[8192]; size_t n=0; ipc_request r=request(true,true), out;
-    ASSERT(ipc_wire_encode(&r,good,sizeof good,&n)==IPC_OK);
+    ASSERT(ipc_test_wire_encode(&r,good,sizeof good,&n)==IPC_OK);
     static const uint8_t expect[]={'E','D','I','P',1,3,0,0, 0,0,0,0, 1,0,0,0, 5,0,0,0, 5,0,0,0,
         '/','t','m','p',0, 13,0,0,0, 12,0,0,0, 3,0,0,0, '/','t','m','p','/','e','x','a','m','p','l','e',0, 'a',0,'b','\n','c'};
     ASSERT(n==sizeof expect); uint8_t exp2[sizeof expect]; memcpy(exp2,expect,n); exp2[8]=(uint8_t)n;
@@ -338,22 +330,22 @@ static void t_wire_table(const char *dir)
         {"path-relative",41,'x'},{"path-nul-inside",44,0},{"path-no-nul",53,'x'},{"path-len-hi",30,1}};
     for(size_t i=0;i<sizeof t/sizeof t[0];i++) {
         memcpy(mut,good,n); mut[t[i].at]=t[i].val; memset(&out,0xFF,sizeof out);
-        ipc_result rc=ipc_wire_decode(mut,n,&out);
+        ipc_result rc=ipc_test_wire_decode(mut,n,&out);
         if(rc!=IPC_PROTOCOL) fprintf(stderr,"table %s: rc=%d\n",t[i].name,(int)rc);
         ASSERT(rc==IPC_PROTOCOL);
         ASSERT(out.count==0 && out.cwd==NULL && out.stdin_data==NULL && out.stdin_size==0 && !out.wait && !out.has_stdin);
     }
     /* header-only frames: valid empty request, and truncated variants */
     uint8_t h[24+2]; memset(h,0,sizeof h); memcpy(h,"EDIP",4); h[4]=1; h[8]=26; h[16]=2; h[24]='/'; h[25]=0;
-    memset(&out,0xFF,sizeof out); ASSERT(ipc_wire_decode(h,26,&out)==IPC_OK && out.count==0 && !out.wait);
+    memset(&out,0xFF,sizeof out); ASSERT(ipc_test_wire_decode(h,26,&out)==IPC_OK && out.count==0 && !out.wait);
     static uint8_t big[IPC_MAX_WIRE+1];
-    ASSERT(ipc_wire_decode(big,sizeof big,&out)==IPC_PROTOCOL);
+    ASSERT(ipc_test_wire_decode(big,sizeof big,&out)==IPC_PROTOCOL);
     /* maximum frame round trips exactly; one more byte is IPC_LIMIT */
     static uint8_t maxw[IPC_MAX_WIRE]; static uint8_t payload[IPC_MAX_WIRE];
     ipc_request m=request(false,true); m.stdin_data=payload; m.stdin_size=IPC_MAX_WIRE-54u;
-    size_t mn=0; ASSERT(ipc_wire_encode(&m,maxw,sizeof maxw,&mn)==IPC_OK && mn==IPC_MAX_WIRE);
-    ASSERT(ipc_wire_decode(maxw,mn,&out)==IPC_OK && out.stdin_size==IPC_MAX_WIRE-54u);
-    m.stdin_size++; ASSERT(ipc_wire_encode(&m,maxw,sizeof maxw,&mn)==IPC_LIMIT && mn==0);
+    size_t mn=0; ASSERT(ipc_test_wire_encode(&m,maxw,sizeof maxw,&mn)==IPC_OK && mn==IPC_MAX_WIRE);
+    ASSERT(ipc_test_wire_decode(maxw,mn,&out)==IPC_OK && out.stdin_size==IPC_MAX_WIRE-54u);
+    m.stdin_size++; ASSERT(ipc_test_wire_encode(&m,maxw,sizeof maxw,&mn)==IPC_LIMIT && mn==0);
 }
 
 /* 3, 4: pathname semantics and literal-name precedence. */
@@ -388,7 +380,7 @@ static void t_runtime_swap(const char *dir)
     subdir(dir,"rt",rt); ASSERT(snprintf(moved,sizeof moved,"%s/rt-moved",dir)>0);
     ASSERT(snprintf(victim,sizeof victim,"%s/victim",dir)>0);
     int vf=open(victim,O_CREAT|O_WRONLY,0644); ASSERT(vf>=0); close(vf); ASSERT(chmod(victim,0644)==0);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,rt)==IPC_OK);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK);
     struct stat st; sock_path(rt,sock); ASSERT(lstat(sock,&st)==0 && S_ISSOCK(st.st_mode) && (st.st_mode&0777)==0600);
     ASSERT(rename(rt,moved)==0); ASSERT(mkdir(rt,0700)==0);
     ASSERT(symlink(victim,sock)==0); /* decoy: a symlink sitting where the socket used to be */
@@ -399,7 +391,7 @@ static void t_runtime_swap(const char *dir)
     ASSERT(stat(victim,&st)==0 && (st.st_mode&0777)==0644);
     /* a symlink planted at the socket name is never chmod'ed or followed */
     ASSERT(unlink(sock)==0); ASSERT(symlink(victim,sock)==0);
-    ASSERT(ipc_server_init(&s,rt)==IPC_INVALID); ASSERT(stat(victim,&st)==0 && (st.st_mode&0777)==0644);
+    ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_INVALID); ASSERT(stat(victim,&st)==0 && (st.st_mode&0777)==0644);
     rm_rf(rt); rm_rf(moved); ASSERT(unlink(victim)==0);
 }
 
@@ -407,8 +399,8 @@ static void t_runtime_swap(const char *dir)
 static void t_drain_budget(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"budget",rt);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,rt)==IPC_OK); capture c={0};
-    uint8_t frame[256]; size_t n=0; ipc_request r=request(false,false); ASSERT(ipc_wire_encode(&r,frame,sizeof frame,&n)==IPC_OK);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); capture c={0};
+    uint8_t frame[256]; size_t n=0; ipc_request r=request(false,false); ASSERT(ipc_test_wire_encode(&r,frame,sizeof frame,&n)==IPC_OK);
     int fds[24];
     for(size_t i=0;i<24;i++) { fds[i]=raw_connect(rt); ASSERT(write(fds[i],frame,n)==(ssize_t)n); }
     usleep(20000);
@@ -422,7 +414,7 @@ static void t_drain_budget(const char *dir)
     /* byte budget: 8 near-complete 60 KB frames */
     static uint8_t body[60000]; memset(body,'x',sizeof body);
     ipc_request big=request(false,true); big.stdin_data=body; big.stdin_size=sizeof body;
-    static uint8_t wire[IPC_RX_SMALL_SIZE]; ASSERT(ipc_wire_encode(&big,wire,sizeof wire,&n)==IPC_OK);
+    static uint8_t wire[IPC_RX_SMALL_SIZE]; ASSERT(ipc_test_wire_encode(&big,wire,sizeof wire,&n)==IPC_OK);
     c.calls=0; int bf[8];
     for(size_t i=0;i<8;i++) { bf[i]=raw_connect(rt); ASSERT(write(bf[i],wire,n-1)==(ssize_t)(n-1)); }
     usleep(20000);
@@ -449,7 +441,7 @@ static void t_slot_exhaust(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"slots",rt); int fds[IPC_MAX_CLIENTS]; capture c={0};
     /* A: absolute pre-ACK deadline; the timer wakes the epoll fd by itself */
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,rt)==IPC_OK); s.request_deadline_ms=200; s.evict_idle_ms=600000;
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); s.request_deadline_ms=200; s.evict_idle_ms=600000;
     silent_fill(&s,rt,fds);
     int woke=pump(&s,count_only,&c,3000);
     if(woke==0) fprintf(stderr,"deadline timer never woke the loop\n");
@@ -461,7 +453,7 @@ static void t_slot_exhaust(const char *dir)
     pid_t ch=spawn_client(rt,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
     ipc_server_fini(&s);
     /* B: pressure eviction of the longest-idle incomplete client */
-    ASSERT(ipc_server_init(&s,rt)==IPC_OK); s.request_deadline_ms=600000; s.evict_idle_ms=100; c.calls=0;
+    ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); s.request_deadline_ms=600000; s.evict_idle_ms=100; c.calls=0;
     silent_fill(&s,rt,fds); usleep(150000);
     ch=spawn_client(rt,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
     for(size_t i=0;i<IPC_MAX_CLIENTS;i++) close(fds[i]);
@@ -472,19 +464,19 @@ static void t_slot_exhaust(const char *dir)
 static void t_lock_timeout(const char *dir)
 {
     char rt[IPC_PATH_CAP], lp[IPC_PATH_CAP], sp[IPC_PATH_CAP]; subdir(dir,"lock",rt); lock_path(rt,lp); sock_path(rt,sp);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,rt)==IPC_OK); ipc_server_fini(&s);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); ipc_server_fini(&s);
     alarm(15);
     int hold=open(lp,O_RDWR|O_CLOEXEC); ASSERT(hold>=0); ASSERT(flock(hold,LOCK_EX)==0);
-    uint64_t t0=now_ms(); ipc_result rc=ipc_server_init(&s,rt); uint64_t dt=now_ms()-t0;
+    uint64_t t0=now_ms(); ipc_result rc=ipc_server_init_display(&s,rt,NULL); uint64_t dt=now_ms()-t0;
     if(rc!=IPC_TIMEOUT) fprintf(stderr,"init under held lock: rc=%d after %llu ms\n",(int)rc,(unsigned long long)dt);
     ASSERT(rc==IPC_TIMEOUT && dt<IPC_LOCK_TIMEOUT_MS+1500u);
     ASSERT(flock(hold,LOCK_UN)==0);
-    ASSERT(ipc_server_init(&s,rt)==IPC_OK);
+    ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK);
     ASSERT(flock(hold,LOCK_EX)==0);
     t0=now_ms(); ipc_server_fini(&s); dt=now_ms()-t0; ASSERT(dt<IPC_LOCK_TIMEOUT_MS+1500u);
     struct stat st; ASSERT(lstat(sp,&st)==0 && S_ISSOCK(st.st_mode)); /* ownership preserved, not unlinked blind */
     ASSERT(flock(hold,LOCK_UN)==0); close(hold);
-    ASSERT(ipc_server_init(&s,rt)==IPC_OK); ipc_server_fini(&s); /* stale socket recovered */
+    ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); ipc_server_fini(&s); /* stale socket recovered */
     ASSERT(lstat(sp,&st)!=0);
     alarm(120); rm_rf(rt);
 }
@@ -501,14 +493,14 @@ static void t_foreign_cred(const char *dir)
     char stale[IPC_PATH_CAP]; subdir(dir,"cred-stale",stale); ASSERT(setenv("EDIT_IPC_FALLBACK_DIR",stale,1)==0);
     ipc_request r=request(false,false); capture c={0};
     /* client refuses a server whose credentials are foreign */
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,NULL)==IPC_OK);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,NULL,NULL)==IPC_OK);
     ipc_seam_foreign_abstract=true;
-    ipc_result rc=ipc_client_send(NULL,&r,1000);
+    ipc_result rc=ipc_client_send_display(NULL,NULL,&r,1000);
     if(rc!=IPC_REJECTED) fprintf(stderr,"client foreign-server rc=%d\n",(int)rc);
     ASSERT(rc==IPC_REJECTED);
     /* server refuses a foreign client: connection dropped, callback never runs */
     pid_t ch=fork(); ASSERT(ch>=0);
-    if(ch==0) { ipc_seam_foreign_abstract=false; ipc_result x=ipc_client_send(NULL,&r,5000); _exit(x==IPC_IO?0:2); }
+    if(ch==0) { ipc_seam_foreign_abstract=false; ipc_result x=ipc_client_send_display(NULL,NULL,&r,5000); _exit(x==IPC_IO?0:2); }
     for(int i=0;i<10;i++) { int st; if(waitpid(ch,&st,WNOHANG)==ch) { ASSERT(WIFEXITED(st) && WEXITSTATUS(st)==0); ch=-1; break; } (void)pump(&s,count_only,&c,200); }
     ASSERT(ch==-1 && c.calls==0);
     ipc_server_fini(&s);
@@ -517,12 +509,12 @@ static void t_foreign_cred(const char *dir)
     n=snprintf(a.sun_path+1,sizeof a.sun_path-1,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),ipc_seam_namespace); ASSERT(n>0);
     int squat=socket(AF_UNIX,SOCK_STREAM,0); ASSERT(squat>=0);
     ASSERT(bind(squat,(struct sockaddr *)&a,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)n))==0 && listen(squat,4)==0);
-    rc=ipc_server_init(&s,NULL);
+    rc=ipc_server_init_display(&s,NULL,NULL);
     if(rc!=IPC_OK) fprintf(stderr,"init with squatted abstract name: rc=%d\n",(int)rc);
     ASSERT(rc==IPC_OK);
     char sp[IPC_PATH_CAP]; sock_path(rt,sp); struct stat st; ASSERT(lstat(sp,&st)==0 && S_ISSOCK(st.st_mode));
     sock_path(stale,sp); ASSERT(lstat(sp,&st)!=0 && errno==ENOENT);
-    ipc_server other={0}; ASSERT(ipc_server_init(&other,NULL)==IPC_EXISTS);
+    ipc_server other={0}; ASSERT(ipc_server_init_display(&other,NULL,NULL)==IPC_EXISTS);
     ch=spawn_client(NULL,false,IPC_OK); serve_one(&s,&c); reap_ok(ch);
     ipc_server_fini(&s); close(squat);
     ipc_seam_foreign_abstract=false; ipc_seam_fallback[0]='\0'; ASSERT(unsetenv("EDIT_IPC_FALLBACK_DIR")==0);
@@ -535,7 +527,7 @@ static void t_foreign_cred(const char *dir)
 static void t_memory(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"mem",rt);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,rt)==IPC_OK); capture c={0};
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); capture c={0};
     if(s.arena.size>4u*1024u*1024u) fprintf(stderr,"ipc arena is %zu bytes\n",s.arena.size);
     ASSERT(s.arena.size<=4u*1024u*1024u);
     uint8_t hdr[24]; memset(hdr,0,sizeof hdr); memcpy(hdr,"EDIP",4); hdr[4]=1; hdr[10]=0x10; /* total = 1 MiB */
@@ -556,8 +548,8 @@ static void t_memory(const char *dir)
 static void t_wait_disconnect(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"waitdrop",rt);
-    ipc_server s={0}; ASSERT(ipc_server_init(&s,rt)==IPC_OK); capture c={0};
-    uint8_t bytes[256], reply[8]; size_t n=0; ipc_request r=request(true,false); ASSERT(ipc_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
+    ipc_server s={0}; ASSERT(ipc_server_init_display(&s,rt,NULL)==IPC_OK); capture c={0};
+    uint8_t bytes[256], reply[8]; size_t n=0; ipc_request r=request(true,false); ASSERT(ipc_test_wire_encode(&r,bytes,sizeof bytes,&n)==IPC_OK);
     for(int k=0;k<100;k++) {
         int fd=raw_connect(rt); ASSERT(write(fd,bytes,n)==(ssize_t)n);
         size_t want=c.calls+1; for(int i=0;i<40 && c.calls<want;i++) (void)pump(&s,count_only,&c,200);
@@ -594,7 +586,7 @@ static void t_launcher(const char *dir)
 {
     char rt[IPC_PATH_CAP]; subdir(dir,"launch",rt);
     for(int isolated=0;isolated<2;isolated++) {
-        ipc_server s={0}; ipc_result rc=isolated?ipc_server_init_isolated(&s):ipc_server_init(&s,rt); ASSERT(rc==IPC_OK);
+        ipc_server s={0}; ipc_result rc=isolated?ipc_server_init_isolated(&s):ipc_server_init_display(&s,rt,NULL); ASSERT(rc==IPC_OK);
         if(isolated) { char sp[IPC_PATH_CAP]; struct stat st; sock_path(rt,sp); ASSERT(os_listener_fd(&s.listener)<0 && !s.owns_path && lstat(sp,&st)!=0); }
         int fds[2]; pid_t ch=launcher_child(fds,IPC_OK); ipc_token t=0;
         ASSERT(ipc_server_adopt_wait(&s,fds[0],&t)==IPC_OK && t!=0 && ipc_server_token_live(&s,t));
@@ -678,36 +670,36 @@ static void t_activation(const char *dir)
 {
     uint8_t wire[8192]; size_t n=0; ipc_request r=request(false,true), out={0};
     /* Absent fields: byte-identical to the previous format. */
-    ASSERT(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK && legacy_accepts(wire,n) && !(wire[5]&4u));
-    ASSERT(ipc_wire_decode(wire,n,&out)==IPC_OK && out.activation_token==NULL && out.startup_id==NULL);
+    ASSERT(ipc_test_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK && legacy_accepts(wire,n) && !(wire[5]&4u));
+    ASSERT(ipc_test_wire_decode(wire,n,&out)==IPC_OK && out.activation_token==NULL && out.startup_id==NULL);
     /* Both, token only, startup id only: exact round trip. */
     const struct { const char *token,*startup; } cases[]={{ACT_TOKEN,ACT_STARTUP},{ACT_TOKEN,NULL},{NULL,ACT_STARTUP},{"",""}};
     for(size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
         r.activation_token=cases[i].token; r.startup_id=cases[i].startup;
         bool any=(cases[i].token&&cases[i].token[0])||(cases[i].startup&&cases[i].startup[0]);
-        ASSERT(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
+        ASSERT(ipc_test_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
         ASSERT(((wire[5]&4u)!=0)==any && legacy_accepts(wire,n)==!any);
-        ipc_request d={0}; ASSERT(ipc_wire_decode(wire,n,&d)==IPC_OK);
+        ipc_request d={0}; ASSERT(ipc_test_wire_decode(wire,n,&d)==IPC_OK);
         ASSERT(d.has_stdin && d.stdin_size==5 && memcmp(d.stdin_data,"a\0b\nc",5)==0 && d.count==1);
         ASSERT(any ? (cases[i].token&&cases[i].token[0] ? d.activation_token&&strcmp(d.activation_token,cases[i].token)==0 : d.activation_token==NULL) : d.activation_token==NULL);
         ASSERT(any ? (cases[i].startup&&cases[i].startup[0] ? d.startup_id&&strcmp(d.startup_id,cases[i].startup)==0 : d.startup_id==NULL) : d.startup_id==NULL);
-        for(size_t k=0;k<n;k++) ASSERT(ipc_wire_decode(wire,k,&d)==IPC_PROTOCOL); /* every truncation */
+        for(size_t k=0;k<n;k++) ASSERT(ipc_test_wire_decode(wire,k,&d)==IPC_PROTOCOL); /* every truncation */
     }
     /* The decoder refuses malformed blocks. Unusable strings never reach the
      * encoder: ipc_args_set_activation drops them (below). */
     char big[IPC_ACTIVATION_CAP+8]; memset(big,'a',sizeof big); big[sizeof big-1]=0;
-    r.activation_token=ACT_TOKEN; r.startup_id=ACT_STARTUP; ASSERT(ipc_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
+    r.activation_token=ACT_TOKEN; r.startup_id=ACT_STARTUP; ASSERT(ipc_test_wire_encode(&r,wire,sizeof wire,&n)==IPC_OK);
     size_t blk=(size_t)wire[6]|(size_t)wire[7]<<8; ASSERT(blk==4u+sizeof ACT_TOKEN+sizeof ACT_STARTUP && blk<n);
     uint8_t m[8192]; ipc_request d;
-    memcpy(m,wire,n); m[5]&=(uint8_t)~4u; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);   /* block size without the flag */
-    memcpy(m,wire,n); m[6]=m[7]=0; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);           /* flag without a block */
-    memcpy(m,wire,n); m[6]=3; m[7]=0; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* block shorter than its header */
-    memcpy(m,wire,n); m[7]=0xff; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);             /* block larger than the request */
-    memcpy(m,wire,n); m[5]|=8u; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);              /* unknown flag */
-    memcpy(m,wire,n); m[n-blk]++; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);            /* token length disagrees with block */
-    memcpy(m,wire,n); m[n-1]='x'; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);            /* no trailing NUL */
-    memcpy(m,wire,n); m[n-blk+4+2]=0; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* NUL inside the token */
-    memcpy(m,wire,n); m[n-blk+4]=' '; ASSERT(ipc_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* space inside the token */
+    memcpy(m,wire,n); m[5]&=(uint8_t)~4u; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);   /* block size without the flag */
+    memcpy(m,wire,n); m[6]=m[7]=0; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);           /* flag without a block */
+    memcpy(m,wire,n); m[6]=3; m[7]=0; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* block shorter than its header */
+    memcpy(m,wire,n); m[7]=0xff; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);             /* block larger than the request */
+    memcpy(m,wire,n); m[5]|=8u; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);              /* unknown flag */
+    memcpy(m,wire,n); m[n-blk]++; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);            /* token length disagrees with block */
+    memcpy(m,wire,n); m[n-1]='x'; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);            /* no trailing NUL */
+    memcpy(m,wire,n); m[n-blk+4+2]=0; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* NUL inside the token */
+    memcpy(m,wire,n); m[n-blk+4]=' '; ASSERT(ipc_test_wire_decode(m,n,&d)==IPC_PROTOCOL);        /* space inside the token */
     /* Launcher helper: copies, drops unusable values instead of failing the handoff. */
     char *av[]={"sublimite","/tmp/x"}; ipc_args a={0}; ASSERT(ipc_parse_args(2,av,&a)==IPC_OK);
     ASSERT(a.request.activation_token==NULL && a.request.startup_id==NULL);
@@ -720,10 +712,10 @@ static void t_activation(const char *dir)
     ipc_args_fini(&a);
     /* New launcher, new server: the callback sees both fields. */
     {
-        ipc_server s={0}; ASSERT(ipc_server_init(&s,dir)==IPC_OK);
+        ipc_server s={0}; ASSERT(ipc_server_init_display(&s,dir,NULL)==IPC_OK);
         pid_t child=fork(); ASSERT(child>=0);
         if(child==0) { ipc_request q=request(false,false); q.activation_token=ACT_TOKEN; q.startup_id=ACT_STARTUP;
-            _exit(ipc_client_send(dir,&q,CLIENT_TIMEOUT_MS)==IPC_OK?0:2); }
+            _exit(ipc_client_send_display(dir,NULL,&q,CLIENT_TIMEOUT_MS)==IPC_OK?0:2); }
         ipc_request seen={0};
         for(int i=0;i<40 && seen.count==0;i++) (void)pump(&s,act_seen,&seen,500);
         ASSERT(seen.count==1); reap_ok(child); ipc_server_fini(&s);
@@ -743,7 +735,7 @@ static void t_activation(const char *dir)
         if(server==0) { close(rp[0]); legacy_server(listener,rp[1]); }
         close(listener); close(rp[1]);
         ipc_request q=request(false,false); q.activation_token=ACT_TOKEN; q.startup_id=ACT_STARTUP;
-        ASSERT(ipc_client_send(legacy,&q,CLIENT_TIMEOUT_MS)==IPC_OK);
+        ASSERT(ipc_client_send_display(legacy,NULL,&q,CLIENT_TIMEOUT_MS)==IPC_OK);
         uint8_t v[4]; ASSERT(read(rp[0],v,4)==4);
         ASSERT(v[0]==1 && (v[1]&4u)); /* first attempt carried activation and was refused */
         ASSERT(v[2]==0 && !(v[3]&4u)); /* the resend is the previous format and was accepted */
@@ -765,7 +757,7 @@ static void t_namespace(const char *dir)
     int dfd=socket(AF_UNIX,SOCK_STREAM,0); ASSERT(dfd>=0);
     ASSERT(bind(dfd,(struct sockaddr *)&a,sizeof a)==0 && listen(dfd,1)==0); close(dir_fd);
     struct stat before; ASSERT(lstat(decoy,&before)==0);
-    ipc_server s={0}; ipc_result rc=ipc_server_init(&s,rt);
+    ipc_server s={0}; ipc_result rc=ipc_server_init_display(&s,rt,NULL);
     if(rc!=IPC_OK) fprintf(stderr,"namespace: init rc=%d beside v1 decoy leaf\n",(int)rc);
     ASSERT(rc==IPC_OK);
     char want[128]; ASSERT(snprintf(want,sizeof want,EDIT_APP_ID "-%lu.sock",(unsigned long)getuid())>0);
@@ -784,7 +776,7 @@ static void t_namespace(const char *dir)
     ASSERT(vn>0 && (size_t)vn<sizeof va.sun_path-1);
     int vfd=socket(AF_UNIX,SOCK_STREAM|SOCK_NONBLOCK,0); ASSERT(vfd>=0);
     ASSERT(bind(vfd,(struct sockaddr *)&va,(socklen_t)(offsetof(struct sockaddr_un,sun_path)+1u+(size_t)vn))==0 && listen(vfd,1)==0);
-    ASSERT(ipc_server_init(&s,NULL)==IPC_OK);
+    ASSERT(ipc_server_init_display(&s,NULL,NULL)==IPC_OK);
     struct sockaddr_un bound={0}; socklen_t bl=sizeof bound;
     ASSERT(getsockname(os_listener_fd(&s.listener),(struct sockaddr *)&bound,&bl)==0);
     char awant[128]; int an=snprintf(awant,sizeof awant,EDIT_APP_ID "-%lu-%s",(unsigned long)getuid(),ns);
@@ -797,16 +789,16 @@ static void t_namespace(const char *dir)
     puts("ipc_test: endpoint names carry the v2 app id; v1 decoys untouched");
 }
 
-/* An encoder request comes from ipc_parse_args or ipc_wire_decode, which
+/* An encoder request comes from ipc_parse_args or the wire decoder, which
  * produce only absolute paths: a relative cwd is a caller bug (A15). */
 static void encode_relative_cwd(void)
 {
     uint8_t wire[64]; size_t n=0; ipc_request r={0}; r.cwd="relative";
-    (void)ipc_wire_encode(&r,wire,sizeof wire,&n);
+    (void)ipc_test_wire_encode(&r,wire,sizeof wire,&n);
 }
 static void t_precondition_death(void)
 {
-    ASSERT(assert_death(encode_relative_cwd,"src/ipc/wire.c",
+    ASSERT(assert_death(encode_relative_cwd,"src/ipc/ipc_posix.c",
                         "cwdn <= IPC_PATH_CAP && string_ok((const uint8_t *)r->cwd, cwdn)"));
     puts("ipc_test: a forged request dies by ASSERT");
 }
@@ -823,7 +815,6 @@ static int run_suite(const char *only, int ns_fd)
     if(ns_fd>=0) { size_t l=strlen(ns); ASSERT(write(ns_fd,ns,l+1u)==(ssize_t)(l+1u)); close(ns_fd); } /* --parallel: report the namespace */
 #define T(name,call) do { if(only==NULL || strcmp(only,name)==0) { call; } } while(0)
     T("death",t_precondition_death()); T("parser",parser(dir)); T("wire",wire_tests()); T("roundtrip",roundtrip(dir,false,false)); T("roundtrip",roundtrip(dir,true,false)); T("roundtrip",roundtrip(dir,false,true));
-    T("result_text",t_result_text());
     T("stale",stale(dir)); T("race",race(dir)); T("fragmented",fragmented(dir)); T("tokens",wait_tokens(dir)); T("callbacks",callback_results(dir,true)); T("callbacks",callback_results(dir,false)); T("endpoints",endpoint_validation(dir));
     T("wire_alias",t_wire_alias(dir)); T("wire_table",t_wire_table(dir)); T("parser_paths",t_parser_paths(dir)); T("runtime_swap",t_runtime_swap(dir));
     T("drain_budget",t_drain_budget(dir)); T("slot_exhaust",t_slot_exhaust(dir)); T("lock_timeout",t_lock_timeout(dir)); T("foreign_cred",t_foreign_cred(dir));

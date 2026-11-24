@@ -5,8 +5,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-const char *base_version(void);
-
 /* Arena and pool objects are single-owner. Init takes a handle with no
  * live reservation. Each reservation is writable and backed on first touch.
  * Preconditions below are ASSERTed (os.h, A15); a size the OS cannot reserve
@@ -27,7 +25,6 @@ void *base_arena_alloc(base_arena *a, size_t size, size_t align);
 base_arena_mark_t base_arena_mark(const base_arena *a);
 /* m is a mark of this arena at or behind the current cursor. */
 void  base_arena_reset_to_mark(base_arena *a, base_arena_mark_t m);
-void  base_arena_reset(base_arena *a);
 void  base_arena_free(base_arena *a);
 
 /* Fixed-size blocks carved lazily from one reservation. Get and put are
@@ -50,7 +47,6 @@ void *base_pool_get(base_pool *p);             /* NULL when full */
 /* Return a currently checked-out block exactly once. A foreign, interior or
  * unissued address fails the ASSERT; a second return is not detected. */
 void  base_pool_put(base_pool *p, void *ptr);
-size_t base_pool_count_live(const base_pool *p);
 /* Initialized pool. Returns every block at once and keeps the reservation:
  * the pool is as after init, handing out blocks from the first again.
  * Blocks still held become invalid; O(1), touches no block. */
@@ -59,7 +55,6 @@ void  base_pool_free(base_pool *p);
 
 /* ---- SIMD dispatch: cached after first call ---------------------------- */
 bool base_cpu_has_avx2(void);
-bool base_cpu_has_popcnt(void);
 /* SSE4.2 (the CRC32 instruction), selected by journal's CRC32C. */
 bool base_cpu_has_sse42(void);
 
@@ -68,11 +63,7 @@ bool base_cpu_has_sse42(void);
  * opens and closes non-overlapping, process-wide counting windows. */
 bool   base_malloc_guard_active(void);
 void   base_malloc_guard_begin(void);
-/* Returns the count of non-exempt calls in the window (saturating). */
+/* Returns the count of allocation calls in the window (saturating). */
 size_t base_malloc_guard_end(void);
-/* Balanced, nestable exemptions apply only to the calling thread.
- * Bracket only exempt library calls such as post-submit libxcb completion. */
-void   base_malloc_guard_exempt_begin(void);
-void   base_malloc_guard_exempt_end(void);
 
 #endif

@@ -41,7 +41,7 @@ static bool test_allocator_window(void)
     memset(aligned, 0xa5, alignment);
     base_arena_reset_to_mark(&arena, mark);
     ASSERT(base_arena_alloc(&arena, 1, 1) == first);
-    base_arena_reset(&arena);
+    base_arena_reset_to_mark(&arena, mark);
     ASSERT(base_arena_alloc(&arena, page, 1) == first);
     ASSERT(base_arena_alloc(&arena, 1, 1) == NULL);
 
@@ -53,7 +53,7 @@ static bool test_allocator_window(void)
     ASSERT(base_pool_get(&pool) == a);
     base_pool_put(&pool, b);
     base_pool_put(&pool, a);
-    ASSERT(base_pool_count_live(&pool) == 0);
+    ASSERT(pool.live == 0);
     size_t count = base_malloc_guard_end();
 
     base_arena_free(&arena);
@@ -64,7 +64,6 @@ static bool test_allocator_window(void)
 }
 
 typedef struct guard_probe {
-    bool exempt;
     _Atomic bool run;
     _Atomic bool done;
 } guard_probe;
@@ -81,37 +80,29 @@ static void probe_worker(void *arg)
 {
     guard_probe *probe = arg;
     while (!atomic_load(&probe->run)) (void)sched_yield();
-    if (probe->exempt) base_malloc_guard_exempt_begin();
     allocate_byte();
-    if (probe->exempt) base_malloc_guard_exempt_end();
     atomic_store(&probe->done, true);
 }
 
-static size_t guard_worker_window(bool exempt)
+static size_t guard_worker_window(void)
 {
-    guard_probe probe = {.exempt = exempt};
+    guard_probe probe = {0};
     os_thread worker;
     ASSERT(os_thread_start(&worker, probe_worker, &probe) == OS_OK);
 
     base_malloc_guard_begin();
-    base_malloc_guard_exempt_begin();
-    base_malloc_guard_exempt_begin();
     allocate_byte();
-    base_malloc_guard_exempt_end();
     allocate_byte();
     atomic_store(&probe.run, true);
     while (!atomic_load(&probe.done)) (void)sched_yield();
-    base_malloc_guard_exempt_end();
     size_t count = base_malloc_guard_end();
     ASSERT(os_thread_join(&worker) == OS_OK);
     return count;
 }
 
-static bool test_guard_exempt(void)
+static bool test_guard_allocators(void)
 {
-    /* The calling thread remains exempt while the other thread allocates. */
-    size_t exempt = guard_worker_window(true);
-    size_t counted = guard_worker_window(false);
+    size_t across_threads = guard_worker_window();
 
     base_malloc_guard_begin();
     allocate_byte();
@@ -122,13 +113,13 @@ static bool test_guard_exempt(void)
     /* A larger request exercises realloc separately from the calloc. */
     p = resize(p, 2);
     ASSERT(p != NULL);
-    size_t after_close = base_malloc_guard_end();
+    size_t allocators = base_malloc_guard_end();
     free(p);
 
     bool active = base_malloc_guard_active();
-    printf("guard exemptions: active=%d worker_exempt=%zu worker_counted=%zu after_close=%zu\n",
-           (int)active, exempt, counted, after_close);
-    return active && exempt == 0 && counted == 1 && after_close == 3;
+    printf("guard allocators: active=%d across_threads=%zu malloc_calloc_realloc=%zu\n",
+           (int)active, across_threads, allocators);
+    return active && across_threads == 3 && allocators == 3;
 }
 
 typedef struct os_probe {
@@ -245,9 +236,9 @@ int main(void)
               stderr);
         return EXIT_FAILURE;
     }
-    bool exempt = test_guard_exempt();
+    bool allocators = test_guard_allocators();
     bool os_clean = test_os_window();
-    if (!exempt || !os_clean) return EXIT_FAILURE;
+    if (!allocators || !os_clean) return EXIT_FAILURE;
     puts("law2_base_test: PASS");
     return EXIT_SUCCESS;
 }

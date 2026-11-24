@@ -1,6 +1,6 @@
 /* Find latency on warm, generated text. Timing observations are tracked
  * under CLAUDE.md law 1. A wrong result fails the benchmark self-check. */
-#include "find/find.h"
+#include "../tests/find_fixture.h"
 #include "trace/trace.h"
 
 #include <inttypes.h>
@@ -51,9 +51,9 @@ static bool word(uint8_t c)
     return (lower(c) >= 'a' && lower(c) <= 'z') || (c >= '0' && c <= '9') || c == '_';
 }
 
-static find_result reference(const find_source *source, const row *r, size_t n)
+static find_fixture_result reference(const find_source *source, const row *r, size_t n)
 {
-    find_result result = {0};
+    find_fixture_result result = {0};
     for (size_t i = 0; i + n <= source->length;) {
         const uint8_t *p = source->bytes + i;
         size_t k = 0;
@@ -65,7 +65,7 @@ static find_result reference(const find_source *source, const row *r, size_t n)
         bool boundary = !r->options.whole_word ||
             ((!i || !word(p[-1])) && (i + n == source->length || !word(p[n])));
         if (k == n && boundary) {
-            if (result.stored < FIND_MAX_OFFSETS) result.offsets[result.stored++] = i;
+            if (result.stored < FIND_FIXTURE_OFFSETS) result.offsets[result.stored++] = i;
             result.total++;
             i += n;
         } else i++;
@@ -120,11 +120,11 @@ int main(int argc,char **argv)
         const row *r = &rows[i];
         fill(text, length, r->adversarial);
         size_t n = strlen(r->needle);
-        find_result want = reference(&source, r, n), got;
+        find_fixture_result want = reference(&source, r, n), got;
         uint64_t ns[SAMPLES];
         for (size_t j = 0; j < samples; j++) {
             uint64_t start = os_now_ns();
-            find_code code = find_literal(&source, (const uint8_t *)r->needle, n,
+            find_code code = find_fixture_literal(&source, (const uint8_t *)r->needle, n,
                                           r->options, NULL, &got);
             ns[j] = os_now_ns() - start;
             if (code != FIND_OK || got.total != want.total || got.stored != want.stored ||

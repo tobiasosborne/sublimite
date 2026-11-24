@@ -131,7 +131,6 @@ static inline uint8_t get_byte_forward(reader *r, uint64_t off, meter *m)
 }
 
 typedef struct find_sink {
-    find_result *result;
     find_visit *visit;
     uint64_t total;
 } find_sink;
@@ -148,16 +147,12 @@ static inline find_code find_sink_add(find_sink *sink, meter *m, find_capture ra
 {
     if (sink->total == UINT64_MAX) return FIND_ERR_LIMIT;
     find_visit *v = sink->visit;
-    if (v) {
-        bool shown = find_visit_intersects(v, range);
-        bool selected = sink->total < v->prefix_capacity || sink->total == v->wanted ||
-                        (shown && v->visible < v->visible_capacity);
-        v->visible += shown;
-        if (selected && (poll_fault(m) || !v->emit(v->user, sink->total, range)))
-            return FIND_CANCELLED;
-    }
-    find_result *r = sink->result;
-    if (r && r->stored < FIND_MAX_OFFSETS) r->offsets[r->stored++] = range.start;
+    bool shown = find_visit_intersects(v, range);
+    bool selected = sink->total < v->prefix_capacity || sink->total == v->wanted ||
+                    (shown && v->visible < v->visible_capacity);
+    v->visible += shown;
+    if (selected && (poll_fault(m) || !v->emit(v->user, sink->total, range)))
+        return FIND_CANCELLED;
     sink->total++;
     return FIND_OK;
 }
@@ -165,14 +160,8 @@ static inline find_code find_sink_add(find_sink *sink, meter *m, find_capture ra
 static inline find_code find_sink_finish(find_sink *sink, meter *m, find_code code)
 {
     if (poll_stop(m)) code = FIND_CANCELLED;
-    if (sink->result) {
-        sink->result->total = code == FIND_OK ? sink->total : 0;
-        if (code != FIND_OK) sink->result->stored = 0;
-    }
-    if (sink->visit) {
-        sink->visit->total = code == FIND_OK ? sink->total : 0;
-        if (code != FIND_OK) sink->visit->visible = 0;
-    }
+    sink->visit->total = code == FIND_OK ? sink->total : 0;
+    if (code != FIND_OK) sink->visit->visible = 0;
     return code;
 }
 

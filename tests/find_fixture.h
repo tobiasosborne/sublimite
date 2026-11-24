@@ -48,10 +48,93 @@ static inline void find_fixture_release(find_fixture f)
     piece_reserve_destroy(f.reserve);
 }
 
-/* Test variant of literal.c. Forced Two-Way applies only to this invocation,
- * with the same public source, options, cancellation and result contract. */
-find_code find_test_literal_two_way(const find_source *source, const uint8_t *needle,
-                                   size_t n, find_literal_options options,
-                                   const find_control *control, find_result *result);
+/* Collect the same bounded prefix and total through the public visitors.
+ * The inherited fixture capacity also drives the dense-match tests. */
+#define FIND_FIXTURE_OFFSETS 4096u
+typedef struct find_fixture_result {
+    uint64_t total;
+    size_t stored;
+    uint64_t offsets[FIND_FIXTURE_OFFSETS];
+} find_fixture_result;
+
+static inline bool find_fixture_emit(void *user, uint64_t ordinal, find_capture range)
+{
+    find_fixture_result *result = user;
+    ASSERT(ordinal < FIND_FIXTURE_OFFSETS && ordinal == result->stored);
+    result->offsets[result->stored++] = range.start;
+    return true;
+}
+
+static inline bool find_fixture_emit_mask(void *user, uint64_t mask, uint64_t base, uint64_t ordinal)
+{
+    find_fixture_result *result = user;
+    ASSERT(ordinal >= result->stored);
+    while (mask && result->stored < FIND_FIXTURE_OFFSETS) {
+        result->offsets[result->stored++] = base + (unsigned)__builtin_ctzll(mask);
+        mask &= mask - 1;
+    }
+    return true;
+}
+
+/* The find test object forces Two-Way for this visitor call only. */
+find_code find_test_literal_visit_two_way(const find_source *source, const uint8_t *needle,
+                                         size_t n, find_literal_options options,
+                                         const find_control *control, find_visit *visit);
+typedef find_code (*find_fixture_literal_fn)(const find_source *, const uint8_t *, size_t,
+    find_literal_options, const find_control *, find_visit *);
+
+static inline find_code find_fixture_literal_run(find_fixture_literal_fn run,
+    const find_source *source, const uint8_t *needle, size_t n,
+    find_literal_options options, const find_control *control, find_fixture_result *result)
+{
+    if (!result) return FIND_ERR_ARGUMENT;
+    result->stored = 0;
+    find_visit visit = {.prefix_capacity = FIND_FIXTURE_OFFSETS, .wanted = FIND_UNSET,
+                        .emit = find_fixture_emit, .emit_mask = find_fixture_emit_mask, .user = result};
+    find_code code = run(source, needle, n, options, control, &visit);
+    result->total = visit.total;
+    if (code != FIND_OK) result->stored = 0;
+    return code;
+}
+
+static inline find_code find_fixture_literal(const find_source *source, const uint8_t *needle,
+    size_t n, find_literal_options options, const find_control *control, find_fixture_result *result)
+{
+    return find_fixture_literal_run(find_literal_visit, source, needle, n, options, control, result);
+}
+
+static inline find_code find_fixture_literal_two_way(const find_source *source, const uint8_t *needle,
+    size_t n, find_literal_options options, const find_control *control, find_fixture_result *result)
+{
+    return find_fixture_literal_run(find_test_literal_visit_two_way, source, needle, n, options, control, result);
+}
+
+static inline find_code find_fixture_regex(const find_source *source, const find_regex *regex,
+    void *scratch, size_t size, const find_control *control, find_fixture_result *result)
+{
+    if (!result) return FIND_ERR_ARGUMENT;
+    result->stored = 0;
+    find_visit visit = {.prefix_capacity = FIND_FIXTURE_OFFSETS, .wanted = FIND_UNSET,
+                        .emit = find_fixture_emit, .user = result};
+    find_code code = find_regex_visit(source, regex, scratch, size, control, &visit);
+    result->total = visit.total;
+    if (code != FIND_OK) result->stored = 0;
+    return code;
+}
+
+static inline find_code find_fixture_compile(void *program, size_t size, const uint8_t *query,
+    size_t length, find_regex **out, size_t *error)
+{
+    return find_regex_compile_options(program, size, query, length, false, NULL, 0, NULL, out, error);
+}
+
+static inline find_code find_fixture_regex_next(const find_source *source, const find_regex *regex,
+    uint64_t off, void *scratch, size_t size, const find_control *control, find_match *match)
+{
+    uint64_t length = source ? source->length : 0;
+    if (source && source->view) length = piece_length(source->view);
+    uint64_t budget = find_regex_work_budget(regex, length);
+    return find_regex_next_budget(source, regex, off, scratch, size, control, &budget, match);
+}
 
 #endif

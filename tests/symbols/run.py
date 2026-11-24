@@ -11,6 +11,7 @@ import sys
 
 FIXTURES = Path('tests/symbols')
 CHECKER = Path('tools/check_symbols.py')
+EXPORT_CHECKER = Path('tools/check_exports.py')
 # Each layer's module tuple also gives the member order passed to ar; an
 # entry with a '/' is a directory of vendored sources (the vendor_ts
 # pseudo-module, docs/decisions/v2-he7.24.md), any other is src/MODULE. A
@@ -81,6 +82,28 @@ CASES = (
 )
 
 
+def check_export_reservation(build, nm, module_map):
+    # trace_leaf has only a same-module reference, so a reservation would
+    # satisfy this archive unless the checker actually reads the cited file.
+    reservations = build / 'unnamed-export.txt'
+    reservations.write_text('trace_leaf v2-0fv.21 # Fixture for an undocumented export.\n',
+                            encoding='utf-8')
+    members = ['src/os/probe.o', 'src/base/probe.o', 'src/trace/leaf.o', 'src/trace/trace.o']
+    command = [sys.executable, '-B', str(EXPORT_CHECKER), '--nm', nm,
+               '--module-map', *module_map, '--main', str(build / 'src/piece/piece.o'),
+               '--archive', '0', str(build / 'layer0.a'), *members,
+               '--reservations', str(reservations), '--module', 'trace']
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    expected = (f'check_exports: error: [input] {reservations}:1: '
+                'v2-0fv.21.md does not name trace_leaf')
+    if result.returncode == 1 and expected in result.stdout.splitlines():
+        print('reservation_unnamed_export: rejected as expected')
+        return 0
+    print(f'reservation_unnamed_export: expected exit 1 and {expected!r}, got {result.returncode}')
+    print(result.stdout, end='')
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -133,6 +156,8 @@ def main():
                   f'got {result.returncode}; fixture imports missing: {missing}')
             print(result.stdout, end='')
             failures += 1
+    failures += check_export_reservation(args.build / 'rel' / FIXTURES / 'clean',
+                                         args.nm, args.module_map)
     return int(bool(failures))
 
 

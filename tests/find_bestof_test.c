@@ -38,29 +38,29 @@ bool __wrap_work_should_stop(const work_ctx *ctx)
 }
 
 static find_code run_mode(const find_source *source,const uint8_t *needle,size_t n,
-                          const find_control *control,find_result *result,int mode)
+                          const find_control *control,find_fixture_result *result,int mode)
 {
     find_literal_options options={0};
-    return mode ? find_test_literal_two_way(source,needle,n,options,control,result)
-                : find_literal(source,needle,n,options,control,result);
+    return mode ? find_fixture_literal_two_way(source,needle,n,options,control,result)
+                : find_fixture_literal(source,needle,n,options,control,result);
 }
 
 typedef struct test_context {
     uint64_t rng;
-    find_result got, want;
+    find_fixture_result got, want;
 } test_context;
 static uint32_t rnd(test_context *t)
 {
     t->rng^=t->rng<<13; t->rng^=t->rng>>7; t->rng^=t->rng<<17;
     return (uint32_t)(t->rng>>16);
 }
-static void oracle(const uint8_t *h,size_t hn,const uint8_t *n,size_t nn,find_result *r)
+static void oracle(const uint8_t *h,size_t hn,const uint8_t *n,size_t nn,find_fixture_result *r)
 {
     r->total=0; r->stored=0;
     if (!nn || nn>hn) return;
     for (size_t i=0;i<=hn-nn;) {
         if (memcmp(h+i,n,nn)==0) {
-            if (r->stored<FIND_MAX_OFFSETS) r->offsets[r->stored++]=i;
+            if (r->stored<FIND_FIXTURE_OFFSETS) r->offsets[r->stored++]=i;
             r->total++; i+=nn;
         } else i++;
     }
@@ -234,7 +234,7 @@ static int linear_work(test_context *t)
     memcpy(h+N-1000,n,502);
     for (int mode=0;mode<2;mode++) CHECK(run_mode(&s,n,502,NULL,&t->got,mode)==FIND_OK && t->got.total==1 && t->got.offsets[0]==N-1000);
     memset(h,'a',N); memset(n,'a',64);
-    for (int mode=0;mode<2;mode++) CHECK(run_mode(&s,n,64,NULL,&t->got,mode)==FIND_OK && t->got.total==N/64 && t->got.stored==FIND_MAX_OFFSETS && t->got.offsets[FIND_MAX_OFFSETS-1]==(FIND_MAX_OFFSETS-1)*64u);
+    for (int mode=0;mode<2;mode++) CHECK(run_mode(&s,n,64,NULL,&t->got,mode)==FIND_OK && t->got.total==N/64 && t->got.stored==FIND_FIXTURE_OFFSETS && t->got.offsets[FIND_FIXTURE_OFFSETS-1]==(FIND_FIXTURE_OFFSETS-1)*64u);
     free(h); return 0;
 }
 static int cancel_prep(test_context *t)
@@ -243,10 +243,10 @@ static int cancel_prep(test_context *t)
     memset(n,'a',nn); memset(h,'a',sizeof h);
     atomic_bool flag; atomic_init(&flag,true);
     find_control c={0}; c.cancel=&flag; find_source s={h,sizeof h,NULL}; find_match m;
-    CHECK(find_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_CANCELLED && t->got.total==0 && t->got.stored==0);
+    CHECK(find_fixture_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_CANCELLED && t->got.total==0 && t->got.stored==0);
     CHECK(find_literal_next(&s,n,nn,(find_literal_options){0},0,&c,&m)==FIND_CANCELLED && !m.matched && m.whole.start==FIND_UNSET);
     atomic_store(&flag,false);
-    CHECK(find_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_OK && t->got.total==0 && t->got.stored==0);
+    CHECK(find_fixture_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_OK && t->got.total==0 && t->got.stored==0);
     free(n); return 0;
 }
 static int regex_prefix_path(test_context *t)
@@ -255,26 +255,26 @@ static int regex_prefix_path(test_context *t)
     uint8_t h[300]; find_regex *re=NULL; memset(h,'x',sizeof h);
     memcpy(h+10,"ERROR  ",7); memcpy(h+100,"ERROR",5); memcpy(h+200,"ERROR   ",8);
     CHECK(find_regex_bytes()<=sizeof mem);
-    CHECK(find_regex_compile(mem,sizeof mem,(const uint8_t *)"ERROR +",7,&re,NULL)==FIND_OK);
+    CHECK(find_fixture_compile(mem,sizeof mem,(const uint8_t *)"ERROR +",7,&re,NULL)==FIND_OK);
     CHECK(find_regex_scratch_bytes(re)<=sizeof scratch);
     const size_t cuts[]={12,102,202,204};
     find_fixture f=find_fixture_snapshot(h,sizeof h,cuts,4);
     for (unsigned kind=0;kind<2;kind++) {
         find_source s=kind?find_fixture_source(f):(find_source){h,sizeof h,NULL};
-        CHECK(find_regex_search(&s,re,scratch,sizeof scratch,NULL,&t->got)==FIND_OK);
+        CHECK(find_fixture_regex(&s,re,scratch,sizeof scratch,NULL,&t->got)==FIND_OK);
         CHECK(t->got.total==2 && t->got.stored==2 && t->got.offsets[0]==10 && t->got.offsets[1]==200);
         find_match m;
-        CHECK(find_regex_next(&s,re,11,scratch,sizeof scratch,NULL,&m)==FIND_OK && m.matched && m.whole.start==200 && m.whole.end==208);
+        CHECK(find_fixture_regex_next(&s,re,11,scratch,sizeof scratch,NULL,&m)==FIND_OK && m.matched && m.whole.start==200 && m.whole.end==208);
         CHECK(find_regex_captures(&s,re,100,scratch,sizeof scratch,NULL,&m)==FIND_OK && !m.matched);
     }
     find_fixture_release(f);
     /* A rejected prefix hit must resume at hit+1, since the next complete
      * prefix may overlap it (the losing decision's regex rewind edge). */
-    CHECK(find_regex_compile(mem,sizeof mem,(const uint8_t *)"aaaa[b]",7,&re,NULL)==FIND_OK);
+    CHECK(find_fixture_compile(mem,sizeof mem,(const uint8_t *)"aaaa[b]",7,&re,NULL)==FIND_OK);
     const uint8_t overlap[]="aaaaab"; const size_t small_cuts[]={1,2,3,4,5};
     f=find_fixture_snapshot(overlap,6,small_cuts,5);
     find_source s=find_fixture_source(f);
-    CHECK(find_regex_search(&s,re,scratch,sizeof scratch,NULL,&t->got)==FIND_OK && t->got.total==1 && t->got.offsets[0]==1);
+    CHECK(find_fixture_regex(&s,re,scratch,sizeof scratch,NULL,&t->got)==FIND_OK && t->got.total==1 && t->got.offsets[0]==1);
     find_fixture_release(f); return 0;
 }
 static int snapshot_traversal(test_context *t)
@@ -288,7 +288,7 @@ static int snapshot_traversal(test_context *t)
     find_bestof_probe probe={0};
     find_source s=find_fixture_source(f);
     active_probe=&probe;
-    CHECK(find_literal(&s,n,N,(find_literal_options){0},NULL,&t->got)==FIND_OK && t->got.total==1 && t->got.offsets[0]==4096);
+    CHECK(find_fixture_literal(&s,n,N,(find_literal_options){0},NULL,&t->got)==FIND_OK && t->got.total==1 && t->got.offsets[0]==4096);
     active_probe=NULL;
     /* (P) At most two forward comparison readers and a possible terminal
      * seek. Bound by one traversal per cursor, with one run of headroom. */
@@ -305,7 +305,7 @@ static int snapshot_traversal(test_context *t)
     s=find_fixture_source(f);
     probe=(find_bestof_probe){0};
     active_probe=&probe;
-    CHECK(find_test_literal_two_way(&s,n,N,(find_literal_options){0},NULL,&t->got)==FIND_OK);
+    CHECK(find_fixture_literal_two_way(&s,n,N,(find_literal_options){0},NULL,&t->got)==FIND_OK);
     active_probe=NULL;
     CHECK(t->got.total==1 && t->got.offsets[0]==N/2);
     CHECK(probe.seeks<=3 && probe.spans>0 && probe.spans<=3*spans);
@@ -342,12 +342,12 @@ static int poll_boundaries(test_context *t)
         find_control c={0}; c.work=&ctx;
         find_source s=f.snapshot?find_fixture_source(f):(find_source){h,H,NULL};
         active_probe=&probe;
-        CHECK(find_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_OK);
+        CHECK(find_fixture_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_OK);
         size_t polls=probe.polls; CHECK(polls>2);
         for (size_t stop=1;stop<=polls;stop++) {
             probe=(find_bestof_probe){0}; probe.cancel_at=stop;
             t->got.total=99; t->got.stored=99;
-            CHECK(find_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_CANCELLED && t->got.total==0 && t->got.stored==0);
+            CHECK(find_fixture_literal(&s,n,nn,(find_literal_options){0},&c,&t->got)==FIND_CANCELLED && t->got.total==0 && t->got.stored==0);
             CHECK(probe.polls<=stop+1);
             if (stop==2 && nn==N) CHECK(probe.spans==0); /* Cancelled inside preprocessing. */
         }

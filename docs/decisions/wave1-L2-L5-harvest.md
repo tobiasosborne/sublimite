@@ -645,7 +645,7 @@ The API is proposed from PLAN §4.2 and the piece/undo headers. Names are the be
 
 - edit includes piece, undo and journal (`journal < edit`), plus utf8 (cluster boundaries, `edits.c` uses `utf8_step`
   :381) and indent (`v1:input.c:416-421` `indent_on_enter_after_delete`, `indent_on_close_brace_after_delete`).
-  `find/find.h` (`edits.c:3`) is used by `view_skip_next_occurrence` (:419). All of these are L1, so they are allowed.
+  `find/find.h` (`edits.c:3`) provides `find_literal_next` for `view_skip_next_occurrence` (:419). All of these are L1, so they are allowed.
 - **Layout.** `soft_row` (`edits.c:216-235`) calls `layout_visual_row` when wrapped. In v2,
   `edit_delete_to_soft_bol/eol` take the soft row `[start, end)` from the caller, which is L4 viewport/layout. The
   plan is then layout-free; the row query is L4's. The simplest alternative, a callback from L2 into L4, is an upward

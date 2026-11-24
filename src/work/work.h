@@ -72,14 +72,11 @@ typedef struct work_handle {
 typedef struct work_slot {
     work_job job;
     _Atomic uint32_t epoch;      /* bumped by cancel; job stops when != ctx.epoch */
-    _Atomic uint64_t cancel_ns;  /* CLOCK_MONOTONIC at cancel; written before epoch */
     _Atomic uint32_t busy;       /* 1 from submit until the worker is done with it */
     _Atomic uint32_t pending;    /* published, not yet drained; slot is not reused while >0 */
     _Atomic uint32_t finished_epoch; /* physical completion acknowledgement */
     /* UI-only selective receive state; workers never read these fields. */
-    void (*receive_cb)(const work_msg *, void *);
-    void *receive_ud;
-    uint32_t receive_epoch, receive_generation;
+    uint32_t receive_epoch;
     uint32_t receive_scan_generation;
     uint32_t receive_pos[WORK_MAX_WORKERS], receive_next;
     uint32_t receive_foreground_pos; /* UI-only cursor for the optional lane */
@@ -107,7 +104,6 @@ typedef struct work_pool {
     os_cond cv[2];
     os_thread threads[WORK_MAX_WORKERS];
     work_ctx wctx[WORK_MAX_WORKERS];
-    _Atomic uint64_t worker_ids[WORK_MAX_MAILBOXES];
     uint32_t n_workers, n_bulk;
     bool shutting_down;                 /* under mu */
     os_wake wake;
@@ -152,38 +148,11 @@ void work_pool_shutdown(work_pool *p);
  * os_waitset (the one wait primitive, v2-0fv.13). Never drain it separately
  * from the mailbox protocol. */
 const os_wake *work_pool_wake(const work_pool *p);
-/* os_thread_self identity for ownership diagnostics; zero before that worker
- * starts. worker < WORK_MAX_MAILBOXES; foreground uses WORK_FOREGROUND_WORKER.
- * Never a native thread handle. */
-uint64_t work_pool_worker_id(const work_pool *p, uint32_t worker);
-
 /* Returns handle {0, 0} if the pool is full or inactive, or all otherwise
  * free slots exhausted their identities. Slots retire before epoch
  * wrap. Handles belong to one initialized pool lifetime; discard all handles
  * before shutdown/reinitialization and never use them with another pool. */
 work_handle work_submit(work_pool *p, work_job job);
-/* UI-only priority upgrade for an existing BULK/FOREGROUND lease. Requires a
- * foreground-enabled pool and a bounded, nonblocking continuation job. Queued
- * work moves immediately; a running invocation keeps its current physical
- * owner and moves only after it returns with work_continue. No preemption of
- * blocking I/O: never prioritize an I/O/discovery job. Identity, argument,
- * result reservations and completion ownership stay unchanged. Before the
- * first migrated invocation, the UI must drain results from the old worker;
- * other foreground jobs remain runnable while that delivery is pending.
- * This preserves per-lease result order across the mailbox handoff. Returns -1
- * for an inactive pool, the refused handle or a stale identity; otherwise 0,
- * including an already finished valid lease. A live raster lease is a caller
- * bug. No allocation or additional slot. */
-int work_prioritize(work_pool *p, work_handle h);
-/* UI-only atomic enqueue. Returns 0 on success, -1 on capacity/identity
- * exhaustion or an inactive pool. count is at most WORK_MAX_JOBS; zero
- * succeeds without accessing jobs/handles/pool. Every job has a non-NULL fn
- * and a class the pool was configured for.
- * All available classes may appear, preserving input FIFO order within each class.
- * Failure changes no slots, queues, or output handles and starts no jobs.
- * Success fills handles in input order before any worker can dequeue the batch.
- * No allocation. Arrays must not overlap pool storage or each other. */
-int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles);
 /* UI-only physical lease acknowledgement. True for the refused handle, after
  * shutdown, or once its worker has returned / queued cancellation removed it.
  * Cancellation alone does not finish a running lease. Valid across slot reuse
@@ -208,7 +177,6 @@ bool     work_should_stop(const work_ctx *c);   /* poll at least every 5 ms CPU 
  * Continuations must not wait for I/O or a full mailbox on the foreground
  * lane: retain progress and retry in a later invocation instead. */
 bool     work_continue(work_ctx *c);
-uint64_t work_cancel_time_ns(const work_ctx *c);/* when cancelled (0 if not) */
 /* Returns false if dropped (stale job or mailbox full). */
 bool     work_publish(work_ctx *c, const work_msg *m);
 
@@ -219,11 +187,6 @@ bool     work_publish(work_ctx *c, const work_msg *m);
  * between calls. Nested drains on the same pool return 0. Partial drains re-arm
  * the wake so the caller can resume after checking input. */
 size_t work_mailbox_drain(work_pool *p, void (*cb)(const work_msg *, void *), void *ud);
-/* Explicit slice controls: maximum examined messages and absolute
- * CLOCK_MONOTONIC deadline in ns (0 disables the deadline). max_messages=0
- * consumes nothing. Callback must be non-NULL. Valid after shutdown as well. */
-size_t work_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
-                                  void *ud, size_t max_messages, uint64_t deadline_ns);
 /* UI-only continuation check; also true when all remaining messages are stale. */
 bool work_mailbox_pending(const work_pool *p);
 
@@ -232,24 +195,11 @@ bool work_mailbox_pending(const work_pool *p);
  * pending reservations, payload, and per-worker order for their own receiver
  * or a later ordinary drain. Stale messages may be discarded during any scan.
  * Examined messages (including foreign messages and consumed holes) count
- * against max_messages. A per-handle cursor makes repeated slices progress
- * past foreign traffic. Return delivered count; nested receives/drains return
- * zero. Deadlines, callbacks and continuation follow the bounded-drain rules.
+ * against WORK_DRAIN_MAX_MESSAGES. A per-handle cursor makes repeated slices
+ * progress past foreign traffic. Return delivered count. Nested receives and
+ * drains return zero. Deadlines and callbacks follow the ordinary drain rules.
  * A foreign message at the ring head retains ring capacity until drained;
  * each client must continue pumping the shared pool. No allocation. */
-size_t work_mailbox_receive_bounded(work_pool *p, work_handle h, uint32_t generation,
-    void (*cb)(const work_msg *, void *), void *ud, size_t max_messages, uint64_t deadline_ns);
 size_t work_mailbox_receive(work_pool *p, work_handle h, uint32_t generation,
     void (*cb)(const work_msg *, void *), void *ud);
-/* Optional UI-only handler for this identity/generation. Ordinary drains route
- * matching validated messages here instead of their fallback callback, so a
- * shared-pool dispatcher cannot steal another client's result. Selective
- * receive uses the same handler when bound. Bind after submit, before any UI
- * pumping; worker publication may already have occurred. Returns -1 for the
- * refused handle or a stale binding. cb=NULL removes only this identity's
- * binding (also allowed after cancellation/shutdown). Unbind before freeing ud; do not
- * init/shutdown/free a bound receiver from inside its callback. */
-int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
-    void (*cb)(const work_msg *, void *), void *ud);
-
 #endif

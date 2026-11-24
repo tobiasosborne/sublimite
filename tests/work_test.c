@@ -3,6 +3,13 @@
 #include "trace/trace.h"
 #include "assert_death.h"
 
+/* Exact slice and admission controls from the work test object. */
+int work_test_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles);
+size_t work_test_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
+                                      void *ud, size_t max_messages, uint64_t deadline_ns);
+size_t work_test_mailbox_receive_bounded(work_pool *p, work_handle h, uint32_t generation,
+    void (*cb)(const work_msg *, void *), void *ud, size_t max_messages, uint64_t deadline_ns);
+
 #include <sched.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -159,7 +166,6 @@ static void wait_finished(work_handle h)
 }
 typedef struct fixture {
     _Atomic uint32_t started, ran;
-    _Atomic uint64_t stopped_ns;
     uint32_t n;
 } fixture;
 static void job_pub(work_ctx *c)
@@ -176,7 +182,6 @@ static void job_block(work_ctx *c)
     fixture *f = c->arg;
     atomic_store_explicit(&f->started, 1, memory_order_release);
     while (!work_should_stop(c)) sleep_ms(1);
-    atomic_store(&f->stopped_ns, work_cancel_time_ns(c));
     atomic_fetch_add_explicit(&f->ran, 1, memory_order_release);
 }
 static void job_noop(work_ctx *c)
@@ -217,7 +222,7 @@ static void test_recursive(void)
     CHECK(h.epoch);
     wait_finished(h);
     recursive_collection c = {0};
-    size_t n = work_mailbox_drain_bounded(&pool, recursive_cb, &c, 2, 0);
+    size_t n = work_test_mailbox_drain_bounded(&pool, recursive_cb, &c, 2, 0);
     CHECK(c.calls == 2 && c.nested == 0 && n == 2);
     CHECK(atomic_load(&pool.slots[h.slot].pending) == 0);
     printf("work_test: section1 callbacks=%zu nested=%zu delivered=%zu pending=%u\n", c.calls, c.nested, n, atomic_load(&pool.slots[h.slot].pending));
@@ -389,27 +394,13 @@ static void test_slice(void)
     CHECK(n <= 1 && n == c.n && work_mailbox_pending(&pool));
     CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     while (c.n < f.n) {
-        size_t got = work_mailbox_drain_bounded(&pool, collect, &c, WORK_DRAIN_MAX_MESSAGES, 0);
+        size_t got = work_test_mailbox_drain_bounded(&pool, collect, &c, WORK_DRAIN_MAX_MESSAGES, 0);
         if (!got) { CHECK(false); break; }
     }
     CHECK(c.n == f.n && atomic_load(&pool.slots[h.slot].pending) == 0);
     work_pool_shutdown(&pool);
     result("section8 slice", before);
 }
-static void test_shutdown_stamp(void)
-{
-    int before = atomic_load(&fails);
-    if (!init_pool(0)) return;
-    fixture f = {0};
-    work_handle h = work_submit(&pool, (work_job){job_block, &f, 0, WORK_BULK});
-    CHECK(h.epoch);
-    (void)wait_value(&f.started, 1);
-    work_pool_shutdown(&pool);
-    CHECK(atomic_load(&f.stopped_ns) != 0);
-    printf("work_test: section18 timestamp_nonzero=%d\n", atomic_load(&f.stopped_ns) != 0 ? 1 : 0);
-    result("section18 shutdown_stamp", before);
-}
-
 static void job_stale_publish(work_ctx *c)
 {
     fixture *f = c->arg;
@@ -435,13 +426,13 @@ static void test_reservations(void)
     work_handle b = work_submit(&pool, (work_job){job_noop, &noop, 0, WORK_BULK});
     CHECK(b.epoch && b.slot != a.slot); wait_finished(b);
     collection c = {0};
-    CHECK(work_mailbox_drain_bounded(&pool, collect, &c, 3, 0) == 3 && c.n == 3);
+    CHECK(work_test_mailbox_drain_bounded(&pool, collect, &c, 3, 0) == 3 && c.n == 3);
     work_handle reuse = work_submit(&pool, (work_job){job_pub, &f, 0, WORK_BULK});
     CHECK(reuse.epoch && reuse.slot == a.slot); wait_finished(reuse);
     work_cancel(&pool, a); /* old submission must not invalidate reuse */
     CHECK(atomic_load(&pool.slots[reuse.slot].epoch) == reuse.epoch);
     work_cancel(&pool, reuse); /* suppress already-published messages */
-    CHECK(work_mailbox_drain_bounded(&pool, discard, NULL, 3, 0) == 0);
+    CHECK(work_test_mailbox_drain_bounded(&pool, discard, NULL, 3, 0) == 0);
     CHECK(atomic_load(&pool.slots[reuse.slot].pending) == 0);
     atomic_store(&f.started, 0);
     reuse = work_submit(&pool, (work_job){job_stale_publish, &f, 0, WORK_BULK});
@@ -452,7 +443,7 @@ static void test_reservations(void)
     reuse = work_submit(&pool, (work_job){job_pub, &f, 0, WORK_BULK});
     CHECK(reuse.epoch); wait_finished(reuse);
     submit_collection sc = {.arg = &noop};
-    CHECK(work_mailbox_drain_bounded(&pool, submit_from_callback, &sc, 1, 0) == 1);
+    CHECK(work_test_mailbox_drain_bounded(&pool, submit_from_callback, &sc, 1, 0) == 1);
     wait_finished(sc.submitted);
     work_pool_shutdown(&pool);
     result("reservation_and_cancel_contracts", before);
@@ -473,15 +464,15 @@ static void test_budget_controls(void)
     work_handle r = work_submit(&pool, (work_job){job_pub, &raster, 22, WORK_RASTER});
     CHECK(b.epoch && r.epoch); wait_finished(b); wait_finished(r);
     generation_collection c = {0};
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 0, 0) == 0);
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 1) == 0);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 0, 0) == 0);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 1) == 0);
     CHECK(work_mailbox_pending(&pool));
 
     CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 11);
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 22);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 11);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 22);
     work_cancel(&pool, b);
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 0);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 0);
     CHECK(atomic_load(&pool.slots[b.slot].pending) == WORK_MAILBOX_CAP - 2u);
     CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     work_pool_shutdown(&pool);
@@ -513,8 +504,8 @@ static void test_cancel_fifo(void)
     CHECK(pool.queue[0].q[(pool.queue[0].head + 1u) % WORK_MAX_JOBS] == h[3].slot);
     work_cancel(&pool, block); wait_finished(block); wait_finished(h[1]); wait_finished(h[3]);
     generation_collection c = {0};
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 1);
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 3);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 1);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &c, 1, 0) == 1 && c.generation == 3);
     CHECK(atomic_load(&queued[0].ran) == 0 && atomic_load(&queued[2].ran) == 0 && atomic_load(&queued[4].ran) == 0);
     work_pool_shutdown(&pool);
     result("section7 cancelled_queue_fifo_wrap", before);
@@ -645,7 +636,7 @@ static void test_state_machine(void)
             fixtures[index].n = random_step(&rng) % 4u;
             handles[index] = work_submit(&pool, (work_job){job_maybe_pub, &fixtures[index], step, (random_step(&rng) & 1u) ? WORK_BULK : WORK_RASTER});
         }
-        (void)work_mailbox_drain_bounded(&pool, discard, NULL, random_step(&rng) % 8u, 0);
+        (void)work_test_mailbox_drain_bounded(&pool, discard, NULL, random_step(&rng) % 8u, 0);
         if (!(step % 32u)) (void)sched_yield();
     }
     work_pool_shutdown(&pool);
@@ -664,7 +655,6 @@ static void job_trace(work_ctx *c)
 static void test_trace_pool_lifetimes(void)
 {
     int before = atomic_load(&fails);
-    trace_reset();
     /* One more pool lifetime than the total number of physical slots. */
     const uint32_t lifetimes = TRACE_MAX_THREADS + 1u;
     for (uint32_t i = 1; i <= lifetimes; i++) {
@@ -699,7 +689,6 @@ static void test_trace_pool_lifetimes(void)
 static void test_selective_receive(void);
 static void test_atomic_batch(void);
 static void test_receive_slices(void);
-static void test_receive_routes(void);
 static void test_finished_leases(void);
 static void test_batch_contracts(void);
 static void test_dormant_receive_wrap(void);
@@ -709,7 +698,6 @@ static void test_foreground_cancel_shutdown(void);
 static void test_foreground_mailbox(void);
 static void test_foreground_init_errors(void);
 static void test_continuations(void);
-static void test_foreground_priority(void);
 static bool init_foreground_pool(uint32_t raster);
 /* The pool shape is the caller's configuration: n_bulk != 1 is a caller bug (A15). */
 static void init_two_bulk(void)
@@ -731,10 +719,9 @@ int main(int argc, char **argv)
         {"4", test_shutdown}, {"5", test_closed_submit}, {"6", test_init_errors},
         {"7", test_churn}, {"8", test_slice}, {"15", test_live_ordering},
         {"15", test_full_wrap}, {"15", test_state_machine},
-        {"18", test_shutdown_stamp},
         {"basic", test_reservations}, {"8", test_budget_controls}, {"7", test_cancel_fifo},
         {"receive", test_selective_receive}, {"batch", test_atomic_batch},
-        {"receive", test_receive_slices}, {"receive", test_receive_routes},
+        {"receive", test_receive_slices},
         {"receive", test_finished_leases}, {"batch", test_batch_contracts},
         {"receive", test_dormant_receive_wrap},
         {"foreground", test_foreground_progress},
@@ -743,7 +730,6 @@ int main(int argc, char **argv)
         {"foreground", test_foreground_mailbox},
         {"foreground", test_foreground_init_errors},
         {"continue", test_continuations},
-        {"priority", test_foreground_priority},
         {"trace", test_trace_pool_lifetimes}
     };
     bool ran = false;
@@ -763,14 +749,12 @@ typedef struct continuation_fixture {
     _Atomic uint32_t release;
     uint32_t steps;
     bool yield_ok;
-    uint32_t workers[3];
     fixture *reply;
 } continuation_fixture;
 
 static void job_continue(work_ctx *c)
 {
     continuation_fixture *f = c->arg;
-    if (f->steps < 3) f->workers[f->steps] = c->worker;
     f->steps++;
     if (f->steps == 2 && f->reply) CHECK(atomic_load(&f->reply->ran) == 1);
     if (f->steps == 1) {
@@ -779,20 +763,6 @@ static void job_continue(work_ctx *c)
     }
     if (f->steps < 3) f->yield_ok = work_continue(c);
 }
-static void job_ordered_continue(work_ctx *c)
-{
-    continuation_fixture *f = c->arg;
-    work_msg msg = {.kind = f->steps, .generation = c->generation};
-    CHECK(work_publish(c, &msg));
-    job_continue(c);
-}
-typedef struct ordered_delivery { uint32_t next; } ordered_delivery;
-static void collect_ordered(const work_msg *msg, void *ctx)
-{
-    ordered_delivery *seen = ctx;
-    CHECK(msg->kind == seen->next++);
-}
-
 static void test_continuations(void)
 {
     int before = atomic_load(&fails);
@@ -811,86 +781,6 @@ static void test_continuations(void)
         work_pool_shutdown(&pool);
     }
     result("continuation_same_lease_all_classes", before);
-}
-
-static void test_foreground_priority(void)
-{
-    int before = atomic_load(&fails);
-    if (!init_foreground_pool(1)) return;
-    fixture blocker = {0}, reply = {.n = 2};
-    work_handle bulk = work_submit(&pool, (work_job){job_block, &blocker, 10, WORK_BULK});
-    CHECK(bulk.epoch); (void)wait_value(&blocker.started, 1);
-    work_handle queued = work_submit(&pool, (work_job){job_pub, &reply, 11, WORK_BULK});
-    CHECK(queued.epoch);
-    int rc = work_prioritize(&pool, queued);
-    CHECK(rc == 0);
-    if (rc == 0) {
-        wait_finished(queued);
-        CHECK(!work_handle_finished(&pool, bulk));
-        CHECK(atomic_load(&reply.ran) == 1);
-        CHECK(pool.slots[queued.slot].job.cls == WORK_FOREGROUND);
-        CHECK(atomic_load(&pool.slots[queued.slot].epoch) == queued.epoch);
-        CHECK(work_prioritize(&pool, queued) == 0); /* idempotent completion */
-    }
-    work_cancel(&pool, bulk); wait_finished(bulk);
-    wait_finished(queued);
-    CHECK(work_prioritize(&pool, bulk) == -1); /* cancelled identity */
-    collection got = {0};
-    while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, collect, &got);
-    CHECK(got.n == 2);
-    work_pool_shutdown(&pool);
-    CHECK(work_prioritize(&pool, queued) == -1);
-
-    /* The running invocation remains on its owner until return; only its
-     * next continuation moves, with the same identity and argument. */
-    if (!init_foreground_pool(0)) return;
-    continuation_fixture f = {0};
-    work_handle running = work_submit(&pool, (work_job){job_continue, &f, 12, WORK_BULK});
-    CHECK(running.epoch); (void)wait_value(&f.pause.started, 1);
-    CHECK(work_prioritize(&pool, running) == 0);
-    atomic_store(&f.release, 1);
-    wait_finished(running);
-    CHECK(f.steps == 3 && f.yield_ok);
-    CHECK(f.workers[0] == 0 && f.workers[1] == WORK_FOREGROUND_WORKER &&
-          f.workers[2] == WORK_FOREGROUND_WORKER);
-    CHECK(pool.slots[running.slot].job.cls == WORK_FOREGROUND);
-    work_pool_shutdown(&pool);
-
-    if (!init_foreground_pool(0)) return;
-    fixture foreground_blocker = {0}, marker = {0};
-    work_handle held = work_submit(&pool, (work_job){job_block, &foreground_blocker, 1, WORK_FOREGROUND});
-    CHECK(held.epoch); (void)wait_value(&foreground_blocker.started, 1);
-    continuation_fixture stream = {0};
-    work_handle moving = work_submit(&pool, (work_job){job_ordered_continue, &stream, 2, WORK_BULK});
-    CHECK(moving.epoch); (void)wait_value(&stream.pause.started, 1);
-    CHECK(work_prioritize(&pool, moving) == 0);
-    atomic_store(&stream.release, 1);
-    /* Keep foreground physically paused until the continuation is queued. */
-    uint64_t deadline = os_now_ns() + 2000000000ull;
-    bool continuation_queued = false;
-    while (!continuation_queued && os_now_ns() < deadline) {
-        os_mutex_lock(&pool.mu);
-        for (uint32_t i = 0; i < pool.foreground_queue.count; i++)
-            continuation_queued = continuation_queued || pool.foreground_queue.q[(pool.foreground_queue.head + i) % WORK_MAX_JOBS] == moving.slot;
-        os_mutex_unlock(&pool.mu);
-        if (!continuation_queued) sleep_ms(1);
-    }
-    CHECK(continuation_queued);
-    work_handle mark = work_submit(&pool, (work_job){job_noop, &marker, 3, WORK_FOREGROUND});
-    CHECK(mark.epoch);
-    work_cancel(&pool, held); wait_finished(held); wait_finished(mark);
-    /* Visit the destination mailbox first: old delivery must still precede
-     * any message from the migrated invocation. */
-    pool.slots[moving.slot].receive_next = pool.n_workers;
-    ordered_delivery seen = {0};
-    while (seen.next < 3 && os_now_ns() < deadline) {
-        (void)work_mailbox_receive(&pool, moving, 2, collect_ordered, &seen);
-        sleep_ms(1);
-    }
-    CHECK(seen.next == 3);
-    wait_finished(moving);
-    work_pool_shutdown(&pool);
-    result("foreground_priority_same_lease_queued_running", before);
 }
 
 typedef struct selective_collection { work_handle h; uint32_t generation, next; size_t n; } selective_collection;
@@ -912,12 +802,12 @@ static void test_selective_receive(void)
     work_handle b = work_submit(&pool, (work_job){job_pub, &selected, 11, WORK_BULK});
     CHECK(b.epoch); wait_finished(b);
     selective_collection received = {.h = b, .generation = 11};
-    (void)work_mailbox_receive_bounded(&pool, b, 11, collect_selected, &received, WORK_MAILBOX_CAP, 0);
+    (void)work_test_mailbox_receive_bounded(&pool, b, 11, collect_selected, &received, WORK_MAILBOX_CAP, 0);
     CHECK(received.n == 2);
     CHECK(atomic_load(&pool.slots[a.slot].pending) == 3);
     CHECK(atomic_load(&pool.slots[b.slot].pending) == 0);
     collection others = {0};
-    (void)work_mailbox_drain_bounded(&pool, collect, &others, WORK_MAILBOX_CAP, 0);
+    (void)work_test_mailbox_drain_bounded(&pool, collect, &others, WORK_MAILBOX_CAP, 0);
     CHECK(others.n == 3);
     printf("work_test: receive selected=%zu foreign=%zu\n", received.n, others.n);
     work_pool_shutdown(&pool);
@@ -942,7 +832,7 @@ static void test_atomic_batch(void)
     }
     memcpy(untouched, handles, sizeof handles);
     uint32_t count_before = pool.queue[WORK_BULK].count;
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(work_test_submit_batch(&pool, jobs, 4, handles) == -1);
     CHECK(memcmp(handles, untouched, sizeof handles) == 0);
     CHECK(pool.queue[WORK_BULK].count == count_before);
     CHECK(atomic_load(&pool.slots[WORK_MAX_JOBS - 2u].epoch) == 1);
@@ -969,12 +859,12 @@ static void test_receive_slices(void)
     work_handle b = work_submit(&pool, (work_job){job_pub, &target, 31, WORK_BULK});
     CHECK(b.epoch); wait_finished(b);
     selective_collection received = {.h = b, .generation = 31};
-    CHECK(work_mailbox_receive_bounded(&pool, b, 32, collect_selected, &received, 130, 0) == 0);
+    CHECK(work_test_mailbox_receive_bounded(&pool, b, 32, collect_selected, &received, 130, 0) == 0);
     CHECK(atomic_load(&pool.slots[b.slot].pending) == 3);
-    CHECK(work_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, 0, 0) == 0);
-    CHECK(work_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, WORK_MAILBOX_CAP, os_now_ns()) == 0);
+    CHECK(work_test_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, 0, 0) == 0);
+    CHECK(work_test_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, WORK_MAILBOX_CAP, os_now_ns()) == 0);
     for (size_t i = 0; i < 160 && received.n < 3; i++)
-        (void)work_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, 1, 0);
+        (void)work_test_mailbox_receive_bounded(&pool, b, 31, collect_selected, &received, 1, 0);
     CHECK(received.n == 3);
     CHECK(atomic_load(&pool.mb[0].head) == origin); /* foreign head still owns capacity */
     CHECK(atomic_load(&pool.slots[a.slot].pending) == 129);
@@ -982,7 +872,7 @@ static void test_receive_slices(void)
     CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
     collection others = {0};
     while (work_mailbox_pending(&pool))
-        (void)work_mailbox_drain_bounded(&pool, collect, &others, 1, 0);
+        (void)work_test_mailbox_drain_bounded(&pool, collect, &others, 1, 0);
     CHECK(others.n == 129);
     CHECK(atomic_load(&pool.mb[0].head) == origin + 132u);
     CHECK(atomic_load(&pool.slots[a.slot].pending) == 0);
@@ -990,54 +880,16 @@ static void test_receive_slices(void)
     result("receive_slices_generation_wrap_continuation", before);
 }
 
-typedef struct bound_collection { selective_collection selected; size_t nested; } bound_collection;
-static void bound_cb(const work_msg *m, void *arg)
+typedef struct recursive_receive { selective_collection selected; size_t nested; } recursive_receive;
+static void receive_recursive_cb(const work_msg *m, void *arg)
 {
-    bound_collection *bound = arg;
-    collect_selected(m, &bound->selected);
+    recursive_receive *recursion = arg;
+    collect_selected(m, &recursion->selected);
     CHECK(atomic_load(&pool.slots[m->slot_].pending) > 0);
-    bound->nested += work_mailbox_receive_bounded(&pool, bound->selected.h,
-        bound->selected.generation, discard, NULL, WORK_MAILBOX_CAP, 0);
-    bound->nested += work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
+    recursion->nested += work_test_mailbox_receive_bounded(&pool, recursion->selected.h,
+        recursion->selected.generation, discard, NULL, WORK_MAILBOX_CAP, 0);
+    recursion->nested += work_test_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
 }
-static void test_receive_routes(void)
-{
-    int before = atomic_load(&fails);
-    if (!init_pool(1)) return;
-    fixture target = {.n = 3}, foreign = {.n = 2};
-    work_handle a = work_submit(&pool, (work_job){job_pub, &target, 41, WORK_BULK});
-    CHECK(a.epoch); wait_finished(a);
-    work_handle b = work_submit(&pool, (work_job){job_pub, &foreign, 42, WORK_RASTER});
-    CHECK(b.epoch); wait_finished(b);
-    bound_collection bound = {.selected = {.h = a, .generation = 41}};
-    CHECK(work_mailbox_bind(&pool, a, 40, bound_cb, &bound) == -1);
-    CHECK(work_mailbox_bind(&pool, a, 41, bound_cb, &bound) == 0);
-    selective_collection others = {.h = b, .generation = 42};
-    CHECK(work_mailbox_drain_bounded(&pool, collect_selected, &others, WORK_MAILBOX_CAP, 0) == 5);
-    CHECK(bound.selected.n == 3 && bound.nested == 0 && others.n == 2);
-    work_handle reuse = work_submit(&pool, (work_job){job_pub, &target, 43, WORK_BULK});
-    CHECK(reuse.epoch && reuse.slot == a.slot); wait_finished(reuse);
-    bound.selected = (selective_collection){.h = reuse, .generation = 43};
-    CHECK(work_mailbox_bind(&pool, reuse, 43, bound_cb, &bound) == 0);
-    CHECK(work_mailbox_bind(&pool, a, 41, NULL, NULL) == 0); /* cannot erase replacement binding */
-    CHECK(work_mailbox_receive_bounded(&pool, reuse, 43, discard, NULL, WORK_MAILBOX_CAP, 0) == 3);
-    CHECK(bound.selected.n == 3);
-    work_handle cancelled = work_submit(&pool, (work_job){job_pub, &target, 44, WORK_BULK});
-    CHECK(cancelled.epoch); wait_finished(cancelled);
-    bound.selected = (selective_collection){.h = cancelled, .generation = 44};
-    CHECK(work_mailbox_bind(&pool, cancelled, 44, bound_cb, &bound) == 0);
-    work_cancel(&pool, cancelled);
-    CHECK(work_mailbox_receive_bounded(&pool, cancelled, 44, bound_cb, &bound, WORK_MAILBOX_CAP, 0) == 0);
-    CHECK(bound.selected.n == 0 && atomic_load(&pool.slots[cancelled.slot].pending) == 0);
-    CHECK(work_mailbox_bind(&pool, cancelled, 44, NULL, NULL) == 0);
-    work_handle shutdown = work_submit(&pool, (work_job){job_pub, &target, 45, WORK_BULK});
-    CHECK(shutdown.epoch); wait_finished(shutdown);
-    work_pool_shutdown(&pool);
-    CHECK(work_mailbox_receive_bounded(&pool, shutdown, 45, discard, NULL, WORK_MAILBOX_CAP, 0) == 0);
-    CHECK(!work_mailbox_pending(&pool));
-    result("receive_binding_cancel_shutdown_reentrancy", before);
-}
-
 static void test_finished_leases(void)
 {
     int before = atomic_load(&fails);
@@ -1099,11 +951,11 @@ static void test_batch_contracts(void)
         handles[i] = (work_handle){UINT32_MAX, UINT32_MAX};
     }
     work_handle saved[WORK_MAX_JOBS]; memcpy(saved, handles, sizeof saved);
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(work_test_submit_batch(&pool, jobs, 4, handles) == -1);
     CHECK(memcmp(saved, handles, sizeof saved) == 0 && atomic_load(&visible.ran) == 0);
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
-    CHECK(work_submit_batch(NULL, NULL, 0, NULL) == 0);
-    CHECK(work_submit_batch(&pool, jobs, WORK_MAX_JOBS, handles) == 0);
+    CHECK(work_test_submit_batch(NULL, NULL, 0, NULL) == 0);
+    CHECK(work_test_submit_batch(&pool, jobs, WORK_MAX_JOBS, handles) == 0);
     (void)wait_value(&visible.ran, WORK_MAX_JOBS);
     for (size_t i = 0; i < WORK_MAX_JOBS; i++) {
         wait_finished(handles[i]);
@@ -1111,13 +963,13 @@ static void test_batch_contracts(void)
     }
     work_pool_shutdown(&pool);
     memcpy(saved, handles, sizeof saved);
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(work_test_submit_batch(&pool, jobs, 4, handles) == -1);
     CHECK(memcmp(saved, handles, sizeof saved) == 0);
     result("batch_pending_invalid_full_publication_shutdown", before);
 
     if (!init_pool(0)) return;
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) atomic_store(&pool.slots[i].epoch, UINT32_MAX - 1u);
-    CHECK(work_submit_batch(&pool, jobs, 4, handles) == -1);
+    CHECK(work_test_submit_batch(&pool, jobs, 4, handles) == -1);
     CHECK(memcmp(saved, handles, sizeof saved) == 0 && pool.queue[0].count == 0);
     work_pool_shutdown(&pool);
     result("batch_retired_identities", before);
@@ -1129,7 +981,7 @@ static void test_batch_contracts(void)
     size_t shared = WORK_MAX_JOBS - WORK_RASTER_RESERVE;
     for (size_t i = 0; i < shared - 1; i++) jobs[i] = (work_job){job_noop, &cancelled, 52, WORK_BULK};
     jobs[shared - 1] = (work_job){job_pub, &raster, 53, WORK_RASTER};
-    CHECK(work_submit_batch(&pool, jobs, shared, handles) == 0);
+    CHECK(work_test_submit_batch(&pool, jobs, shared, handles) == 0);
     wait_finished(handles[shared - 1]);
     CHECK(handles[shared - 1].slot >= shared);
     for (size_t i = 0; i < shared - 1; i++) work_cancel(&pool, handles[i]);
@@ -1163,19 +1015,19 @@ static void test_dormant_receive_wrap(void)
     work_handle h = work_submit(&pool, (work_job){job_receive_wrap, &f, 71, WORK_BULK});
     CHECK(h.epoch); (void)wait_value(&f.ready, 1);
     selective_collection selected = {.h = h, .generation = 71};
-    CHECK(work_mailbox_receive_bounded(&pool, h, 71, collect_selected, &selected, 2, 0) == 0);
-    (void)work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
+    CHECK(work_test_mailbox_receive_bounded(&pool, h, 71, collect_selected, &selected, 2, 0) == 0);
+    (void)work_test_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
     /* Compress a dormant selector's nearly-full counter cycle. The ring is
      * empty and its producer is paused, just as in the existing wrap fixture. */
     uint32_t origin = UINT32_MAX - 2u;
     atomic_store(&pool.mb[0].head, origin); atomic_store(&pool.mb[0].tail, origin);
     atomic_store_explicit(&f.phase, 1, memory_order_release);
     (void)wait_value(&f.ready, 2);
-    (void)work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
+    (void)work_test_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0);
     CHECK(atomic_load(&pool.mb[0].head) == 0);
     atomic_store_explicit(&f.phase, 2, memory_order_release);
     wait_finished(h);
-    CHECK(work_mailbox_receive_bounded(&pool, h, 71, collect_selected, &selected, WORK_MAILBOX_CAP, 0) == 3);
+    CHECK(work_test_mailbox_receive_bounded(&pool, h, 71, collect_selected, &selected, WORK_MAILBOX_CAP, 0) == 3);
     CHECK(selected.n == 3);
     work_pool_shutdown(&pool);
     while (work_mailbox_pending(&pool)) (void)work_mailbox_drain(&pool, discard, NULL);
@@ -1237,7 +1089,7 @@ static void test_foreground_progress(void)
     /* v1 foreground fixture watchdog bounds the wait for one publication. */
     CHECK(wake_wait(work_pool_wake(&pool), 2000000000) == OS_OK);
     selective_collection seen = {.h = fg, .generation = 84};
-    CHECK(work_mailbox_receive_bounded(&pool, fg, 84, collect_selected, &seen, WORK_MAILBOX_CAP, 0) == 1);
+    CHECK(work_test_mailbox_receive_bounded(&pool, fg, 84, collect_selected, &seen, WORK_MAILBOX_CAP, 0) == 1);
     CHECK(seen.n == 1 && !work_handle_finished(&pool, bulk));
     CHECK(atomic_load(&queued.ran) == 0);
 
@@ -1274,7 +1126,7 @@ static void test_foreground_contracts(void)
     work_handle handles[WORK_RASTER_RESERVE + WORK_FOREGROUND_RESERVE];
     for (uint32_t i = 0; i < WORK_RASTER_RESERVE + WORK_FOREGROUND_RESERVE; i++)
         jobs[i] = (work_job){job_pub, &pub, 90, i < WORK_FOREGROUND_RESERVE ? WORK_FOREGROUND : WORK_RASTER};
-    CHECK(work_submit_batch(&pool, jobs, WORK_RASTER_RESERVE + WORK_FOREGROUND_RESERVE, handles) == 0);
+    CHECK(work_test_submit_batch(&pool, jobs, WORK_RASTER_RESERVE + WORK_FOREGROUND_RESERVE, handles) == 0);
     for (uint32_t i = 0; i < WORK_RASTER_RESERVE + WORK_FOREGROUND_RESERVE; i++) {
         CHECK(handles[i].epoch);
         wait_finished(handles[i]);
@@ -1287,13 +1139,13 @@ static void test_foreground_contracts(void)
     CHECK(work_submit(&pool, (work_job){job_noop, &queued, 0, WORK_FOREGROUND}).epoch == 0);
     CHECK(work_submit(&pool, (work_job){job_noop, &queued, 0, WORK_RASTER}).epoch == 0);
     for (uint32_t i = 0; i < WORK_FOREGROUND_RESERVE; i++) {
-        CHECK(work_mailbox_receive_bounded(&pool, handles[i], 90, discard, NULL, WORK_MAILBOX_CAP, 0) == 1);
+        CHECK(work_test_mailbox_receive_bounded(&pool, handles[i], 90, discard, NULL, WORK_MAILBOX_CAP, 0) == 1);
         CHECK(atomic_load(&pool.slots[handles[i].slot].pending) == 0);
     }
     CHECK(atomic_load(&pool.slots[handles[WORK_FOREGROUND_RESERVE].slot].pending) == 1);
     work_job refused[2] = {{job_noop, &queued, 0, WORK_FOREGROUND}, {job_noop, &queued, 0, WORK_BULK}};
     work_handle outputs[2] = {{UINT32_MAX, UINT32_MAX}, {UINT32_MAX, UINT32_MAX}};
-    CHECK(work_submit_batch(&pool, refused, 2, outputs) == -1);
+    CHECK(work_test_submit_batch(&pool, refused, 2, outputs) == -1);
     CHECK(outputs[0].epoch == UINT32_MAX && outputs[1].epoch == UINT32_MAX);
     CHECK(pool.foreground_queue.count == 0);
     work_handle again = work_submit(&pool, (work_job){job_pub, &pub, 91, WORK_FOREGROUND});
@@ -1335,8 +1187,8 @@ static void test_foreground_cancel_shutdown(void)
     work_cancel(&pool, blocker); wait_finished(blocker);
     wait_finished(handles[1]); wait_finished(handles[3]);
     generation_collection seen = {0};
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &seen, 1, 0) == 1 && seen.generation == 1);
-    CHECK(work_mailbox_drain_bounded(&pool, generation_cb, &seen, 1, 0) == 1 && seen.generation == 3);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &seen, 1, 0) == 1 && seen.generation == 1);
+    CHECK(work_test_mailbox_drain_bounded(&pool, generation_cb, &seen, 1, 0) == 1 && seen.generation == 3);
     CHECK(atomic_load(&queued[0].ran) == 0 && atomic_load(&queued[2].ran) == 0 && atomic_load(&queued[4].ran) == 0);
     fixture pending = {.n = 2}, never_run = {.n = 1};
     work_handle published = work_submit(&pool, (work_job){job_pub, &pending, 94, WORK_FOREGROUND});
@@ -1351,7 +1203,7 @@ static void test_foreground_cancel_shutdown(void)
     CHECK(pool.foreground_queue.count == 0 && !pool.foreground_started);
     CHECK(atomic_load(&never_run.ran) == 0 && atomic_load(&pool.slots[dropped.slot].busy) == 0);
     CHECK(work_mailbox_pending(&pool));
-    CHECK(work_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0) == 0);
+    CHECK(work_test_mailbox_drain_bounded(&pool, discard, NULL, WORK_MAILBOX_CAP, 0) == 0);
     CHECK(!work_mailbox_pending(&pool) && atomic_load(&pool.slots[published.slot].pending) == 0);
     work_pool_shutdown(&pool);
     result("foreground_fifo_cancel_shutdown_stale_drain", before);
@@ -1370,11 +1222,10 @@ static void test_foreground_mailbox(void)
     CHECK(a.epoch); wait_finished(a);
     work_handle b = work_submit(&pool, (work_job){job_pub, &selected, 98, WORK_FOREGROUND});
     CHECK(b.epoch); wait_finished(b);
-    bound_collection bound = {.selected = {.h = b, .generation = 98}};
-    CHECK(work_mailbox_bind(&pool, b, 98, bound_cb, &bound) == 0);
+    recursive_receive recursion = {.selected = {.h = b, .generation = 98}};
     for (uint32_t i = 0; i < 5; i++)
-        (void)work_mailbox_receive_bounded(&pool, b, 98, discard, NULL, 1, 0);
-    CHECK(bound.selected.n == 2 && bound.nested == 0);
+        (void)work_test_mailbox_receive_bounded(&pool, b, 98, receive_recursive_cb, &recursion, 1, 0);
+    CHECK(recursion.selected.n == 2 && recursion.nested == 0);
     CHECK(atomic_load(&pool.foreground_mb.head) == origin);
     CHECK(atomic_load(&pool.slots[a.slot].pending) == 3);
     collection others = {0};
@@ -1396,7 +1247,7 @@ static void test_foreground_mailbox(void)
     CHECK(seen.total == 3u * fixtures[0].n);
     work_pool_shutdown(&pool);
     CHECK(!work_mailbox_pending(&pool));
-    result("foreground_mailbox_wrap_bind_live_integrity", before);
+    result("foreground_mailbox_wrap_receive_live_integrity", before);
 }
 
 static void test_foreground_init_errors(void)

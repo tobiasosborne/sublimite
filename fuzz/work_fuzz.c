@@ -5,7 +5,6 @@
 typedef struct fuzz_job {
     work_handle handle;
     uint32_t id, generation, limit, sent, received;
-    work_class cls;
     bool cancelled;
 } fuzz_job;
 typedef struct fuzz_state {
@@ -43,9 +42,8 @@ static work_job prepare(fuzz_state *state, uint8_t value)
     job->id = (uint32_t)state->count;
     job->generation = 100u + (uint32_t)state->count;
     job->limit = 1u + value % 12u;
-    job->cls = (work_class)(value % 3u);
     state->count++;
-    return (work_job){job_step, job, job->generation, job->cls};
+    return (work_job){job_step, job, job->generation, (work_class)(value % 3u)};
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
@@ -67,33 +65,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             work_cancel(&state.pool, state.jobs[selected].handle);
             state.jobs[selected].cancelled = true;
         } else if (op == 2 && state.count + 3 <= WORK_MAX_JOBS) {
-            size_t first = state.count;
-            work_job jobs[3]; work_handle handles[3] = {{0}};
-            for (uint8_t j = 0; j < 3; j++) jobs[j] = prepare(&state, (uint8_t)(value + j));
-            int rc = work_submit_batch(&state.pool, jobs, 3, handles);
-            for (size_t j = 0; j < 3; j++) {
-                state.jobs[first + j].handle = handles[j];
-                ASSERT(rc == 0 ? handles[j].epoch != 0 : handles[j].epoch == 0);
+            for (uint8_t j = 0; j < 3; j++) {
+                size_t next = state.count;
+                work_job job = prepare(&state, (uint8_t)(value + j));
+                state.jobs[next].handle = work_submit(&state.pool, job);
             }
         } else if (op == 3 && state.count) {
             fuzz_job *job = &state.jobs[selected];
-            (void)work_mailbox_receive_bounded(&state.pool, job->handle, job->generation,
-                                             receive, &state, value % 65u, 0);
-        } else if (op == 4) {
-            (void)work_mailbox_drain_bounded(&state.pool, receive, &state, value % 65u, 0);
-        } else if (op == 7 && state.count) {
-            /* Prioritizing a raster lease is a caller bug (A15). */
-            if (state.jobs[selected].cls != WORK_RASTER)
-                (void)work_prioritize(&state.pool, state.jobs[selected].handle);
+            (void)work_mailbox_receive(&state.pool, job->handle, job->generation, receive, &state);
+        } else if (op == 4 || op == 5) {
+            (void)work_mailbox_drain(&state.pool, receive, &state);
         } else if (state.count) {
-            fuzz_job *job = &state.jobs[selected];
-            (void)work_mailbox_bind(&state.pool, job->handle, job->generation,
-                                   op == 5 ? receive : NULL, &state);
+            (void)work_handle_finished(&state.pool, state.jobs[selected].handle);
         }
     }
     uint64_t deadline = os_now_ns() + 2000000000ull;
     for (;;) {
-        (void)work_mailbox_drain_bounded(&state.pool, receive, &state, 64, 0);
+        (void)work_mailbox_drain(&state.pool, receive, &state);
         bool finished = true;
         for (size_t i = 0; i < state.count; i++)
             finished = finished && work_handle_finished(&state.pool, state.jobs[i].handle);

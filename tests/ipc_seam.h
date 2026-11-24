@@ -21,6 +21,7 @@
  * opened in place of /run/user/<uid>. Filesystem endpoints are otherwise
  * left alone: a test isolates those through XDG_RUNTIME_DIR or an explicit
  * runtime directory, which the product reads anyway. */
+#include "ipc/ipc.h"
 #include "os/os.h"
 
 #include <stdbool.h>
@@ -107,4 +108,10 @@ os_err __wrap_os_dir_open(os_dir *out, const char *path)
         path = ipc_seam_fallback;
     return __real_os_dir_open(out, path);
 }
+
+/* Exercise the EDIP codec in the test-only IPC object. */
+ipc_result ipc_test_wire_encode(const ipc_request *request, uint8_t *wire, size_t capacity,
+                                size_t *size);
+ipc_result ipc_test_wire_decode(const uint8_t *wire, size_t size, ipc_request *out);
+
 #endif

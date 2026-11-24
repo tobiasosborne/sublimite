@@ -10,6 +10,8 @@ Read first (absolute paths under /home/tobias/Projects/sublimite-v2):
 7. v1 evidence, read-only: /home/tobias/Projects/sublimite-v1-oracle/src/file/ and its tests (§1.6), src/savectl/savectl.c :195-294 (the reload path that moves into file).
 
 Scope (dossier §1.2 API table, with these decided points):
+- Mapped opens use `os_phys_mem_bytes` for the copy threshold and `os_fault_register` before publishing. Final release uses `os_fault_retire` before `os_unmap`. Refused opens also unmap unpublished storage. Anonymous reload storage uses `os_file_open_anon` (dossier §§1.3, 3.3).
+- The owned watch queue uses `os_watch_init` and `os_watch_close`. Calls to `os_watch_add` and `os_watch_remove` track parent-directory holds. The loop uses `os_watch_fd` for readiness and `os_watch_read` for the notifications.
 - file_open_tree(file*, piece_reserve*, piece_tree**): piece_open_copy below the copy threshold, piece_open_mapped at or above it, the mapping registered with the fault service BEFORE publication; on registration failure (OS_E_NOSPC) the unpublished map and fd are released and the open is refused visibly (Q12). The copy threshold constant states its derivation and that OS_FAULT_SLOTS is derived from it.
 - Change detection: v1's map_change / check / changed / resolve_keep, with the fault poll as "os_fault_poll != OK or epoch != 0", identity + timestamps for a same-size in-place overwrite (no SIGBUS), and the owned watch object from L2-0a (no global).
 - The live backing-identity validator for undo (piece_validate_fn), Law-2 clean, non-blocking.

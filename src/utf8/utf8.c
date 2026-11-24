@@ -14,7 +14,7 @@
  * units are one byte). So the unit ending at off is either the valid
  * sequence whose lead is the nearest non-continuation within 4 bytes and
  * whose decode ends exactly at off, or the single byte off-1. */
-size_t utf8_prev(const uint8_t *base, size_t off)
+static size_t utf8_prev(const uint8_t *base, size_t off)
 {
     if (off == 0)
         return 0;
@@ -111,7 +111,7 @@ UTF8_TREE_LEVEL(10, 9)
 _Static_assert(NELEM(UCD_ZERO_WIDTH) <= 1024 && NELEM(UCD_WIDE) <= 1024, "tree10 covers at most 1024 ranges (P: 2^10)");
 #define IN_TREE(tab, cp) ((cp) >= (tab)[0].lo && (cp) <= (tab)[NELEM(tab) - 1].hi && tree10(tab, 0, NELEM(tab), cp))
 
-int utf8_cell_width_table(uint32_t cp)
+static int utf8_cell_width_table(uint32_t cp)
 {
     if (cp < 0x300)                 /* direct callers: keep the contract */
         return cp != 0xAD;
@@ -276,7 +276,7 @@ static int gstate_join(gstate *st, uint32_t cp)
     return 1;
 }
 
-size_t utf8_grapheme_next(const uint8_t *p, size_t n)
+static size_t utf8_grapheme_next(const uint8_t *p, size_t n)
 {
     if (n == 0)
         return 0;
@@ -307,33 +307,6 @@ static int safe_start(const uint8_t *base, size_t q, size_t end)
     if (g == G_CR || g == G_CONTROL)
         return 1;
     return g == G_LF && (q == 0 || base[q - 1] != '\r');
-}
-
-int utf8_break_certain(utf8_step x, utf8_step y)
-{
-    if (!x.valid || !y.valid)
-        return 1;                                   /* invalid: Control (GB4, GB5) */
-    enum gcb a = gcb_of(x.cp), b = gcb_of(y.cp);
-    if (a == G_CR)
-        return b != G_LF;                           /* GB3, GB4 */
-    if (a == G_LF || a == G_CONTROL || b == G_CR || b == G_LF || b == G_CONTROL)
-        return 1;                                   /* GB4, GB5 */
-    if (b == G_EXTEND || b == G_ZWJ || b == G_SPACING || a == G_PREPEND)
-        return 0;                                   /* GB9, GB9a, GB9b */
-    if (a == G_L)
-        return !(b == G_L || b == G_V || b == G_LV || b == G_LVT);  /* GB6 */
-    if (a == G_LV || a == G_V)
-        return !(b == G_V || b == G_T);             /* GB7 */
-    if (a == G_LVT || a == G_T)
-        return b != G_T;                            /* GB8 */
-    if (a == G_EXTEND || a == G_ZWJ)
-        return 0;                                   /* GB9c / GB11 depend on context */
-    if (a == G_RI)
-        return b != G_RI;                           /* GB12, GB13 depend on parity */
-    /* x is Other, ExtPict or SpacingMark: joining it leaves gb9c NONE or
-     * CONSONANT (never LINKED), gb11 NONE or PICT (never ZWJ) and ri_odd 0
-     * (gstate_join), so GB9c, GB11 and GB12/13 cannot fire: GB999. */
-    return 1;
 }
 
 size_t utf8_grapheme_prev(const uint8_t *base, size_t off)
@@ -414,6 +387,14 @@ int utf8_grapheme_step(utf8_gseg *g, const uint8_t *p, size_t n, size_t budget, 
         }
         i += s.len;
     }
+}
+
+/* Below U+0300 the only zero-width scalar is soft hyphen (U+00AD). */
+static inline int utf8_cell_width(uint32_t cp)
+{
+    if (cp < 0x300)
+        return cp != 0xAD;
+    return utf8_cell_width_table(cp);
 }
 
 /* ------------------------------------------------- emoji class, artwork */
@@ -569,31 +550,6 @@ static void cseg_scan(utf8_cseg *c, const uint8_t *p, size_t len)
     }
 }
 
-size_t utf8_cluster(const uint8_t *p, size_t n, int *width)
-{
-    if (n == 0) {
-        *width = 0;
-        return 0;
-    }
-    if (p[0] >= 0x20 && p[0] < 0x7F && (n == 1 || p[1] < 0x80)) {
-        *width = 1;                                 /* printable ASCII before ASCII: always a break */
-        return 1;
-    }
-    size_t len = utf8_grapheme_next(p, n);
-    utf8_cseg c;
-    utf8_cseg_init(&c);
-    cseg_scan(&c, p, len);
-    *width = cw_width((enum cw)c.phase);
-    return len;
-}
-
-int utf8_cluster_width(const uint8_t *p, size_t n)
-{
-    int w;
-    (void)utf8_cluster(p, n, &w);
-    return w;
-}
-
 int utf8_cluster_step(utf8_cseg *c, const uint8_t *p, size_t n, size_t budget, int eof, size_t *used, int *width)
 {
     if (!c->seg.started && n >= 2 && p[0] >= 0x20 && p[0] < 0x7F && p[1] < 0x80) {
@@ -609,3 +565,15 @@ int utf8_cluster_step(utf8_cseg *c, const uint8_t *p, size_t n, size_t budget, i
     }
     return r;
 }
+
+#ifdef UTF8_TEST_HOOKS
+size_t utf8_test_prev(const uint8_t *base, size_t off)
+{
+    return utf8_prev(base, off);
+}
+
+int utf8_test_cell_width(uint32_t cp)
+{
+    return utf8_cell_width(cp);
+}
+#endif

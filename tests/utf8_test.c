@@ -13,7 +13,7 @@
  * the gcc -O2 release build included. A positive control proves the guards
  * can fail before any case runs. Run from the repository root (reads
  * vendor/ucd/GraphemeBreakTest.txt). */
-#include "utf8/utf8.h"
+#include "utf8_fixture.h"
 #include "utf8/tables.h"
 #include "os/os.h"
 
@@ -346,7 +346,7 @@ static void t_all_scalars(void)
         CHECK_BREAK(l == enc_len(cp));
         utf8_step s = utf8_decode(put(S_ONE, b, l), l);
         CHECK_BREAK(s.valid && s.cp == cp && s.len == l);
-        CHECK_BREAK(utf8_prev(put_begin(S_ONE, b, l), l) == 0);
+        CHECK_BREAK(utf8_test_prev(put_begin(S_ONE, b, l), l) == 0);
         /* truncation at every shorter length: invalid single byte */
         int tr_ok = 1;
         for (size_t k = 1; k < l; k++) {
@@ -365,9 +365,9 @@ static void t_all_scalars(void)
             while (off < n) { bounds[nb++] = off; off += utf8_decode(buf + off, n - off).len; }
             pv_ok &= nb >= 1 && bounds[nb - 1] == cl;    /* scalar is its own unit */
             const uint8_t *left = put_begin(S_ONE, buf, n);
-            for (size_t k = nb, o = n; k > 0; k--) { o = utf8_prev(left, o); pv_ok &= o == bounds[k - 1]; }
+            for (size_t k = nb, o = n; k > 0; k--) { o = utf8_test_prev(left, o); pv_ok &= o == bounds[k - 1]; }
             const uint8_t *right = put(S_AUX, buf, n);
-            pv_ok &= utf8_prev(right, n) == bounds[nb - 1];
+            pv_ok &= utf8_test_prev(right, n) == bounds[nb - 1];
         }
         CHECK_BREAK(pv_ok);
     }
@@ -375,12 +375,12 @@ static void t_all_scalars(void)
     CHECK(utf8_encode(0x110000, b) == 3 && b[0] == 0xEF && b[1] == 0xBF && b[2] == 0xBD);
     CHECK(utf8_encode(0xFFFFFFFFu, b) == 3 && b[0] == 0xEF && b[1] == 0xBF && b[2] == 0xBD);
     CHECK(utf8_encode(0xD800, b) == 3 && b[0] == 0xEF);
-    CHECK(utf8_prev(put(S_ONE, "abc", 3), 0) == 0);
-    CHECK(utf8_prev(put(S_ONE, "\x80\x80\x80\x80\x80", 5), 5) == 4);         /* 4+ continuations */
-    CHECK(utf8_prev(put(S_ONE, "\xE2\x82\xAC\x80", 4), 4) == 3);            /* valid unit + stray */
-    CHECK(utf8_prev(put(S_ONE, "\xF0\x9F\x98\x80\x80", 5), 5) == 4);
-    CHECK(utf8_prev(put(S_ONE, "\xF0\x9F\x98\x80", 4), 4) == 0);
-    CHECK(utf8_prev(put(S_ONE, "\xE0\x80\x80", 3), 3) == 2);                /* overlong: 3 units */
+    CHECK(utf8_test_prev(put(S_ONE, "abc", 3), 0) == 0);
+    CHECK(utf8_test_prev(put(S_ONE, "\x80\x80\x80\x80\x80", 5), 5) == 4);         /* 4+ continuations */
+    CHECK(utf8_test_prev(put(S_ONE, "\xE2\x82\xAC\x80", 4), 4) == 3);            /* valid unit + stray */
+    CHECK(utf8_test_prev(put(S_ONE, "\xF0\x9F\x98\x80\x80", 5), 5) == 4);
+    CHECK(utf8_test_prev(put(S_ONE, "\xF0\x9F\x98\x80", 4), 4) == 0);
+    CHECK(utf8_test_prev(put(S_ONE, "\xE0\x80\x80", 3), 3) == 2);                /* overlong: 3 units */
 }
 
 /* ----------------------------------------------------------------- width */
@@ -388,59 +388,59 @@ static void t_width(void)
 {
     long bad = 0;
     for (uint32_t cp = 0; cp <= 0x10FFFF; cp++) {
-        int w = utf8_cell_width(cp), wt = utf8_cell_width_table(cp), r = ref_width(cp);
-        if ((w != r || wt != r) && bad++ < 4) printf("width U+%04X: got %d/%d want %d\n", cp, w, wt, r);
+        int w = utf8_test_cell_width(cp), r = ref_width(cp);
+        if (w != r && bad++ < 4) printf("width U+%04X: got %d want %d\n", cp, w, r);
     }
     CHECK(bad == 0);
-    CHECK(utf8_cell_width(0x110000) == 1 && utf8_cell_width(0xFFFFFFFFu) == 1 && utf8_cell_width_table(0xFFFFFFFFu) == 1);
+    CHECK(utf8_test_cell_width(0x110000) == 1 && utf8_test_cell_width(0xFFFFFFFFu) == 1);
     /* Spot checks, each re-derived from tables.h. */
-    CHECK(utf8_cell_width('a') == 1);
-    CHECK(utf8_cell_width(0x07) == 1);       /* controls: 1, drawn as placeholders */
-    CHECK(utf8_cell_width(0x1B) == 1);
-    CHECK(utf8_cell_width(0x7F) == 1);
-    CHECK(utf8_cell_width(0xA9) == 1);       /* ©: ExtPict, not Emoji_Presentation */
-    CHECK(utf8_cell_width(0xAE) == 1);       /* ® likewise */
-    CHECK(utf8_cell_width(0xE9) == 1);
-    CHECK(utf8_cell_width(0x00AD) == 0);     /* soft hyphen is Cf */
-    CHECK(utf8_cell_width(0x0301) == 0);
-    CHECK(utf8_cell_width(0x0600) == 0);     /* Arabic number sign (Cf, Prepend) */
-    CHECK(utf8_cell_width(0x0915) == 1);
-    CHECK(utf8_cell_width(0x093E) == 0);     /* Mc is zero-width in these tables */
-    CHECK(utf8_cell_width(0x0E01) == 1);
-    CHECK(utf8_cell_width(0x0E31) == 0);
-    CHECK(utf8_cell_width(0x115F) == 0);     /* Hangul choseong filler: DI wins over W */
-    CHECK(utf8_cell_width(0x1161) == 1);     /* medial jamo: EAW N */
-    CHECK(utf8_cell_width(0x200B) == 0);
-    CHECK(utf8_cell_width(0x200D) == 0);
-    CHECK(utf8_cell_width(0x2603) == 1);     /* snowman: text presentation */
-    CHECK(utf8_cell_width(0x2FFC) == 2);     /* new in 15.1 */
-    CHECK(utf8_cell_width(0x3000) == 2);
-    CHECK(utf8_cell_width(0x3042) == 2);
-    CHECK(utf8_cell_width(0x3099) == 0);     /* Mn and W: zero wins */
-    CHECK(utf8_cell_width(0x302A) == 0);
-    CHECK(utf8_cell_width(0x303F) == 1);
-    CHECK(utf8_cell_width(0x31EF) == 2);     /* new in 15.1 */
-    CHECK(utf8_cell_width(0x3164) == 0);     /* Hangul filler: DI */
-    CHECK(utf8_cell_width(0x4DC0) == 1);
-    CHECK(utf8_cell_width(0x4E2D) == 2);
-    CHECK(utf8_cell_width(0xAC00) == 2);
-    CHECK(utf8_cell_width(0xFE0F) == 0);
-    CHECK(utf8_cell_width(0xFF21) == 2);
-    CHECK(utf8_cell_width(0x1AFF4) == 1);    /* unassigned gap in Kana Ext-B */
-    CHECK(utf8_cell_width(0x1F1E6) == 2);    /* regional indicator: Emoji_Presentation */
-    for (uint32_t cp = 0x1F3FB; cp <= 0x1F3FF; cp++) CHECK(utf8_cell_width(cp) == 0);
-    CHECK(utf8_cell_width(0x1F600) == 2);
-    CHECK(utf8_cell_width(0x20000) == 2);
-    CHECK(utf8_cell_width(0x2FFFE) == 1);
-    CHECK(utf8_cell_width(0x2FFFD) == 2);        /* unassigned, EAW=W: tables, not a blanket 1 */
-    CHECK(utf8_cell_width(0xE01F0) == 0);        /* unassigned, Default_Ignorable */
-    CHECK(utf8_cell_width(0x3FFFD) == 2);
-    CHECK(utf8_cell_width(0xE0001) == 0);
-    CHECK(utf8_cell_width(0xE0100) == 0);
+    CHECK(utf8_test_cell_width('a') == 1);
+    CHECK(utf8_test_cell_width(0x07) == 1);       /* controls: 1, drawn as placeholders */
+    CHECK(utf8_test_cell_width(0x1B) == 1);
+    CHECK(utf8_test_cell_width(0x7F) == 1);
+    CHECK(utf8_test_cell_width(0xA9) == 1);       /* ©: ExtPict, not Emoji_Presentation */
+    CHECK(utf8_test_cell_width(0xAE) == 1);       /* ® likewise */
+    CHECK(utf8_test_cell_width(0xE9) == 1);
+    CHECK(utf8_test_cell_width(0x00AD) == 0);     /* soft hyphen is Cf */
+    CHECK(utf8_test_cell_width(0x0301) == 0);
+    CHECK(utf8_test_cell_width(0x0600) == 0);     /* Arabic number sign (Cf, Prepend) */
+    CHECK(utf8_test_cell_width(0x0915) == 1);
+    CHECK(utf8_test_cell_width(0x093E) == 0);     /* Mc is zero-width in these tables */
+    CHECK(utf8_test_cell_width(0x0E01) == 1);
+    CHECK(utf8_test_cell_width(0x0E31) == 0);
+    CHECK(utf8_test_cell_width(0x115F) == 0);     /* Hangul choseong filler: DI wins over W */
+    CHECK(utf8_test_cell_width(0x1161) == 1);     /* medial jamo: EAW N */
+    CHECK(utf8_test_cell_width(0x200B) == 0);
+    CHECK(utf8_test_cell_width(0x200D) == 0);
+    CHECK(utf8_test_cell_width(0x2603) == 1);     /* snowman: text presentation */
+    CHECK(utf8_test_cell_width(0x2FFC) == 2);     /* new in 15.1 */
+    CHECK(utf8_test_cell_width(0x3000) == 2);
+    CHECK(utf8_test_cell_width(0x3042) == 2);
+    CHECK(utf8_test_cell_width(0x3099) == 0);     /* Mn and W: zero wins */
+    CHECK(utf8_test_cell_width(0x302A) == 0);
+    CHECK(utf8_test_cell_width(0x303F) == 1);
+    CHECK(utf8_test_cell_width(0x31EF) == 2);     /* new in 15.1 */
+    CHECK(utf8_test_cell_width(0x3164) == 0);     /* Hangul filler: DI */
+    CHECK(utf8_test_cell_width(0x4DC0) == 1);
+    CHECK(utf8_test_cell_width(0x4E2D) == 2);
+    CHECK(utf8_test_cell_width(0xAC00) == 2);
+    CHECK(utf8_test_cell_width(0xFE0F) == 0);
+    CHECK(utf8_test_cell_width(0xFF21) == 2);
+    CHECK(utf8_test_cell_width(0x1AFF4) == 1);    /* unassigned gap in Kana Ext-B */
+    CHECK(utf8_test_cell_width(0x1F1E6) == 2);    /* regional indicator: Emoji_Presentation */
+    for (uint32_t cp = 0x1F3FB; cp <= 0x1F3FF; cp++) CHECK(utf8_test_cell_width(cp) == 0);
+    CHECK(utf8_test_cell_width(0x1F600) == 2);
+    CHECK(utf8_test_cell_width(0x20000) == 2);
+    CHECK(utf8_test_cell_width(0x2FFFE) == 1);
+    CHECK(utf8_test_cell_width(0x2FFFD) == 2);        /* unassigned, EAW=W: tables, not a blanket 1 */
+    CHECK(utf8_test_cell_width(0xE01F0) == 0);        /* unassigned, Default_Ignorable */
+    CHECK(utf8_test_cell_width(0x3FFFD) == 2);
+    CHECK(utf8_test_cell_width(0xE0001) == 0);
+    CHECK(utf8_test_cell_width(0xE0100) == 0);
 }
 
 /* -------------------------------------------------------------- grapheme */
-static size_t G(const char *s, size_t n) { return utf8_grapheme_next(put(S_ONE, s, n), n); }
+static size_t G(const char *s, size_t n) { return first_grapheme(put(S_ONE, s, n), n); }
 #define GS(s) G(s, sizeof(s) - 1)
 
 static void t_grapheme(void)
@@ -550,7 +550,7 @@ static void t_grapheme_conformance(void)
         const uint8_t *exact = put(S_TEXT, bytes, n);
         got[0] = 1;
         for (size_t off = 0; off < n;) {
-            size_t step = utf8_grapheme_next(exact + off, n - off);
+            size_t step = first_grapheme(exact + off, n - off);
             CHECK(step > 0 && step <= n - off);
             if (!step || step > n - off) break;
             off += step;
@@ -617,7 +617,7 @@ static size_t seg_oneshot(const uint8_t *src, size_t n, size_t *ends)
     const uint8_t *p = put(S_AUX, src, n);
     size_t nc = 0;
     for (size_t off = 0; off < n;) {
-        off += utf8_grapheme_next(p + off, n - off);
+        off += first_grapheme(p + off, n - off);
         ends[nc++] = off;
     }
     return nc;
@@ -699,7 +699,7 @@ static void t_step(void)
     /* budget stops a 49,153-byte cluster early, and the pieces add up */
     {
         uint8_t *b = chain("a", "\xCC\x81", 24576, &n);
-        CHECK(n == 49153 && utf8_grapheme_next(put(S_TEXT, b, n), n) == n);
+        CHECK(n == 49153 && first_grapheme(put(S_TEXT, b, n), n) == n);
         size_t len, fu; int fr;
         size_t calls = drive_budget(b, n, UTF8_GRAPHEME_BUDGET, &len, &fu, &fr);
         /* (P) the first call takes 'a' + 2048 marks = 4097 B (the unit that
@@ -715,11 +715,11 @@ static void t_step(void)
         size_t len, fu; int fr;
         uint8_t *b = chain("", "\xD8\x80", 20000, &n);
         b[n++] = 'a';
-        CHECK(utf8_grapheme_next(put(S_TEXT, b, n), n) == n);
+        CHECK(first_grapheme(put(S_TEXT, b, n), n) == n);
         CHECK(drive_budget(b, n, UTF8_GRAPHEME_BUDGET, &len, &fu, &fr) > 1 && len == n && fr == UTF8_G_BUDGET);
         free(b);
         b = chain("\xF0\x9F\x91\xA8", "\xE2\x80\x8D\xF0\x9F\x91\xA9", 6000, &n);
-        CHECK(utf8_grapheme_next(put(S_TEXT, b, n), n) == n);
+        CHECK(first_grapheme(put(S_TEXT, b, n), n) == n);
         CHECK(drive_budget(b, n, UTF8_GRAPHEME_BUDGET, &len, &fu, &fr) > 1 && len == n && fr == UTF8_G_BUDGET);
         free(b);
     }
@@ -777,7 +777,7 @@ static void t_gb11_copyright(void)
     for (size_t i = 0; i < NELEM(cases); i++) {
         size_t n = strlen(cases[i].s);
         const uint8_t *p = put(S_TEXT, cases[i].s, n);
-        size_t g = utf8_grapheme_next(p, n);
+        size_t g = first_grapheme(p, n);
         if (g != cases[i].first) printf("gb11 case %zu: first cluster %zu bytes, want %zu\n", i, g, cases[i].first);
         CHECK(g == cases[i].first);
         CHECK(utf8_grapheme_prev(p, cases[i].first) == 0);
@@ -788,7 +788,7 @@ static void t_gb11_copyright(void)
 
 /* Red test (c): © and ® take one cell alone and two with VS16; VS15 does not
  * widen; both directions, so moving them into UCD_WIDE would fail too. */
-static int cw(const char *s, size_t n) { return utf8_cluster_width(put(S_ONE, s, n), n); }
+static int cw(const char *s, size_t n) { return first_cluster_width(put(S_ONE, s, n), n); }
 #define CWS(s) cw(s, sizeof(s) - 1)
 static int cluster_step_ok(const uint8_t *src, size_t n, size_t budget, size_t chunk);
 
@@ -822,7 +822,7 @@ static void t_copyright_width(void)
 }
 
 /* Every code point C: segment C followed by VS16 and check length and width
- * against ref_cluster_width, through utf8_cluster and through
+ * against ref_cluster_width, through first_cluster and through
  * utf8_cluster_step fed C first and VS16 after a refill. */
 static void t_vs16_every_cp(void)
 {
@@ -838,7 +838,7 @@ static void t_vs16_every_cp(void)
         int m = ref_break(c, ib, 1) ? 1 : 2;
         size_t want_len = m == 1 ? l : n;
         int want_w = ref_cluster_width(u, c, m), w = -1;
-        size_t len = utf8_cluster(put(S_ONE, b, n), n, &w);
+        size_t len = first_cluster(put(S_ONE, b, n), n, &w);
         utf8_cseg cs;
         utf8_cseg_init(&cs);
         size_t used = 0, pos = 0;
@@ -899,7 +899,7 @@ static unsigned probe_utf8(size_t pi, uint32_t cp)
     }
     pos[m] = n;
     unsigned mask = 0;
-    for (size_t off = utf8_grapheme_next(b, n); off < n; off += utf8_grapheme_next(b + off, n - off)) {
+    for (size_t off = first_grapheme(b, n); off < n; off += first_grapheme(b + off, n - off)) {
         int j = 1;
         while (j < m && pos[j] < off) j++;
         if (j == m || pos[j] != off) return ~0u;        /* not a unit boundary */
@@ -996,7 +996,7 @@ static void t_cluster_width(void)
     for (uint32_t cp = 0x1F3FB; cp <= 0x1F3FF; cp++) {
         uint8_t b[4];
         size_t l = utf8_encode(cp, b);
-        CHECK(utf8_cluster_width(put(S_ONE, b, l), l) == 0);
+        CHECK(first_cluster_width(put(S_ONE, b, l), l) == 0);
     }
     CHECK(cw("", 0) == 0);
     CHECK(CWS("a") == 1);
@@ -1036,8 +1036,8 @@ static void t_cluster_width(void)
             uint8_t s[2] = { (uint8_t)a, (uint8_t)b };
             const uint8_t *h = put(S_ONE, s, 2);
             int w;
-            size_t l = utf8_cluster(h, 2, &w);
-            CHECK_BREAK(l == utf8_grapheme_next(h, 2) && w == 1 && (l == 2) == (a == '\r' && b == '\n'));
+            size_t l = first_cluster(h, 2, &w);
+            CHECK_BREAK(l == first_grapheme(h, 2) && w == 1 && (l == 2) == (a == '\r' && b == '\n'));
         }
 }
 
@@ -1076,11 +1076,11 @@ static void t_random(void)
         bounds[nb] = n;
         CHECK(off == n);
         size_t o = n;
-        for (size_t k = nb; k > 0; k--) { o = utf8_prev(h, o); if (o != bounds[k - 1]) { CHECK(o == bounds[k - 1]); break; } }
+        for (size_t k = nb; k > 0; k--) { o = utf8_test_prev(h, o); if (o != bounds[k - 1]) { CHECK(o == bounds[k - 1]); break; } }
         /* grapheme boundaries advance, never overrun, and land on unit boundaries */
         size_t bi = 0;
         for (off = 0; off < n;) {
-            size_t g = utf8_grapheme_next(h + off, n - off);
+            size_t g = first_grapheme(h + off, n - off);
             if (g == 0 || off + g > n) { CHECK(g >= 1 && off + g <= n); break; }
             off += g;
             while (bi < nb && bounds[bi] < off) bi++;
@@ -1125,13 +1125,13 @@ static void t_oracle_random(void)
         const uint8_t *exact = put(S_TEXT, buf, n);
         int i = 0;
         for (size_t off = 0; off < n;) {
-            size_t g = utf8_grapheme_next(exact + off, n - off);
+            size_t g = first_grapheme(exact + off, n - off);
             int j = i + 1;                                  /* ref: extend until the next break */
             while (j < m && !ref_break(c, ib, j)) j++;
             CHECK_BREAK(g == pos[j] - off);
             CHECK_BREAK(utf8_grapheme_prev(exact, off + g) == off);
             int w;
-            CHECK_BREAK(utf8_cluster(exact + off, n - off, &w) == g);
+            CHECK_BREAK(first_cluster(exact + off, n - off, &w) == g);
             CHECK_BREAK(w == ref_cluster_width(u + i, c + i, j - i));
             for (int k = i + 1; k < j; k++)                 /* unit ends inside the cluster: its start */
                 CHECK_BREAK(utf8_grapheme_prev(exact, pos[k]) == off);
@@ -1145,7 +1145,7 @@ static void t_oracle_random(void)
  * regeneration breaks them. */
 static void t_table_facts(void)
 {
-    /* utf8_cell_width: below U+0300 only U+00AD is zero width, nothing is wide. */
+    /* utf8_test_cell_width: below U+0300 only U+00AD is zero width, nothing is wide. */
     CHECK(UCD_ZERO_WIDTH[0].lo == 0xAD && UCD_ZERO_WIDTH[0].hi == 0xAD && UCD_ZERO_WIDTH[1].lo >= 0x300);
     CHECK(UCD_WIDE[0].lo >= 0x1100);
     /* gcb_of below U+0300: Control = Cc + U+00AD; no Extend, SpacingMark, Prepend, RI, Hangul. */
@@ -1164,13 +1164,13 @@ static void t_table_facts(void)
     CHECK(UCD_EXT_PICT[2].lo >= 0x300);
 }
 
-/* ---- utf8_cluster_step == utf8_cluster at every budget and split. */
+/* ---- utf8_cluster_step == first_cluster at every budget and split. */
 static int cluster_step_ok(const uint8_t *src, size_t n, size_t budget, size_t chunk)
 {
     size_t off = 0;
     while (off < n) {
         int wantw;
-        size_t want = utf8_cluster(put(S_AUX, src + off, n - off), n - off, &wantw);
+        size_t want = first_cluster(put(S_AUX, src + off, n - off), n - off, &wantw);
         utf8_cseg c;
         utf8_cseg_init(&c);
         size_t pos = 0, avail = chunk < n - off ? chunk : n - off;
@@ -1243,7 +1243,7 @@ static void t_cluster_step(void)
         uint8_t *src = chain(L[i].h, L[i].u, L[i].reps, &n);
         const uint8_t *b = put(S_TEXT, src, n);
         int ww;
-        size_t want = utf8_cluster(b, n, &ww);
+        size_t want = first_cluster(b, n, &ww);
         utf8_cseg c;
         utf8_cseg_init(&c);
         size_t pos = 0, calls = 0, used;
@@ -1258,42 +1258,6 @@ static void t_cluster_step(void)
         CHECK(want == n && calls > 1);
         free(src);
     }
-}
-
-/* utf8_break_certain is sound (a 1 means a break before y in every left
- * context of length 0..3 over this alphabet, by utf8_grapheme_next) and not
- * vacuous (the pairs the view relies on are certain). © and ® are in the
- * alphabet: as x, as y, and inside the context (GB11 across them). */
-static size_t put_unit(uint8_t *p, uint32_t cp)
-{
-    if (cp == 0xFFFFFFFFu) { p[0] = 0xFF; return 1; }
-    return utf8_encode(cp, p);
-}
-static void t_break_certain(void)
-{
-    static const uint32_t al[] = { 'a', '\r', '\n', 0x01, 0x0301, 0x200D, 0x0903, 0x0600, 0x1F1E6,
-        0x1100, 0x1161, 0x11A8, 0xAC00, 0xAC01, 0x1F600, 0x0915, 0x094D, 0x6F22, 0xA9, 0xAE, 0xFE0F, 0xFFFFFFFFu };
-    size_t k = NELEM(al), contexts = 1 + k + k * k + k * k * k;
-    for (size_t xi = 0; xi < k; xi++) for (size_t yi = 0; yi < k; yi++) {
-        uint8_t xb[4], yb[4]; size_t xl = put_unit(xb, al[xi]), yl = put_unit(yb, al[yi]);
-        if (!utf8_break_certain(utf8_decode(xb, xl), utf8_decode(yb, yl))) continue;
-        for (size_t c = 0; c < contexts; c++) {
-            uint8_t buf[24]; size_t n = 0, code = c, len = c == 0 ? 0 : c <= k ? 1 : c <= k + k * k ? 2 : 3;
-            code -= len == 0 ? 0 : len == 1 ? 1 : len == 2 ? 1 + k : 1 + k + k * k;
-            for (size_t i = 0; i < len; i++) { n += put_unit(buf + n, al[code % k]); code /= k; }
-            memcpy(buf + n, xb, xl); n += xl; size_t at = n; memcpy(buf + n, yb, yl); n += yl;
-            size_t q = 0; while (q < at) q += utf8_grapheme_next(buf + q, n - q);
-            CHECK_BREAK(q == at);
-        }
-    }
-    uint8_t han[4], emoji[4], lv[4], cr[4], lf = '\n', x = 'x';
-    utf8_encode(0x6F22, han); utf8_encode(0x1F600, emoji); utf8_encode(0xAC00, lv); utf8_encode(0xA9, cr);
-    CHECK(utf8_break_certain(utf8_decode(han, 3), utf8_decode(han, 3)));
-    CHECK(utf8_break_certain(utf8_decode(han, 3), utf8_decode(&x, 1)));
-    CHECK(utf8_break_certain(utf8_decode(emoji, 4), utf8_decode(emoji, 4)));
-    CHECK(utf8_break_certain(utf8_decode(lv, 3), utf8_decode(lv, 3)));
-    CHECK(utf8_break_certain(utf8_decode(&lf, 1), utf8_decode(han, 3)));
-    CHECK(utf8_break_certain(utf8_decode(cr, 2), utf8_decode(cr, 2)));        /* © © */
 }
 
 int main(void)
@@ -1313,7 +1277,6 @@ int main(void)
     t_copyright_width();
     t_vs16_every_cp();
     t_class_audit();
-    t_break_certain();
     t_decode_cases();
     t_decode_exhaustive();
     t_all_scalars();

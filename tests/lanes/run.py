@@ -103,8 +103,6 @@ def stub_law2_guard(root, active):
 bool base_malloc_guard_active(void) {{ return {active}; }}
 void base_malloc_guard_begin(void) {{}}
 size_t base_malloc_guard_end(void) {{ return 0; }}
-void base_malloc_guard_exempt_begin(void) {{}}
-void base_malloc_guard_exempt_end(void) {{}}
 """
     write(root, 'src/base/malloc_guard.c', guard)
 

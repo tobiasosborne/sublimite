@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Require a cross-module release reference or a filed reservation for each archive export."""
+"""Require a cross-module release reference or a filed reservation for each archive export.
+
+Vendored code (vendor_ts) is exempt from the export-usage gate because the
+project preserves the upstream library's public surface. Its references count.
+The Make target leaves piece, undo and journal unenforced during their rewrites.
+"""
 
 import argparse
 from collections import Counter, defaultdict
@@ -8,7 +13,7 @@ import re
 import shlex
 import sys
 
-from check_symbols import (SYMBOL_NAME, UNDEFINED, archive_members, nm_lines,
+from check_symbols import (SYMBOL_NAME, UNDEFINED, VENDOR_TS, archive_members, nm_lines,
                            object_module, object_symbols, read_module_map)
 
 
@@ -19,6 +24,7 @@ FILED_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 
 def read_reservations(path):
     reservations = {}
+    documents = {}
     for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
         entry, _, reason = line.partition('#')
         fields = entry.split()
@@ -30,9 +36,15 @@ def read_reservations(path):
         symbol, filed = fields
         if not SYMBOL_NAME.fullmatch(symbol) or not FILED_ID.fullmatch(filed):
             raise ValueError(f'{where}: invalid symbol or filed identifier')
-        if not any((ROOT / 'docs' / directory / f'{filed}.md').is_file()
-                   for directory in ('briefs', 'decisions')):
+        if filed not in documents:
+            paths = [ROOT / 'docs' / directory / f'{filed}.md'
+                     for directory in ('briefs', 'decisions')]
+            documents[filed] = [doc.read_text(encoding='utf-8') for doc in paths if doc.is_file()]
+        if not documents[filed]:
             raise ValueError(f'{where}: no brief or decision named {filed}.md')
+        name = rf'(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])'
+        if not any(re.search(name, document) for document in documents[filed]):
+            raise ValueError(f'{where}: {filed}.md does not name {symbol}')
         if symbol in reservations:
             raise ValueError(f'{where}: duplicate reservation for {symbol}')
         reservations[symbol] = where
@@ -66,7 +78,8 @@ def main():
                         metavar='ARG', help='LAYER ARCHIVE [ORDERED_OBJECT ...]')
     parser.add_argument('--main', type=Path, required=True, help='loose release entry-point object')
     parser.add_argument('--module-map', nargs='+', required=True, metavar='LAYER:MODULE')
-    parser.add_argument('--module', help='enforce the rule for this module and count other violations')
+    parser.add_argument('--module', action='append', default=[],
+                        help='enforce this module (repeatable) and count other violations')
     parser.add_argument('--nm', default='nm')
     parser.add_argument('--reservations', type=Path, default=RESERVATIONS)
     args = parser.parse_args()
@@ -76,8 +89,9 @@ def main():
         if not nm:
             raise ValueError('expected an nm command')
         layers = read_module_map(args.module_map)
-        if args.module and (args.module == 'main' or args.module not in layers):
-            raise ValueError(f'unknown archive module {args.module!r}')
+        for module in args.module:
+            if module == 'main' or module not in layers:
+                raise ValueError(f'unknown archive module {module!r}')
         reservations = read_reservations(args.reservations)
         exports, references = release_symbols(nm, args.archive, args.main, layers)
     except (OSError, ValueError) as error:
@@ -92,9 +106,9 @@ def main():
 
     other = Counter()
     for (module, symbol), where in exports.items():
-        if symbol in reservations or references[symbol] - {module}:
+        if module == VENDOR_TS or symbol in reservations or references[symbol] - {module}:
             continue
-        if args.module and module != args.module:
+        if args.module and module not in args.module:
             other[module] += 1
         else:
             errors.append(f'{where}: error: [export] {symbol} has no cross-module reference or reservation')
@@ -107,7 +121,8 @@ def main():
     if errors:
         print(f'check_exports: FAIL ({len(errors)} violations)', file=sys.stderr)
         return 1
-    print(f'check_exports: ok ({args.module or "all modules"}, {len(args.archive)} archives)')
+    scope = ', '.join(args.module) or 'all project modules'
+    print(f'check_exports: ok ({scope}, {len(args.archive)} archives)')
     return 0
 
 

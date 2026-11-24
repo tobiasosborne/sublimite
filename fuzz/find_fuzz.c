@@ -1,7 +1,7 @@
 /* (G) v1 find_fuzz dimensions: endpoint-set regex model and a separate
  * KMP model for long fragmented sources. Small subjects fit in one uint64_t
  * endpoint set. The long operation crosses the inherited literal window. */
-#include "find/find.h"
+#include "../tests/find_fixture.h"
 #include "base/base.h"
 #include <string.h>
 #include <stdlib.h>
@@ -179,7 +179,7 @@ static void word_visit_model(model *m,const find_source *source,const find_regex
  * snapshot verifier. Generate bounded periodic/critical-prefix subjects and
  * compare against an independent KMP model, also from arbitrary next offsets. */
 static uint64_t long_model(const uint8_t *h,size_t hn,const uint8_t *n,size_t nn,
-                          const size_t *prefix,size_t from,find_literal_options options,find_result *out)
+                          const size_t *prefix,size_t from,find_literal_options options,find_fixture_result *out)
 {
     out->total=0; out->stored=0;
     size_t matched=0;
@@ -193,7 +193,7 @@ static uint64_t long_model(const uint8_t *h,size_t hn,const uint8_t *n,size_t nn
             if (options.whole_word && !word) {
                 matched=prefix[matched-1];
             } else {
-                if (out->stored<FIND_MAX_OFFSETS) out->offsets[out->stored++]=at;
+                if (out->stored<FIND_FIXTURE_OFFSETS) out->offsets[out->stored++]=at;
                 out->total++;
                 matched=0; /* non-overlapping */
             }
@@ -223,10 +223,10 @@ static void long_snapshot_op(const uint8_t *data,size_t size,find_literal_option
         if (literal_equal(n[i],n[matched],options)) matched++;
         prefix[i]=matched;
     }
-    find_result want,got;
+    find_fixture_result want,got;
     (void)long_model(h,hn,n,nn,prefix,0,options,&want);
     find_source flat={h,hn,NULL};
-    ASSERT(find_literal(&flat,n,nn,options,NULL,&got)==FIND_OK);
+    ASSERT(find_fixture_literal(&flat,n,nn,options,NULL,&got)==FIND_OK);
     ASSERT(got.total==want.total && got.stored==want.stored);
     ASSERT(memcmp(got.offsets,want.offsets,want.stored*sizeof want.offsets[0])==0);
     piece_reserve *reserve;
@@ -242,7 +242,7 @@ static void long_snapshot_op(const uint8_t *data,size_t size,find_literal_option
     ASSERT(piece_snapshot_take(tree,&snapshot)==PIECE_OK);
     piece_close(tree);
     find_source source={.view=piece_snapshot_view(snapshot)};
-    ASSERT(find_literal(&source,n,nn,options,NULL,&got)==FIND_OK);
+    ASSERT(find_fixture_literal(&source,n,nn,options,NULL,&got)==FIND_OK);
     ASSERT(got.total==want.total && got.stored==want.stored);
     ASSERT(memcmp(got.offsets,want.offsets,want.stored*sizeof want.offsets[0])==0);
     size_t from=(size_t)data[size-1]*(hn+1)/256;
@@ -251,7 +251,7 @@ static void long_snapshot_op(const uint8_t *data,size_t size,find_literal_option
     ASSERT(match.matched==(next!=FIND_UNSET));
     if (match.matched) ASSERT(match.whole.start==next && match.whole.end==next+nn);
     atomic_bool stop; atomic_init(&stop,true); find_control control={0}; control.cancel=&stop;
-    ASSERT(find_literal(&source,n,nn,options,&control,&got)==FIND_CANCELLED && got.total==0 && got.stored==0);
+    ASSERT(find_fixture_literal(&source,n,nn,options,&control,&got)==FIND_CANCELLED && got.total==0 && got.stored==0);
     ASSERT(find_literal_next(&source,n,nn,options,from,&control,&match)==FIND_CANCELLED && !match.matched && match.groups==0 && match.whole.start==FIND_UNSET && match.whole.end==FIND_UNSET);
     piece_snapshot_release(snapshot);
     piece_reserve_destroy(reserve);
@@ -266,7 +266,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
     size_t hn=(data[0]&63u)%33u; if(hn>size-1) hn=size-1;
     find_source source={data+1,hn,NULL};
     const uint8_t *needle=data+1+hn; size_t nn=size-1-hn; if(nn>40) nn=40;
-    find_result r; ASSERT(find_literal(&source,needle,nn,options,NULL,&r)==FIND_OK);
+    find_fixture_result r; ASSERT(find_fixture_literal(&source,needle,nn,options,NULL,&r)==FIND_OK);
     uint64_t count=0;
     if(nn) for(size_t i=0;i+nn<=hn;) {
         size_t k=0; while(k<nn && literal_equal(source.bytes[i+k],needle[k],options)) k++;
@@ -289,11 +289,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
     ASSERT(code==FIND_OK || code==FIND_ERR_LIMIT);
     if(code==FIND_OK) {
         size_t sn=find_regex_stream_scratch_bytes(re); void *scratch=base_arena_alloc(&arena,sn,_Alignof(max_align_t)); ASSERT(scratch);
-        ASSERT(find_regex_search(&source,re,scratch,sn,NULL,&r)==FIND_OK);
+        ASSERT(find_fixture_regex(&source,re,scratch,sn,NULL,&r)==FIND_OK);
         count=0; size_t off=0,start=0,end=0;
         for(;;) {
             bool found=model_next(&m,off,&start,&end); find_match hit;
-            ASSERT(find_regex_next(&source,re,off,scratch,sn,NULL,&hit)==FIND_OK && hit.matched==found);
+            ASSERT(find_fixture_regex_next(&source,re,off,scratch,sn,NULL,&hit)==FIND_OK && hit.matched==found);
             if(!found) break;
             ASSERT(hit.whole.start==start && hit.whole.end==end && r.offsets[count]==start);
             find_match anchored;
@@ -314,12 +314,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
             for(size_t i=hn;i>0;i--) ASSERT(piece_replace(t,0,0,source.bytes+i-1,1)==PIECE_OK);
             ASSERT(piece_snapshot_take(t,&snap)==PIECE_OK);
             piece_close(t);
-            find_source ss={.view=piece_snapshot_view(snap)}; find_result other;
-            ASSERT(find_regex_search(&ss,re,scratch,sn,NULL,&other)==FIND_OK && other.total==r.total && other.stored==r.stored);
+            find_source ss={.view=piece_snapshot_view(snap)}; find_fixture_result other;
+            ASSERT(find_fixture_regex(&ss,re,scratch,sn,NULL,&other)==FIND_OK && other.total==r.total && other.stored==r.stored);
             for(size_t i=0;i<r.stored;i++) ASSERT(other.offsets[i]==r.offsets[i]);
             word_visit_model(&m,&ss,re,scratch,sn);
-            ASSERT(find_literal(&ss,needle,nn,options,NULL,&other)==FIND_OK);
-            find_result bytes_result; ASSERT(find_literal(&source,needle,nn,options,NULL,&bytes_result)==FIND_OK);
+            ASSERT(find_fixture_literal(&ss,needle,nn,options,NULL,&other)==FIND_OK);
+            find_fixture_result bytes_result; ASSERT(find_fixture_literal(&source,needle,nn,options,NULL,&bytes_result)==FIND_OK);
             ASSERT(other.total==bytes_result.total && other.stored==bytes_result.stored);
             for(size_t i=0;i<other.stored;i++) ASSERT(other.offsets[i]==bytes_result.offsets[i]);
             piece_snapshot_release(snap);
@@ -328,13 +328,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size)
     }
     /* Arbitrary syntax: errors are bounded, successful programs are searchable. */
     size_t raw_n=size>FIND_MAX_PATTERN?FIND_MAX_PATTERN:size;
-    code=find_regex_compile(memory,find_regex_bytes(),data,raw_n,&re,&error);
+    code=find_fixture_compile(memory,find_regex_bytes(),data,raw_n,&re,&error);
     ASSERT(error<=raw_n && (code==FIND_OK || re==NULL));
     if(code==FIND_OK) {
         base_arena_reset_to_mark(&arena,find_regex_bytes());
         size_t sn=find_regex_scratch_bytes(re); void *scratch=base_arena_alloc(&arena,sn,_Alignof(max_align_t)); ASSERT(scratch);
-        ASSERT(find_regex_search(&source,re,scratch,sn,NULL,&r)==FIND_OK);
-        ASSERT(r.stored<=FIND_MAX_OFFSETS && r.total<=hn+1);
+        ASSERT(find_fixture_regex(&source,re,scratch,sn,NULL,&r)==FIND_OK);
+        ASSERT(r.stored<=FIND_FIXTURE_OFFSETS && r.total<=hn+1);
         for(size_t i=0;i<r.stored;i++) ASSERT(r.offsets[i]<=hn && (i==0 || r.offsets[i]>r.offsets[i-1]));
     }
     base_arena_free(&arena); return 0;

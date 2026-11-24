@@ -35,8 +35,6 @@ typedef enum ipc_result {
 /* Pointer, descriptor and token arguments, and requests handed to the
  * encoder, are preconditions ASSERTed (os.h, A15). Every ipc_result below
  * reports something input, the environment, the peer or exhaustion caused. */
-/* Static descriptive text for command-line diagnostics; no allocation. */
-const char *ipc_result_string(ipc_result result);
 typedef struct ipc_path { const char *path; uint32_t line, col; } ipc_path;
 typedef struct ipc_request {
     ipc_path paths[IPC_MAX_PATHS];
@@ -44,7 +42,7 @@ typedef struct ipc_request {
     const char *cwd;
     const uint8_t *stdin_data;
     size_t stdin_size;
-    bool wait, has_stdin, new_instance;
+    bool wait, has_stdin, new_instance; /* new_instance is launch-local */
     /* edit-b6ai.8: the launcher's XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID
      * (NULL = absent). The running instance uses them to raise its window;
      * see docs/decisions/edit-b6ai.8.md for the wire format and compatibility. */
@@ -72,18 +70,6 @@ ipc_result ipc_args_read_stdin(ipc_args *args, int fd);
  * the handoff. Returns IPC_IO only if the argument arena is exhausted. */
 ipc_result ipc_args_set_activation(ipc_args *args, const char *token, const char *startup_id);
 void ipc_args_fini(ipc_args *args);
-/* Decoder borrows wire storage. Strings include a checked trailing NUL.
- * On any failure out is zeroed. The encoder takes a request built by
- * ipc_parse_args (plus ipc_args_read_stdin / ipc_args_set_activation) or
- * ipc_wire_decode, in storage disjoint from wire; it returns only IPC_OK or
- * IPC_LIMIT, and never serializes new_instance.
- * Activation strings are serialized in a trailing block flagged by bit 2 of
- * the flags byte, its size in header bytes 6-7; a request without them is
- * byte-identical to the previous format, and the client resends in that form
- * when a server of an earlier release answers IPC_PROTOCOL. */
-ipc_result ipc_wire_encode(const ipc_request *request, uint8_t *wire,
-                           size_t capacity, size_t *size);
-ipc_result ipc_wire_decode(const uint8_t *wire, size_t size, ipc_request *out);
 
 typedef uint64_t ipc_token;
 struct ipc_peer;
@@ -121,14 +107,12 @@ typedef ipc_result (*ipc_open_callback)(const ipc_request *, ipc_token, void *);
  * (v1's Windows named-pipe endpoint is not carried over; see v1 ipc_win.c
  * at 6fec2e8.)
  * All server calls belong to the loop thread; fini only after successful init. */
-ipc_result ipc_server_init(ipc_server *server, const char *runtime);
+
 /* CLI endpoints include a lossless, bounded encoding of the selected DISPLAY.
  * Different display strings never share a primary. NULL preserves the general
  * IPC endpoint; overlong display names return IPC_LIMIT before binding/sending.
  * Pass the same display to server and client, including fallback endpoints. */
 ipc_result ipc_server_init_display(ipc_server *server, const char *runtime, const char *display);
-ipc_result ipc_client_send_display(const char *runtime, const char *display,
-                                   const ipc_request *request, int timeout_ms);
 int ipc_server_fd(const ipc_server *server);
 /* Nonblocking; borrowed request is valid only inside callback. Callback OK
  * queues ACK; other result rejects. Retain token for wait; copy desired data.
@@ -157,6 +141,9 @@ ipc_result ipc_server_adopt_wait(ipc_server *server, int adopt_fd, ipc_token *to
 ipc_result ipc_launcher_wait(int launcher_fd);
 /* Startup-only blocking handoff. timeout_ms bounds connect/send/ACK;
  * -1 means infinite. After ACK, --wait always waits without a deadline.
+ * If a peer rejects the activation extension with IPC_PROTOCOL, retry once
+ * with the request in the original format.
  * IPC_EXISTS/new_instance selection is the caller's startup policy. */
-ipc_result ipc_client_send(const char *runtime, const ipc_request *request, int timeout_ms);
+ipc_result ipc_client_send_display(const char *runtime, const char *display,
+                                   const ipc_request *request, int timeout_ms);
 #endif

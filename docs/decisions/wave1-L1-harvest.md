@@ -1201,7 +1201,7 @@ here: first call may be on a worker).
   `find_regex_visit`, `find_regex_word_visit` (word-boundary
   filter sharing the request's readers/prefix plan/retry
   budget; rejected candidate retries at start+1 byte),
-  `find_regex_stream_begin/step` (worker continuation in
+  `find_regex_stream_begin` and `find_regex_stream_step` (worker continuation in
   prepaid scratch, yields at NFA byte boundaries, exact-policy
   parity with sync API), `find_regex_work_budget`,
   `find_regex_next_budget`. Implemented across `find.c`/

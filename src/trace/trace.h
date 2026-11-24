@@ -69,9 +69,6 @@ void trace_record_at(uint64_t ns, enum trace_ev ev, uint32_t frame_id);
  * the handle and any required durability. Returns 0 on success, -1 on error. */
 int trace_dump(os_file *f);
 
-/* Clears timing, startup and input history, preserving live registrations. */
-void trace_reset(void);
-
 /* Single-producer ingress log (UI thread). Records have consecutive sequence
  * numbers and nondecreasing monotonic timestamps. Oldest records are
  * overwritten on wrap. Appends and timing recording allocate nothing. */

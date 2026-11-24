@@ -1,5 +1,4 @@
 #include "base/base.h"
-#include "find/find.h"
 #include "find_fixture.h"
 
 #include <stdio.h>
@@ -27,27 +26,27 @@ int main(void)
     _Alignas(max_align_t) uint8_t scratch[FIND_MAX_SCRATCH_BYTES];
     uint8_t expansion[FIND_REGEX_FOLD_BUFFER_BYTES];
     find_regex *regex;
-    find_result result;
+    find_fixture_result result;
     find_match match;
     size_t deliveries=0;
-    find_visit visit={.prefix_capacity=FIND_MAX_OFFSETS,.wanted=FIND_UNSET,
+    find_visit visit={.prefix_capacity=FIND_FIXTURE_OFFSETS,.wanted=FIND_UNSET,
                       .emit=record,.user=&deliveries};
 
     bool active=base_malloc_guard_active();
     ASSERT(active);
     base_malloc_guard_begin();
-    ASSERT(find_literal(&source,needle,sizeof needle-1,options,NULL,&result)==FIND_OK);
+    ASSERT(find_fixture_literal(&source,needle,sizeof needle-1,options,NULL,&result)==FIND_OK);
     ASSERT(result.total==1 && result.offsets[0]==0);
     ASSERT(find_literal_next(&source,needle,sizeof needle-1,options,0,NULL,&match)==FIND_OK);
     ASSERT(match.matched && match.whole.end==sizeof needle-1);
     ASSERT(find_literal_visit(&source,needle,sizeof needle-1,options,NULL,&visit)==FIND_OK);
     ASSERT(visit.total==1 && deliveries==1);
-    ASSERT(find_regex_compile(program,sizeof program,pattern,sizeof pattern-1,&regex,NULL)==FIND_OK);
+    ASSERT(find_fixture_compile(program,sizeof program,pattern,sizeof pattern-1,&regex,NULL)==FIND_OK);
     ASSERT(find_regex_compile_options(program,sizeof program,pattern,sizeof pattern-1,true,
                                      expansion,sizeof expansion,NULL,&regex,NULL)==FIND_OK);
-    ASSERT(find_regex_search(&source,regex,scratch,sizeof scratch,NULL,&result)==FIND_OK);
+    ASSERT(find_fixture_regex(&source,regex,scratch,sizeof scratch,NULL,&result)==FIND_OK);
     ASSERT(result.total==2);
-    ASSERT(find_regex_next(&source,regex,0,scratch,sizeof scratch,NULL,&match)==FIND_OK);
+    ASSERT(find_fixture_regex_next(&source,regex,0,scratch,sizeof scratch,NULL,&match)==FIND_OK);
     ASSERT(match.matched && match.whole.start==0);
     uint64_t budget=find_regex_work_budget(regex,sizeof text-1);
     ASSERT(find_regex_next_budget(&source,regex,0,scratch,sizeof scratch,NULL,&budget,&match)==FIND_OK);

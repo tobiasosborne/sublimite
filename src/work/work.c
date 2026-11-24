@@ -50,7 +50,6 @@ static void worker_main(void *vp)
     os_cond *cv = class_condition(p, cls);
 
     /* Pair with diagnostic readers of the published worker identity. */
-    atomic_store_explicit(&p->worker_ids[wc->worker], os_thread_self(), memory_order_release);
     /* Trace exhaustion disables recording for this worker. Work still runs. */
     int trace_slot = trace_thread_register();
     os_mutex_lock(&p->mu);
@@ -178,15 +177,10 @@ void work_pool_shutdown(work_pool *p)
         return;
     os_mutex_lock(&p->mu);
     p->shutting_down = true;
-    uint64_t stamp = now_ns();
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) {
         work_slot *s = &p->slots[i];
         if (atomic_load_explicit(&s->epoch, memory_order_relaxed) == UINT32_MAX)
             continue;
-        /* Preserve an earlier cancellation's timestamp. Publish the shutdown
-         * timestamp before workers can observe the epoch invalidation. */
-        if (atomic_load_explicit(&s->cancel_ns, memory_order_relaxed) == 0)
-            atomic_store_explicit(&s->cancel_ns, stamp, memory_order_relaxed);
         atomic_fetch_add_explicit(&s->epoch, 1u, memory_order_acq_rel);
     }
     /* A dequeued job is owned by its worker until join. A queued job has no
@@ -219,62 +213,7 @@ void work_pool_shutdown(work_pool *p)
 }
 
 const os_wake *work_pool_wake(const work_pool *p) { return p->active ? &p->wake : NULL; }
-uint64_t work_pool_worker_id(const work_pool *p, uint32_t worker)
-{
-    ASSERT(worker < WORK_MAX_MAILBOXES);
-    return atomic_load_explicit(&p->worker_ids[worker], memory_order_acquire);
-}
-
-work_handle work_submit(work_pool *p, work_job job)
-{
-    work_handle h = {0, 0};
-    (void)work_submit_batch(p, &job, 1, &h);
-    return h;
-}
-
-int work_prioritize(work_pool *p, work_handle h)
-{
-    assert_handle(h);
-    if (!p->active || !h.epoch) return -1;
-    ASSERT(p->foreground_enabled);
-    os_mutex_lock(&p->mu);
-    work_slot *s = &p->slots[h.slot];
-    if (atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch) {
-        os_mutex_unlock(&p->mu);
-        return -1;
-    }
-    /* The caller chose the live lease's class at submit. */
-    ASSERT(s->job.cls != WORK_RASTER);
-    if (s->job.cls == WORK_FOREGROUND) {
-        os_mutex_unlock(&p->mu);
-        return 0;
-    }
-    work_queue *q = &p->queue[WORK_BULK];
-    for (uint32_t offset = 0; offset < q->count; offset++) {
-        uint32_t pos = (q->head + offset) % WORK_MAX_JOBS;
-        if (q->q[pos] != h.slot || q->epochs[pos] != h.epoch) continue;
-        for (uint32_t next = offset + 1u; next < q->count; next++) {
-            uint32_t from = (q->head + next) % WORK_MAX_JOBS;
-            uint32_t to = (q->head + next - 1u) % WORK_MAX_JOBS;
-            q->q[to] = q->q[from]; q->epochs[to] = q->epochs[from];
-        }
-        q->count--;
-        work_queue *foreground = &p->foreground_queue;
-        uint32_t tail = (foreground->head + foreground->count) % WORK_MAX_JOBS;
-        foreground->q[tail] = h.slot;
-        foreground->epochs[tail] = h.epoch;
-        foreground->count++;
-        os_cond_signal(&p->foreground_cv);
-        break;
-    }
-    /* The worker reads this member only while holding mu. A running function
-     * reads immutable fn/arg/generation members, never its scheduling class. */
-    s->job.cls = WORK_FOREGROUND;
-    os_mutex_unlock(&p->mu);
-    return 0;
-}
-
-int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles)
+static int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles)
 {
     if (count == 0) return 0;
     ASSERT(count <= WORK_MAX_JOBS && jobs != NULL && handles != NULL);
@@ -341,14 +280,10 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
         s->job = jobs[j];
         s->mailbox_worker = WORK_MAX_MAILBOXES;
         /* Only a free slot can advance here. The queue mutex publishes the
-         * job, its new epoch and the cleared cancellation stamp together. */
+         * job and its new epoch together. */
         uint32_t ep = atomic_fetch_add_explicit(&s->epoch, 1u, memory_order_acq_rel) + 1u;
-        atomic_store_explicit(&s->cancel_ns, 0, memory_order_relaxed);
         atomic_store_explicit(&s->busy, 1, memory_order_relaxed);
-        s->receive_cb = NULL;
-        s->receive_ud = NULL;
         s->receive_epoch = ep;
-        s->receive_generation = jobs[j].generation;
         s->receive_scan_generation = jobs[j].generation;
         s->receive_next = 0;
         for (uint32_t w = 0; w < mailbox_count(p); w++)
@@ -367,6 +302,13 @@ int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_han
         if (needed[cls]) os_cond_broadcast(class_condition(p, cls));
     os_mutex_unlock(&p->mu);
     return 0;
+}
+
+work_handle work_submit(work_pool *p, work_job job)
+{
+    work_handle h = {0, 0};
+    (void)work_submit_batch(p, &job, 1, &h);
+    return h;
 }
 
 bool work_handle_finished(const work_pool *p, work_handle h)
@@ -390,7 +332,6 @@ void work_cancel(work_pool *p, work_handle h)
         return;
     }
     /* Record time first; the epoch bump (release) publishes it. */
-    atomic_store_explicit(&s->cancel_ns, now_ns(), memory_order_relaxed);
     (void)atomic_compare_exchange_strong_explicit(&s->epoch, &expect, expect + 1u,
         memory_order_acq_rel, memory_order_relaxed);
     /* Serialize removal with worker dequeue: only an entry still in the queue
@@ -424,15 +365,6 @@ bool work_continue(work_ctx *c)
 {
     c->continue_ = !work_should_stop(c);
     return c->continue_;
-}
-
-uint64_t work_cancel_time_ns(const work_ctx *c)
-{
-    if (!work_should_stop(c))
-        return 0;
-    /* The acquire in work_should_stop observed the invalidating epoch.
-     * The stamp preceded that release and the running lease prevents reuse. */
-    return atomic_load_explicit(&c->slot->cancel_ns, memory_order_relaxed);
 }
 
 bool work_publish(work_ctx *c, const work_msg *m)
@@ -475,28 +407,6 @@ bool work_mailbox_pending(const work_pool *p)
     return false;
 }
 
-int work_mailbox_bind(work_pool *p, work_handle h, uint32_t generation,
-    void (*cb)(const work_msg *, void *), void *ud)
-{
-    assert_handle(h);
-    if (h.epoch == 0) return -1;
-    work_slot *s = &p->slots[h.slot];
-    if (cb == NULL) {
-        if (s->receive_epoch == h.epoch && s->receive_generation == generation) {
-            s->receive_cb = NULL;
-            s->receive_ud = NULL;
-        }
-        return 0;
-    }
-    if (!p->active ||
-        atomic_load_explicit(&s->epoch, memory_order_acquire) != h.epoch ||
-        s->job.generation != generation)
-        return -1;
-    s->receive_cb = cb;
-    s->receive_ud = ud;
-    return 0;
-}
-
 static void mailbox_clear_notification(const work_pool *p)
 {
     /* Clear before acquiring mailbox state, so a racing publisher either
@@ -535,14 +445,11 @@ static bool mailbox_consume(work_pool *p, work_mailbox *mb, uint32_t pos,
     bool live = atomic_load_explicit(&s->epoch, memory_order_acquire) == m.epoch_;
     if (!live) {
         atomic_fetch_add_explicit(&p->dropped_stale, 1, memory_order_relaxed);
-    } else if (s->receive_cb && s->receive_epoch == m.epoch_ &&
-               s->receive_generation == m.generation) {
-        s->receive_cb(&m, s->receive_ud);
     } else {
         cb(&m, ud);
     }
     /* Keep the result/slot lease throughout the callback, even if it submits.
-     * The release pairs with slot selection or a migrating invocation. */
+     * The release pairs with slot selection or a continuation on another worker. */
     atomic_fetch_sub_explicit(&s->pending, 1u, memory_order_release);
     return live;
 }
@@ -553,7 +460,7 @@ static void mailbox_end_drain(work_pool *p)
     p->draining = false;
 }
 
-size_t work_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
+static size_t work_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
                                   void *ud, size_t max_messages, uint64_t deadline_ns)
 {
     ASSERT(cb != NULL);
@@ -590,7 +497,7 @@ size_t work_mailbox_drain(work_pool *p, void (*cb)(const work_msg *, void *), vo
                                       now_ns() + WORK_DRAIN_BUDGET_NS);
 }
 
-size_t work_mailbox_receive_bounded(work_pool *p, work_handle handle, uint32_t generation,
+static size_t work_mailbox_receive_bounded(work_pool *p, work_handle handle, uint32_t generation,
     void (*cb)(const work_msg *, void *), void *ud, size_t max_messages, uint64_t deadline_ns)
 {
     ASSERT(cb != NULL);
@@ -654,3 +561,22 @@ size_t work_mailbox_receive(work_pool *p, work_handle h, uint32_t generation,
     return work_mailbox_receive_bounded(p, h, generation, cb, ud,
                                         WORK_DRAIN_MAX_MESSAGES, now_ns() + WORK_DRAIN_BUDGET_NS);
 }
+
+#ifdef WORK_TEST_HOOKS
+int work_test_submit_batch(work_pool *p, const work_job *jobs, size_t count, work_handle *handles)
+{
+    return work_submit_batch(p, jobs, count, handles);
+}
+
+size_t work_test_mailbox_drain_bounded(work_pool *p, void (*cb)(const work_msg *, void *),
+                                       void *ud, size_t max_messages, uint64_t deadline_ns)
+{
+    return work_mailbox_drain_bounded(p, cb, ud, max_messages, deadline_ns);
+}
+
+size_t work_test_mailbox_receive_bounded(work_pool *p, work_handle h, uint32_t generation,
+    void (*cb)(const work_msg *, void *), void *ud, size_t max_messages, uint64_t deadline_ns)
+{
+    return work_mailbox_receive_bounded(p, h, generation, cb, ud, max_messages, deadline_ns);
+}
+#endif

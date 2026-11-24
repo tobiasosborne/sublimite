@@ -1,8 +1,6 @@
 #include "base/base.h"
 #include "os/os.h"
 
-const char *base_version(void) { return "0.0.1-v2-dev"; }
-
 static bool is_pow2(size_t n)
 {
     return n != 0 && (n & (n - 1)) == 0;
@@ -50,8 +48,6 @@ void base_arena_reset_to_mark(base_arena *a, base_arena_mark_t mark)
     ASSERT(mark <= a->used);
     a->used = mark;
 }
-
-void base_arena_reset(base_arena *a) { a->used = 0; }
 
 void base_arena_free(base_arena *a)
 {
@@ -102,8 +98,6 @@ void base_pool_put(base_pool *p, void *ptr)
     p->live--;
 }
 
-size_t base_pool_count_live(const base_pool *p) { return p->live; }
-
 void base_pool_reset(base_pool *p)
 {
     ASSERT(p->base != NULL);
@@ -131,12 +125,6 @@ bool base_cpu_has_avx2(void)
 {
     os_once_run(&cpu_once, cpu_detect);
     return __builtin_cpu_supports("avx2") != 0;
-}
-
-bool base_cpu_has_popcnt(void)
-{
-    os_once_run(&cpu_once, cpu_detect);
-    return __builtin_cpu_supports("popcnt") != 0;
 }
 
 bool base_cpu_has_sse42(void)

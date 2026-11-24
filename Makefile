@@ -198,6 +198,13 @@ $(B)/rel/tests/law2_os_fault_test: $(B)/rel/src/os/os_posix_test_hooks.o
 # the shipped binary has no override and reads no test variable.
 IPC_SEAM := -Wl,--wrap=os_stream_peer_uid,--wrap=os_listen_local,--wrap=os_connect_local,--wrap=os_dir_open
 $(foreach c,rel san tsan,$(B)/$(c)/tests/ipc_test) $(B)/fuzz/ipc_fuzz: private LDLIBS += $(IPC_SEAM)
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/ipc_test: $(B)/$(c)/src/ipc/ipc_posix_test_hooks.o))
+$(B)/fuzz/ipc_fuzz: $(B)/fuzz/src/ipc/ipc_posix_test_hooks.o
+# Work tests also exercise the private admission and mailbox limits.
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/work_test: $(B)/$(c)/src/work/work_test_hooks.o))
+# The UTF-8 fixtures check the private scalar width and backward step as well.
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/utf8_test: $(B)/$(c)/src/utf8/utf8_test_hooks.o))
+$(B)/fuzz/utf8_fuzz: $(B)/fuzz/src/utf8/utf8_test_hooks.o
 # piece (v2-0fv.7, .17): base refusal is injected at its one reservation path,
 # and a fault (nonzero epoch) or a failing poll at os_fault_poll (Lines tests);
 # piece_test, piece_shape_test and piece_fuzz share both seams.
@@ -211,7 +218,7 @@ $(B)/fuzz/piece_fuzz: $(B)/fuzz/src/piece/piece_test_hooks.o
 $(foreach c,rel san tsan,$(foreach t,piece_test piece_shape_test,$(eval $(B)/$(c)/tests/$(t): $(B)/$(c)/src/piece/piece_test_hooks.o)))
 # The find suites and fuzzer link the real tree from libtext.a (v2-0fv.17).
 FIND_TW_SUITES := find_bestof_test find_p1r_test find_simd_filter_verify_test
-$(foreach c,rel san tsan,$(foreach t,$(FIND_TW_SUITES),$(eval $(B)/$(c)/tests/$(t): $(B)/$(c)/src/find/literal_test_hooks.o)))
+$(foreach c,rel san tsan,$(foreach t,$(FIND_TW_SUITES),$(eval $(B)/$(c)/tests/$(t): $(B)/$(c)/src/find/find_test_hooks.o)))
 LDFLAGS_find_bestof_test := -Wl,--wrap=work_should_stop,--wrap=piece_iter_init,--wrap=piece_iter_next
 LDFLAGS_find_fault_test := -Wl,--wrap=os_fault_poll,--wrap=piece_iter_next
 LDFLAGS_find_p1r_test := -Wl,--wrap=work_should_stop
@@ -376,7 +383,7 @@ check-symbols: $(call libs_desc,rel) $(B)/rel/src/main.o
 	+$(MAKE) --no-print-directory -f Makefile -f tests/symbols/fixtures.mk check-symbol-fixtures
 
 check-exports: $(call libs_desc,rel) $(B)/rel/src/main.o
-	python3 -B tools/check_exports.py $(symbol_inputs) --module os
+	python3 -B tools/check_exports.py $(symbol_inputs) $(addprefix --module ,os base ipc trace work scan utf8 indent find config dnd)
 
 $(LAYER_TEST_BINS) $(LAYER_L5_BIN): | check-module-ldlibs
 check-module-ldlibs:

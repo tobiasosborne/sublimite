@@ -8,10 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* (G) Inherited v1 byte-search contract limits. FIND_MAX_OFFSETS bounds
- * result storage. The other maxima prepay parser, program, regex states
- * and scratch. FIND_POLL_UNITS is the inherited cancellation quantum. */
-#define FIND_MAX_OFFSETS 4096u
+/* (G) Inherited v1 byte-search limits for parser, program, regex states and
+ * scratch. FIND_POLL_UNITS is the inherited cancellation quantum. */
 #define FIND_MAX_GROUPS 8u
 #define FIND_MAX_STATES 256u
 #define FIND_MAX_PATTERN 4096u
@@ -52,7 +50,7 @@ typedef struct find_source {
  * return. Flag/generation changes alone do not invalidate work mailboxes:
  * caller must recheck/drop them at publication/consumption, or also work_cancel
  * the job. Never publish a partial count as exact or a cancelled result;
- * complete single matches from next() may be streamed. */
+ * Stream only complete single matches. */
 typedef struct find_control {
     const work_ctx *work;
     const atomic_bool *cancel;
@@ -60,19 +58,6 @@ typedef struct find_control {
     uint32_t expected_generation;
 } find_control;
 
-/* (G) v1 perf §2.7 result bound is 64 KiB. FIND_OK supplies the exact
- * total and the first FIND_MAX_OFFSETS starts in ascending order. Other
- * codes clear total/stored. The array tail is unspecified.
- * Literal search returns leftmost non-overlapping matches and an empty
- * needle gives zero matches. NUL and high bytes are valid. All search and
- * capture calls use caller storage and the stack. Literal kernels have worst-case linear
- * work in source + needle length. SIMD verification has a linear work
- * budget and can fall back to Two-Way. */
-typedef struct find_result {
-    uint64_t total;
-    size_t stored;
-    uint64_t offsets[FIND_MAX_OFFSETS];
-} find_result;
 /* fold_ascii compares A-Z and a-z by their lowercase byte. All other bytes
  * compare unchanged. whole_word requires that neither adjacent byte belongs
  * to [A-Za-z0-9_]. Source edges qualify as boundaries. Rejected candidates
@@ -81,11 +66,6 @@ typedef struct find_literal_options {
     bool fold_ascii;
     bool whole_word;
 } find_literal_options;
-find_code find_literal(const find_source *source, const uint8_t *needle,
-                       size_t needle_length, find_literal_options options,
-                       const find_control *control,
-                       find_result *result);
-
 /* ERE-lite: concatenation, |, (), [], [^], inclusive byte ranges, ., *, +, ?,
  * ^ and $. Anchors are multiline: ^ at start/after LF, $ before LF/at EOF.
  * Dot excludes LF; negated classes include LF. Backslash quotes ONE byte;
@@ -113,15 +93,9 @@ find_code find_literal(const find_source *source, const uint8_t *needle,
  * escaped digits are UNSUPPORTED. POSIX [:name:], [.collating.] and [=equiv=]
  * inside classes are UNSUPPORTED. Other bytes, including NUL/high bytes, literal.
  * Success sets error_offset=0. Storage must not alias pattern or any input.
- * Compile also allocates nothing. Queries require a successful live program;
- * NULL queries return zero/NULL. Prefix need only be sound, not maximal. A
- * pattern beginning with unquantified literal bytes, without a top-level
- * alternation, must expose a nonempty prefix; more extraction is optional. */
+ * Compile allocates nothing. The scratch size query returns zero for NULL. */
 typedef struct find_regex find_regex;
 size_t find_regex_bytes(void);
-find_code find_regex_compile(void *memory, size_t memory_size,
-                             const uint8_t *pattern, size_t pattern_length,
-                             find_regex **out, size_t *error_offset);
 /* (P) Four bytes per expanded ASCII literal plus two alphabet widths
  * of class working room, the v1 expansion buffer. Expanded syntax is
  * subject to FIND_MAX_PATTERN. */
@@ -138,10 +112,6 @@ find_code find_regex_compile_options(void *program, size_t program_bytes,
     uint8_t *pattern, size_t pattern_capacity, const work_ctx *context,
     find_regex **out, size_t *error_offset);
 
-/* Common mandatory literal prefix (possibly empty); borrowed from program.
- * A filter may reject starts only if this prefix fails at that same start. */
-const uint8_t *find_regex_prefix(const find_regex *regex, size_t *length);
-size_t find_regex_group_count(const find_regex *regex);
 size_t find_regex_scratch_bytes(const find_regex *regex);
 
 /* Leftmost-longest whole matches, non-overlapping. Empty matches are emitted
@@ -151,11 +121,8 @@ size_t find_regex_scratch_bytes(const find_regex *regex);
  * byte boundary wins. This is explicit subgroup tie policy, not full POSIX
  * subgroup ordering. Scratch is max_align_t-aligned, exclusive to one call;
  * program may be shared. No backtracking or recursive path enumeration.
- * Inputs/storage/results must not alias. NULL or misaligned scratch ARGUMENT;
- * too-small scratch MEMORY. Result is required, including on empty input. */
-find_code find_regex_search(const find_source *source, const find_regex *regex,
-                            void *scratch, size_t scratch_size,
-                            const find_control *control, find_result *result);
+ * Inputs, scratch and outputs must be disjoint. NULL or misaligned scratch
+ * returns ARGUMENT, and too-small scratch returns MEMORY. */
 typedef struct find_capture { uint64_t start, end; } find_capture;
 typedef struct find_match {
     bool matched;
@@ -166,41 +133,29 @@ typedef struct find_match {
         survive an iteration skipping that nested group); empty = {pos,pos}.
         Unused slots are UNSET pairs even on successful matches. */
 } find_match;
-/* Re-run anchored at an offset from result, returning whole range and captures
- * for replacement without bloating bounded find_result. off <= source length.
+/* Match anchored at off, returning the whole range and captures for replacement.
+ * off <= source length.
  * No match returns FIND_OK with matched=false, ranges unset. */
 find_code find_regex_captures(const find_source *source, const find_regex *regex,
                               uint64_t off, void *scratch, size_t scratch_size,
                               const find_control *control, find_match *match);
-/* Single-match streaming/pagination, starting at off <= source length. Find
- * the next leftmost match at or after off, with absolute source offsets.
- * Literal empty needle has no match. Regex includes an empty EOF match.
- * Advance to whole.end after a nonempty match; after an empty match advance
- * one byte, stopping at EOF. This is also search's enumeration policy.
- * Regex captures() is anchored at off, whereas next() may scan past off.
- * On any error/cancel, match is cleared: matched=false, groups=0, all ranges
- * UNSET. Successful no-match has groups=program group count (literal zero).
- * A literal match has no groups. All searches check argument/storage errors
- * before cancellation, then poll even for an empty needle/source. No-match
- * and failed searches clear counts; unused offset tails remain unspecified.
- * Stream these private matches from a work job with work_publish; its mailbox
- * carries small batches/handles, never a whole find_result. Keep snapshot,
- * program, scratch and result alive through acknowledgement. Replace-all
- * gathers edits against this immutable snapshot, then the UI applies them
- * right-to-left in one undo group. find itself mutates/publishes nothing. */
+/* Return the next leftmost literal match at or after off <= source length.
+ * Empty needles have no match. On error, matched is false and ranges are
+ * unset. Literal matching is linear in source and needle length, including
+ * metered SIMD verification with a Two-Way fallback. */
 find_code find_literal_next(const find_source *source, const uint8_t *needle,
                             size_t needle_length, find_literal_options options, uint64_t off,
                             const find_control *control, find_match *match);
-find_code find_regex_next(const find_source *source, const find_regex *regex,
-                          uint64_t off, void *scratch, size_t scratch_size,
-                          const find_control *control, find_match *match);
 
 /* Count the entire source. Emit a union of the bounded prefix, the first
  * visible_capacity matches intersecting [window_start, window_end), and the
  * zero-based wanted ordinal (FIND_UNSET disables it). Empty matches include
  * both window boundaries. Each selected ordinal is delivered once in order.
  * A false callback cancels. Counts clear on failure. Keep callback effects
- * private until successful completion, and discard them on failure. */
+ * private until successful completion, and discard them on failure. Literal
+ * matches are leftmost and non-overlapping, with zero matches for an empty
+ * needle. Regex empty matches advance one byte and include EOF. All matching
+ * uses caller storage and the stack. */
 typedef struct find_visit {
     size_t prefix_capacity, visible_capacity;
     uint64_t wanted, window_start, window_end;
@@ -234,9 +189,13 @@ find_code find_regex_stream_begin(const find_source *source,const find_regex *re
                                   void *scratch,size_t size,bool whole_word);
 find_code find_regex_stream_step(void *scratch,const find_control *control,
                                  find_visit *visit,bool *done);
-/* Filtered consumers share a request budget across overlapping retries,
- * including successful but rejected candidates. */
+/* Filtered consumers initialize one budget for the entire source and share
+ * it across overlapping retries, including successful but rejected candidates. */
 uint64_t find_regex_work_budget(const find_regex *regex,uint64_t length);
+/* Find the next leftmost-longest regex match at or after off <= source length.
+ * After a match, continue at its end, or advance one byte for an empty match.
+ * An empty match at EOF ends the scan. On error, matched is false, groups is
+ * zero and ranges are unset. Successful no-match retains the program's group count. */
 find_code find_regex_next_budget(const find_source *source,const find_regex *regex,uint64_t off,
                                 void *scratch,size_t size,const find_control *control,
                                 uint64_t *budget,find_match *match);

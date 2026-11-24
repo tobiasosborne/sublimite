@@ -878,8 +878,9 @@ v1 tooling. **Do not change the dump format in the harvest.**
   `trace_reset` only while no thread is recording.
 - Input log: `enum trace_in_kind`, `trace_input_rec` (48 bytes,
   `_Static_assert` in the header; zero-filled for byte-exact
-  dumps), appends `trace_input_key`/`_pointer`/`_wheel`/`_resize`/
-  `_focus`/`_clipboard`/`_filechange`, queries
+  dumps), appends `trace_input_key`, `trace_input_pointer`, `trace_input_wheel`,
+  `trace_input_resize`, `trace_input_focus`, `trace_input_clipboard` and
+  `trace_input_filechange`, queries
   `trace_input_count`/`trace_input_dropped`/`trace_input_copy`
   (oldest first). Single producer (UI thread), overwrite-oldest.
   Note the wheel comment ties units to `PLAT_WHEEL_UNIT` in v1

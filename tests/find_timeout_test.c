@@ -1,4 +1,4 @@
-#include "find/find.h"
+#include "find_fixture.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -15,7 +15,7 @@ typedef struct job {
     size_t polls;
     find_source source;
     find_code code;
-    find_result result;
+    find_fixture_result result;
 } job;
 
 bool __real_work_should_stop(const work_ctx *ctx);
@@ -39,7 +39,7 @@ static void run_find(work_ctx *ctx)
     const uint8_t needle[] = "aba";
     const find_control control = {.work = ctx};
     job *j = ctx->arg;
-    j->code = find_literal(&j->source, needle, sizeof needle - 1, (find_literal_options){0},
+    j->code = find_fixture_literal(&j->source, needle, sizeof needle - 1, (find_literal_options){0},
                            &control, &j->result);
 }
 
