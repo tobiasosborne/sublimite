@@ -75,6 +75,17 @@ typedef struct undo_slot {
     } value;
 } undo_slot;
 
+/* (G) v1 cfg.history_keys = 32,768 at oracle pin 6fec2e8, src/editor/buffers.c:256.
+ * (P) A one-byte group charges two slots and the input byte. On LP64 the
+ * slot is 264 B: 8 B owner + 48 B record prefix + 16 B inverse prefix +
+ * eight 24 B entries. The resulting 529 B charge gives 17,334,272 B. */
+#define UNDO_DEFAULT_CAP_BYTES (32768u * (2u * sizeof(undo_slot) + 1u))
+
+size_t undo_default_cap_bytes(void)
+{
+    return UNDO_DEFAULT_CAP_BYTES;
+}
+
 struct undo_slab {
     undo_slab *prev, *next; /* Only slabs with space are linked. */
     base_arena mem;
@@ -82,20 +93,20 @@ struct undo_slab {
     size_t live;
 };
 
-typedef enum undo_direction { UNDO_REVERSE, UNDO_FORWARD } undo_direction;
-typedef enum undo_command_state { UNDO_IDLE, UNDO_OPEN, UNDO_FAILED } undo_command_state;
+typedef enum undo_phase {
+    UNDO_IDLE, UNDO_OPEN, UNDO_FAILED, UNDO_REPLAYING, UNDO_PREPARED
+} undo_phase;
 
 typedef struct undo_replay {
-    /* group != NULL owns the open checkpoint. The committed cursor stays
-     * at its boundary while next walks the unpublished mutations. */
+    /* The committed cursor stays at its boundary while next walks the
+     * unpublished mutations. */
     undo_group *group;
-    undo_direction direction;
+    undo_replay_direction direction;
     undo_record *next;
     piece_snapshot *view, *guard;
 } undo_replay;
 
 typedef struct undo_pending {
-    undo_command_state state;
     bool join;
     undo_state before;
     undo_extent *append;
@@ -122,8 +133,11 @@ struct undo_log {
     size_t groups, applied_groups, evicted_groups;
     size_t bytes, applied_bytes, records, applied_records;
     uint64_t serial;
-    undo_pending pending;
-    undo_replay replay;
+    undo_phase phase;
+    union {
+        undo_pending pending;
+        undo_replay replay;
+    };
 };
 
 static undo_err piece_result(piece_err err)
@@ -219,17 +233,17 @@ static void slot_put(undo_log *u, void *member)
     s->free = slot;
 }
 
-static piece_span *inverse_spans(undo_inverse *v)
+static const piece_span *inverse_spans(const undo_inverse *v)
 {
     if (v->count <= UNDO_INLINE) return v->data.local.spans;
     unsigned char *start = (unsigned char *)(v->data.external.extent + 1);
     return (piece_span *)(start + v->data.external.offset);
 }
 
-static piece_span_nl *inverse_counts(undo_inverse *v)
+static const piece_span_nl *inverse_counts(const undo_inverse *v)
 {
     if (v->count <= UNDO_INLINE) return v->data.local.nl;
-    return (piece_span_nl *)(inverse_spans(v) + v->count);
+    return (const piece_span_nl *)(inverse_spans(v) + v->count);
 }
 
 static bool store_spans(undo_log *u, undo_inverse *v)
@@ -278,8 +292,8 @@ static void retire(undo_log *u, undo_group *first, undo_group *last)
 
 size_t undo_maintain(undo_log *u, size_t record_budget)
 {
-    ASSERT(u && u->pending.state != UNDO_FAILED);
-    if (u->replay.group || u->pending.state != UNDO_IDLE) return 0;
+    ASSERT(u && u->phase != UNDO_FAILED);
+    if (u->phase != UNDO_IDLE) return 0;
     size_t count = 0;
     while (u->retired_head && count < record_budget) {
         undo_group *g = u->retired_head;
@@ -356,30 +370,25 @@ undo_err undo_create(undo_log **out, piece_tree *tree, size_t cap_bytes,
     return UNDO_OK;
 }
 
-static void end_replay(undo_log *u, bool commit)
+static void release_replay_views(undo_log *u)
 {
-    ASSERT(u->replay.group);
     if (u->replay.guard) piece_snapshot_release(u->replay.guard);
-    if (commit) piece_checkpoint_commit(u->tree);
-    else piece_checkpoint_abort(u->tree);
     if (u->replay.view) piece_snapshot_release(u->replay.view);
-    u->replay = (undo_replay){0};
 }
 
 void undo_clear(undo_log *u)
 {
-    ASSERT(u);
-    switch (u->pending.state) {
+    ASSERT(u && u->phase != UNDO_FAILED && u->phase != UNDO_PREPARED);
+    switch (u->phase) {
     case UNDO_IDLE:
+    case UNDO_FAILED:
+    case UNDO_PREPARED:
         break;
     case UNDO_OPEN:
+    case UNDO_REPLAYING:
         undo_abort(u);
         break;
-    case UNDO_FAILED:
-        ASSERT(u->pending.state != UNDO_FAILED);
-        return;
     }
-    if (u->replay.group) end_replay(u, false);
     if (u->head) retire(u, u->head, u->tail);
     u->head = u->tail = u->applied = NULL;
     u->groups = u->applied_groups = u->records = u->applied_records = 0;
@@ -397,7 +406,7 @@ void undo_destroy(undo_log *u)
 
 void undo_set_cap(undo_log *u, size_t cap_bytes)
 {
-    ASSERT(u && cap_bytes != 0 && u->pending.state == UNDO_IDLE && !u->replay.group);
+    ASSERT(u && cap_bytes != 0 && u->phase == UNDO_IDLE);
     u->cap = cap_bytes;
     trim(u);
     (void)undo_maintain(u, UNDO_RECLAIM_RECORDS);
@@ -405,25 +414,25 @@ void undo_set_cap(undo_log *u, size_t cap_bytes)
 
 undo_history undo_get_history(const undo_log *u)
 {
-    ASSERT(u && u->pending.state != UNDO_FAILED);
+    ASSERT(u && u->phase != UNDO_FAILED);
     return (undo_history){u->applied_groups, u->groups - u->applied_groups,
                           u->evicted_groups, u->serial};
 }
 
 undo_stats undo_get_stats(const undo_log *u)
 {
-    ASSERT(u && u->pending.state != UNDO_FAILED);
+    ASSERT(u && u->phase != UNDO_FAILED);
     return (undo_stats){u->records, u->bytes, u->span_payload, u->storage};
 }
 
 undo_err undo_begin(undo_log *u, const undo_state *before, bool join)
 {
-    ASSERT(u && before && u->pending.state == UNDO_IDLE && !u->replay.group);
+    ASSERT(u && before && u->phase == UNDO_IDLE);
     (void)undo_maintain(u, UNDO_RECLAIM_RECORDS);
     undo_err e = piece_result(piece_checkpoint_begin(u->tree));
     if (e != UNDO_OK) return e;
     undo_pending *p = &u->pending;
-    p->state = UNDO_OPEN;
+    u->phase = UNDO_OPEN;
     p->join = join;
     p->before = *before;
     p->append = u->append;
@@ -434,11 +443,9 @@ undo_err undo_begin(undo_log *u, const undo_state *before, bool join)
     return UNDO_OK;
 }
 
-void undo_abort(undo_log *u)
+static void discard_pending(undo_log *u)
 {
-    ASSERT(u && u->pending.state != UNDO_IDLE);
     undo_pending *p = &u->pending;
-    piece_checkpoint_abort(u->tree);
     for (undo_record *r = p->first; r;) {
         undo_record *next = r->next;
         drop_spans(u, &r->inverse);
@@ -448,7 +455,25 @@ void undo_abort(undo_log *u)
     if (p->fresh) slot_put(u, p->fresh);
     u->append = p->append;
     if (u->append) u->append->used = p->append_used;
-    p->state = UNDO_IDLE;
+}
+
+void undo_abort(undo_log *u)
+{
+    ASSERT(u && u->phase != UNDO_IDLE);
+    piece_checkpoint_abort(u->tree);
+    switch (u->phase) {
+    case UNDO_IDLE:
+        break;
+    case UNDO_OPEN:
+    case UNDO_FAILED:
+        discard_pending(u);
+        break;
+    case UNDO_REPLAYING:
+    case UNDO_PREPARED:
+        release_replay_views(u);
+        break;
+    }
+    u->phase = UNDO_IDLE;
 }
 
 static bool adjacent(const undo_record *r, uint64_t off, uint64_t del, size_t len)
@@ -484,8 +509,8 @@ static undo_err prepare_inverse(undo_log *u, undo_record *r, bool remember_sourc
     v->kind = UNDO_SPANS;
     v->count = (size_t)count;
     if (!store_spans(u, v)) return UNDO_ERR_NOMEM;
-    piece_span *spans = inverse_spans(v);
-    piece_span_nl *nl = inverse_counts(v);
+    piece_span *spans = (piece_span *)inverse_spans(v);
+    piece_span_nl *nl = (piece_span_nl *)inverse_counts(v);
     piece_iter_seek(&it, r->off);
     for (size_t i = 0; i < v->count; i++)
         ASSERT(piece_iter_next_span(&it, end, &spans[i], &nl[i]));
@@ -665,12 +690,12 @@ static undo_err stage(undo_log *u, uint64_t off, uint64_t del, const uint8_t *by
 
 undo_err undo_replace(undo_log *u, uint64_t off, uint64_t del, const uint8_t *bytes, size_t len)
 {
-    ASSERT(u && u->pending.state == UNDO_OPEN && (bytes || len == 0));
+    ASSERT(u && u->phase == UNDO_OPEN && (bytes || len == 0));
     const uint64_t n = piece_length(piece_tree_view(u->tree));
     ASSERT(off <= n && del <= n - off && len <= PIECE_MAX_LENGTH - (n - del));
     if (del == 0 && len == 0) return UNDO_OK;
     undo_err e = stage(u, off, del, bytes, len);
-    if (e != UNDO_OK) u->pending.state = UNDO_FAILED;
+    if (e != UNDO_OK) u->phase = UNDO_FAILED;
     return e;
 }
 
@@ -707,17 +732,55 @@ static void publish(undo_log *u, const undo_state *after)
     trim(u);
 }
 
+static const undo_state *replay_target(const undo_replay *replay)
+{
+    return replay->direction == UNDO_REPLAY_UNDO ? &replay->group->before : &replay->group->after;
+}
+
+static void publish_replay(undo_log *u)
+{
+    const undo_group *g = u->replay.group;
+    switch (u->replay.direction) {
+    case UNDO_REPLAY_UNDO:
+        u->applied = g->prev;
+        u->applied_groups--;
+        u->applied_records -= g->records;
+        u->applied_bytes -= g->bytes;
+        break;
+    case UNDO_REPLAY_REDO:
+        u->applied = u->replay.group;
+        u->applied_groups++;
+        u->applied_records += g->records;
+        u->applied_bytes += g->bytes;
+        break;
+    }
+    release_replay_views(u);
+}
+
 undo_err undo_commit(undo_log *u, const undo_state *after)
 {
-    ASSERT(u && after && u->pending.state == UNDO_OPEN);
+    ASSERT(u && after && (u->phase == UNDO_OPEN ||
+                          (u->phase == UNDO_PREPARED && after == replay_target(&u->replay))));
     if (!trusted(u)) {
         undo_abort(u);
         return UNDO_ERR_CONFLICT;
     }
     piece_checkpoint_commit(u->tree);
-    publish(u, after);
-    u->pending.state = UNDO_IDLE;
+    if (u->phase == UNDO_PREPARED) publish_replay(u);
+    else publish(u, after);
+    u->phase = UNDO_IDLE;
     return UNDO_OK;
+}
+
+/* (P) Cuts are set only in a one-run literal below the pair width. Walk
+ * its capture segments backwards, in document insertion order. */
+static piece_span literal_part(const undo_literal *v, uint64_t *end)
+{
+    uint64_t start = *end - 1;
+    while (start != 0 && !(v->cuts & (1u << start))) start--;
+    piece_span part = {v->copy.src + start, *end - start};
+    *end = start;
+    return part;
 }
 
 static undo_err restore_literal(piece_tree *t, const undo_record *r)
@@ -726,24 +789,19 @@ static undo_err restore_literal(piece_tree *t, const undo_record *r)
     if (v->cuts == 0)
         return piece_result(piece_replace_spans(t, r->off, r->inserted.len, &v->copy, NULL, 1));
 
-    /* (P) A one-run literal stays below the pair width. Each nonempty
-     * capture contributes at least one byte. Walk its cuts from the end. */
+    /* (P) Each nonempty capture contributes at least one byte. */
     piece_span spans[sizeof(piece_span) - 1];
     size_t count = 0;
-    for (uint64_t end = v->copy.len; end != 0;) {
-        uint64_t start = end - 1;
-        while (start != 0 && !(v->cuts & (1u << start))) start--;
-        spans[count++] = (piece_span){v->copy.src + start, end - start};
-        end = start;
-    }
+    for (uint64_t end = v->copy.len; end != 0;)
+        spans[count++] = literal_part(v, &end);
     return piece_result(piece_replace_spans(t, r->off, r->inserted.len, spans, NULL, count));
 }
 
-static undo_err apply(undo_log *u, undo_record *r, undo_direction direction)
+static undo_err apply(undo_log *u, const undo_record *r, undo_replay_direction direction)
 {
     switch (direction) {
-    case UNDO_REVERSE: {
-        undo_inverse *v = &r->inverse;
+    case UNDO_REPLAY_UNDO: {
+        const undo_inverse *v = &r->inverse;
         switch (v->kind) {
         case UNDO_EMPTY:
             return piece_result(piece_replace_spans(u->tree, r->off, r->inserted.len, NULL, NULL, 0));
@@ -755,7 +813,7 @@ static undo_err apply(undo_log *u, undo_record *r, undo_direction direction)
         }
         break;
     }
-    case UNDO_FORWARD:
+    case UNDO_REPLAY_REDO:
         return piece_result(piece_replace_spans(u->tree, r->off, r->removed, &r->inserted,
                                                 NULL, r->inserted.len != 0 ? 1u : 0u));
     }
@@ -763,7 +821,7 @@ static undo_err apply(undo_log *u, undo_record *r, undo_direction direction)
     return UNDO_ERR_RANGE;
 }
 
-static undo_err begin_replay(undo_log *u, undo_group *g, undo_direction direction)
+static undo_err begin_replay(undo_log *u, undo_group *g, undo_replay_direction direction)
 {
     piece_snapshot *view = NULL;
     if (g->first != g->last) {
@@ -776,13 +834,13 @@ static undo_err begin_replay(undo_log *u, undo_group *g, undo_direction directio
         return e;
     }
     u->replay = (undo_replay){.group = g, .direction = direction, .view = view,
-                             .next = direction == UNDO_REVERSE ? g->last : g->first};
+                             .next = direction == UNDO_REPLAY_UNDO ? g->last : g->first};
+    u->phase = UNDO_REPLAYING;
     return UNDO_OK;
 }
 
 static undo_err check_guard(undo_log *u)
 {
-    if (!u->replay.guard) return UNDO_OK;
     piece_snapshot *now;
     undo_err e = piece_result(piece_snapshot_take(u->tree, &now));
     if (e != UNDO_OK) return e;
@@ -793,72 +851,34 @@ static undo_err check_guard(undo_log *u)
     return UNDO_OK;
 }
 
-static void dirty(undo_change *c, const undo_record *r, uint64_t before, uint64_t after)
+undo_err undo_replay_prepare(undo_log *u, undo_replay_direction direction,
+                             uint64_t deadline, const undo_state **target)
 {
-    uint64_t end = before == after ? r->off + r->removed : (before > after ? before : after);
-    if (c->len == 0) {
-        c->off = r->off;
-        c->len = end - r->off;
-        return;
-    }
-    uint64_t old_end = c->off + c->len;
-    if (r->off < c->off) c->off = r->off;
-    c->len = (end > old_end ? end : old_end) - c->off;
-}
-
-static void commit_group(undo_log *u, undo_group *g, bool reverse, undo_change *c)
-{
-    end_replay(u, true);
-    if (reverse) {
-        u->applied = g->prev;
-        u->applied_groups--;
-        u->applied_records -= g->records;
-        u->applied_bytes -= g->bytes;
+    ASSERT(u && target && (direction == UNDO_REPLAY_UNDO || direction == UNDO_REPLAY_REDO));
+    ASSERT(u->phase == UNDO_IDLE || (u->phase == UNDO_REPLAYING && u->replay.direction == direction));
+    *target = NULL;
+    undo_err e;
+    undo_group *g;
+    bool reverse = direction == UNDO_REPLAY_UNDO;
+    if (u->phase == UNDO_REPLAYING) {
+        e = check_guard(u);
+        if (e != UNDO_OK) goto abort_group;
+        g = u->replay.group;
     } else {
-        u->applied = g;
-        u->applied_groups++;
-        u->applied_records += g->records;
-        u->applied_bytes += g->bytes;
+        g = reverse ? u->applied : (u->applied ? u->applied->next : u->head);
+        if (!g) return UNDO_OK;
     }
-    c->groups++;
-    c->state = reverse ? g->before : g->after;
-    c->has_state = true;
-}
-
-static undo_err replay(undo_log *u, size_t groups, uint64_t deadline, undo_change *c,
-                       undo_direction direction)
-{
-    ASSERT(u && c && u->pending.state == UNDO_IDLE);
-    ASSERT(!u->replay.group || (groups != 0 && u->replay.direction == direction));
-    *c = (undo_change){0};
-    undo_change completed = {0};
-    bool reverse = direction == UNDO_REVERSE;
-    undo_err e = check_guard(u);
-    if (e != UNDO_OK) goto abort_group;
-    while (c->groups < groups) {
-        undo_group *g = reverse ? u->applied : (u->applied ? u->applied->next : u->head);
-        if (!g) break;
-        /* Each call completes a mutation before honoring its deadline. */
-        if (c->len != 0 && deadline != OS_DEADLINE_NEVER && os_now_ns() >= deadline) {
-            if (u->replay.group) {
-                e = piece_result(piece_snapshot_take(u->tree, &u->replay.guard));
-                if (e != UNDO_OK) goto abort_group;
-            }
-            return UNDO_MORE;
-        }
+    for (;;) {
         /* The sanitizer planner checks carried counts against source
-         * bytes. Reject a known identity change before it can recount
-         * invalidated records, and keep the closing check after apply. */
+         * bytes. Check the backing before it can recount and after apply. */
         if (!trusted(u)) {
             e = UNDO_ERR_CONFLICT;
             goto abort_group;
         }
-        if (!u->replay.group) {
+        if (u->phase == UNDO_IDLE) {
             e = begin_replay(u, g, direction);
             if (e != UNDO_OK) goto abort_group;
         }
-        const piece_view *v = piece_tree_view(u->tree);
-        uint64_t before = piece_length(v);
         undo_record *r = u->replay.next;
         e = apply(u, r, direction);
         if (e != UNDO_OK) goto abort_group;
@@ -866,33 +886,78 @@ static undo_err replay(undo_log *u, size_t groups, uint64_t deadline, undo_chang
             e = UNDO_ERR_CONFLICT;
             goto abort_group;
         }
-        dirty(c, r, before, piece_length(v));
         u->replay.next = reverse ? r->prev : r->next;
         if (!u->replay.next) {
-            commit_group(u, g, reverse, c);
-            completed = *c;
+            u->phase = UNDO_PREPARED;
+            *target = replay_target(&u->replay);
+            return UNDO_OK;
+        }
+        if (deadline != OS_DEADLINE_NEVER && os_now_ns() >= deadline) {
+            e = piece_result(piece_snapshot_take(u->tree, &u->replay.guard));
+            if (e != UNDO_OK) goto abort_group;
+            return UNDO_MORE;
         }
     }
-    return UNDO_OK;
 
 abort_group:
-    if (u->replay.group) end_replay(u, false);
-    *c = completed;
+    if (u->phase == UNDO_REPLAYING) undo_abort(u);
     return e;
 }
 
-undo_err undo_undo(undo_log *u, size_t groups, uint64_t deadline, undo_change *change)
+void undo_splice_iter_init(undo_splice_iter *it, const undo_log *u)
 {
-    return replay(u, groups, deadline, change, UNDO_REVERSE);
+    ASSERT(it && u && u->phase == UNDO_PREPARED);
+    const undo_group *g = u->replay.group;
+    *it = (undo_splice_iter){u, u->replay.direction == UNDO_REPLAY_UNDO ? g->last : g->first};
 }
 
-undo_err undo_redo(undo_log *u, size_t groups, uint64_t deadline, undo_change *change)
+bool undo_splice_iter_next(undo_splice_iter *it, undo_prepared_splice *out)
 {
-    return replay(u, groups, deadline, change, UNDO_FORWARD);
+    ASSERT(it && it->log && it->log->phase == UNDO_PREPARED && out);
+    const undo_record *r = it->next;
+    if (!r) return false;
+    undo_replay_direction direction = it->log->replay.direction;
+    uint64_t removed = r->removed;
+    size_t count = r->inserted.len != 0 ? 1u : 0u;
+    it->next = r->next;
+    if (direction == UNDO_REPLAY_UNDO) {
+        removed = r->inserted.len;
+        count = r->inverse.count;
+        if (r->inverse.kind == UNDO_LITERAL) {
+            for (uint16_t cuts = r->inverse.data.literal.cuts; cuts; cuts &= (uint16_t)(cuts - 1u))
+                count++;
+        }
+        it->next = r->prev;
+    }
+    *out = (undo_prepared_splice){r->off, removed, count, r, direction};
+    return true;
+}
+
+piece_span undo_splice_span(const undo_prepared_splice *splice, size_t index)
+{
+    ASSERT(splice && index < splice->span_count);
+    const undo_record *r = splice->record;
+    if (splice->direction == UNDO_REPLAY_REDO) return r->inserted;
+    const undo_inverse *v = &r->inverse;
+    switch (v->kind) {
+    case UNDO_EMPTY:
+        break;
+    case UNDO_LITERAL: {
+        const undo_literal *literal = &v->data.literal;
+        if (!literal->cuts) return literal->copy;
+        uint64_t end = literal->copy.len;
+        for (size_t i = 0; i < index; i++) (void)literal_part(literal, &end);
+        return literal_part(literal, &end);
+    }
+    case UNDO_SPANS:
+        return inverse_spans(v)[index];
+    }
+    ASSERT(false);
+    return (piece_span){0};
 }
 
 piece_snapshot *undo_replay_snapshot(const undo_log *u)
 {
-    ASSERT(u && u->pending.state != UNDO_FAILED);
-    return u->replay.view;
+    ASSERT(u && u->phase != UNDO_FAILED);
+    return u->phase == UNDO_REPLAYING || u->phase == UNDO_PREPARED ? u->replay.view : NULL;
 }

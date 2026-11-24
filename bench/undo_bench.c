@@ -41,6 +41,13 @@ static void report(const char *label, uint64_t times[SAMPLES])
            (unsigned long long)median, (unsigned long long)tail, (unsigned)SAMPLES);
 }
 
+static bool replay(undo_log *u, undo_replay_direction direction)
+{
+    const undo_state *target;
+    return undo_replay_prepare(u, direction, OS_DEADLINE_NEVER, &target) == UNDO_OK &&
+           target && undo_commit(u, target) == UNDO_OK;
+}
+
 int main(void)
 {
     stamp();
@@ -56,7 +63,6 @@ int main(void)
         undo_create(&u, t, SIZE_MAX, NULL, NULL) == UNDO_OK) {
         const undo_state state = {0};
         const uint8_t byte = 'x';
-        undo_change change;
         uint64_t insert[SAMPLES], reverse[SAMPLES], forward[SAMPLES];
         for (size_t i = 0; i < SAMPLES; i++) {
             /* (P) One independently undoable keystroke per sample.
@@ -71,11 +77,11 @@ int main(void)
             insert[i] = os_now_ns() - start;
             if (piece_replenish(t) != PIECE_OK) break;
             start = os_now_ns();
-            if (undo_undo(u, 1, OS_DEADLINE_NEVER, &change) != UNDO_OK) break;
+            if (!replay(u, UNDO_REPLAY_UNDO)) break;
             reverse[i] = os_now_ns() - start;
             if (piece_replenish(t) != PIECE_OK) break;
             start = os_now_ns();
-            if (undo_redo(u, 1, OS_DEADLINE_NEVER, &change) != UNDO_OK) break;
+            if (!replay(u, UNDO_REPLAY_REDO)) break;
             forward[i] = os_now_ns() - start;
             if (piece_replenish(t) != PIECE_OK) break;
             complete = i + 1 == SAMPLES;

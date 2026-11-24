@@ -13,6 +13,19 @@ static void edit(undo_log *u, uint64_t off, uint64_t del, const uint8_t *bytes, 
     ASSERT(undo_commit(u, &state) == UNDO_OK);
 }
 
+static void replay(undo_log *u, undo_replay_direction direction, size_t spans)
+{
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(u, direction, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    undo_splice_iter it;
+    undo_prepared_splice splice;
+    undo_splice_iter_init(&it, u);
+    ASSERT(undo_splice_iter_next(&it, &splice) && splice.span_count == spans);
+    for (size_t i = 0; i < spans; i++) ASSERT(undo_splice_span(&splice, i).len != 0);
+    ASSERT(!undo_splice_iter_next(&it, &splice));
+    ASSERT(undo_commit(u, target) == UNDO_OK);
+}
+
 int main(void)
 {
     /* (P) The full delete crosses the eight-inline boundary with nine
@@ -43,9 +56,8 @@ int main(void)
     const uint64_t len = piece_length(piece_tree_view(t));
     edit(u, len - 1, 1, NULL, 0, false);
     edit(u, 0, len - 1, NULL, 0, false);
-    undo_change change;
-    ASSERT(undo_undo(u, 1, OS_DEADLINE_NEVER, &change) == UNDO_OK && change.groups == 1);
-    ASSERT(undo_redo(u, 1, OS_DEADLINE_NEVER, &change) == UNDO_OK && change.groups == 1);
+    replay(u, UNDO_REPLAY_UNDO, 2 * cuts + 1);
+    replay(u, UNDO_REPLAY_REDO, 0);
     size_t calls = base_malloc_guard_end();
 
     ASSERT(undo_get_stats(u).span_payload_bytes != 0);

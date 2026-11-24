@@ -85,18 +85,17 @@ static void edit(undo_log *u, model *m, const uint8_t *input, bool burst)
 
 static void replay(undo_log *u, model *m, bool reverse, bool clear_at_yield)
 {
-    undo_err (*slice)(undo_log *, size_t, uint64_t, undo_change *) =
-        reverse ? undo_undo : undo_redo;
-    undo_change c;
+    undo_replay_direction direction = reverse ? UNDO_REPLAY_UNDO : UNDO_REPLAY_REDO;
+    const undo_state *target;
     /* (P) Yield after one operation when replaying a multi-edit group. */
-    undo_err e = slice(u, 1, 0, &c);
+    undo_err e = undo_replay_prepare(u, direction, 0, &target);
     if (reverse ? m->applied == 0 : m->applied == m->total) {
-        ASSERT(e == UNDO_OK && c.groups == 0 && c.len == 0);
+        ASSERT(e == UNDO_OK && target == NULL);
         return;
     }
     const group *g = &m->groups[reverse ? m->applied - 1 : m->applied];
     if (e == UNDO_MORE) {
-        ASSERT(c.groups == 0 && c.len != 0 && !c.has_state);
+        ASSERT(target == NULL);
         check_view(piece_snapshot_view(undo_replay_snapshot(u)), &m->current);
         undo_history h = undo_get_history(u);
         ASSERT(h.undo_groups == m->applied && h.redo_groups == m->total - m->applied);
@@ -105,11 +104,12 @@ static void replay(undo_log *u, model *m, bool reverse, bool clear_at_yield)
             m->applied = m->total = 0;
             return;
         }
-        e = slice(u, 1, 0, &c);
+        e = undo_replay_prepare(u, direction, 0, &target);
     }
-    ASSERT(e == UNDO_OK && c.groups == 1 && c.has_state);
+    ASSERT(e == UNDO_OK && target);
     const undo_state *want = reverse ? &g->first : &g->last;
-    ASSERT(memcmp(&c.state, want, sizeof *want) == 0);
+    ASSERT(memcmp(target, want, sizeof *want) == 0);
+    ASSERT(undo_commit(u, target) == UNDO_OK);
     m->current = reverse ? g->before : g->after;
     if (reverse) m->applied--;
     else m->applied++;

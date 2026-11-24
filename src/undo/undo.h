@@ -21,12 +21,22 @@ typedef enum undo_err {
 
 typedef struct undo_state { uint8_t bytes[UNDO_STATE_BYTES]; } undo_state;
 
-typedef struct undo_change {
-    uint64_t off, len;           /* dirty range for repaint */
-    size_t groups;               /* subtract this when resuming */
-    bool has_state;              /* a completed group supplied cursor state */
-    undo_state state;           /* cursor state for the last completed group */
-} undo_change;
+typedef enum undo_replay_direction {
+    UNDO_REPLAY_UNDO, UNDO_REPLAY_REDO
+} undo_replay_direction;
+
+/* Value cursors. Clients treat the pointer members as private. */
+typedef struct undo_splice_iter {
+    const undo_log *log;
+    const struct undo_record *next;
+} undo_splice_iter;
+
+typedef struct undo_prepared_splice {
+    uint64_t off, removed;
+    size_t span_count;
+    const struct undo_record *record;
+    undo_replay_direction direction;
+} undo_prepared_splice;
 
 typedef struct undo_history {
     size_t undo_groups, redo_groups, evicted_groups;
@@ -49,11 +59,14 @@ typedef struct undo_stats {
 
 /* For mapped trees, this callback supplies the owner's live identity check.
  * A same-size external overwrite can leave a pristine fault epoch and the
- * owner's asynchronous notification can arrive later. Undo needs this check
- * at the publication boundary because sliced replay can commit multiple
- * groups internally. The callback may inspect the backing, must not edit
- * the tree or log, and must not wait. Undo also polls the fault id itself. */
+ * owner's asynchronous notification can arrive later. Undo checks at the
+ * publication boundary and around replay mutations. The callback may inspect
+ * the backing, must not edit the tree or log, and must not wait. Undo also
+ * polls the fault id itself. */
 typedef bool (*undo_validate_fn)(void *ctx, const piece_backing *backing);
+
+/* Default published history budget. undo_create still takes a caller's cap. */
+size_t undo_default_cap_bytes(void);
 
 /* Creates an empty log. O(1), one base extent. NOMEM if base refuses it.
  * ASSERT: out and tree are non-NULL, cap_bytes > 0, and mapped trees have a
@@ -61,12 +74,13 @@ typedef bool (*undo_validate_fn)(void *ctx, const piece_backing *backing);
 undo_err undo_create(undo_log **out, piece_tree *tree, size_t cap_bytes,
                      undo_validate_fn validate, void *ctx);
 
-/* Destroys the log, aborting an open command or replay and releasing every
- * history extent. O(records). Cannot fail. ASSERT: live log, tree still open. */
+/* Destroys the log and releases every history extent. O(records). Cannot
+ * fail. ASSERT: live log, tree still open, no prepared replay. */
 void undo_destroy(undo_log *u);
 
-/* Clears undo and redo, aborting an open command or replay. O(records).
- * Cannot fail. ASSERT: live log. Committed ADD is still owned by the tree. */
+/* Clears undo and redo, aborting an open command or applying replay.
+ * O(records). Cannot fail. ASSERT: live log, no failed command or prepared
+ * replay. Committed ADD is still owned by the tree. */
 void undo_clear(undo_log *u);
 
 /* Changes the published byte cap, evicts whole oldest groups and performs
@@ -103,50 +117,48 @@ undo_err undo_begin(undo_log *u, const undo_state *before, bool join);
 undo_err undo_replace(undo_log *u, uint64_t off, uint64_t del,
                       const uint8_t *bytes, size_t len);
 
-/* Validates the mapped source after the last dependent work, commits the
- * checkpoint and publishes history with the supplied final cursor state.
- * Publication evicts whole groups at the cap and detaches redo on a nonempty
- * edit. O(1) on success, including bounded eviction. CONFLICT on a failed
- * closing validation. It aborts the command in that case. ASSERT: open
- * command without a prior edit error, after != NULL.
- *
- * L2 may prepare journal records from the staged text after its last
- * undo_replace and before undo_commit. Keep that staging private until
- * success. On error discard the staging. The caller never opens a piece
- * checkpoint on this tree. */
+/* Validates the mapped source after the last dependent work, closes the
+ * checkpoint and publishes history on success. A forward command supplies
+ * its final cursor state. Cap eviction and redo detachment apply to nonempty
+ * edits. Replay supplies the saved target and moves only the applied position.
+ * O(1) on success, including bounded eviction. CONFLICT aborts the checkpoint.
+ * ASSERT: open forward command without a prior edit error, after != NULL,
+ * or prepared replay with after pointing to its borrowed target. */
 undo_err undo_commit(undo_log *u, const undo_state *after);
 
 /* Aborts the tree checkpoint and drops pending history, preserving the
  * published cursor, redo and cap. O(staged records and extents).
- * Allocates nothing and cannot fail. ASSERT: open forward command. */
+ * Allocates nothing and cannot fail. ASSERT: open or failed forward command,
+ * or applying or prepared replay. */
 void undo_abort(undo_log *u);
 
-/* Replays up to groups whole groups in the selected direction. deadline is
- * absolute on os_now_ns(), or OS_DEADLINE_NEVER. With work available each
- * call makes one whole mutation before checking the deadline. MORE can
- * leave a group open. Resume in the same direction for the remaining group
- * count, subtracting change.groups. During a yield, the forward command
- * calls undo_begin/undo_replace/undo_commit/undo_abort ASSERT, as do
- * undo_set_cap and opposite replay. Do not call piece_lines_resolve or any
- * piece operation that ends the live revision. Resume detects a changed
- * revision by snapshot identity and ASSERTs.
- * Cost scales with the piece mutations executed.
+/* Applies or resumes one group. On OK, *target borrows its saved cursor
+ * state if a group is prepared. Empty history yields OK and NULL. An
+ * absolute os_now_ns() deadline (or OS_DEADLINE_NEVER) is checked after at
+ * least one available mutation. MORE keeps the checkpoint open. NOMEM,
+ * RANGE or CONFLICT aborts the group. MORE and errors clear *target.
  *
- * The dirty interval covers repaint through the larger pre/post EOF on
- * length changes. Only completed groups report cursor state.
- * NOMEM if a checkpoint,
- * mutation or replay view cannot be admitted. RANGE if a mutation exceeds
- * the piece height limit. CONFLICT on a failed backing check, including
- * after resume and before group publication. An error rolls back the current
- * group and reports only groups this call completed. Earlier committed
- * groups stay committed.
- * ASSERT: live log, change != NULL, no forward command, and a yielded group
- * is resumed in its direction with a nonzero group count. */
-undo_err undo_undo(undo_log *u, size_t groups, uint64_t deadline, undo_change *change);
-undo_err undo_redo(undo_log *u, size_t groups, uint64_t deadline, undo_change *change);
+ * ASSERT: live log, valid direction, target != NULL, and log idle or resuming
+ * a yield in the same direction and revision. While the checkpoint is open,
+ * piece operations that end the live revision (including piece_lines_resolve)
+ * are prohibited. The owner may take a candidate snapshot after preparation.
+ * History counters remain at entry until the owner commits. */
+undo_err undo_replay_prepare(undo_log *u, undo_replay_direction direction,
+                             uint64_t deadline, const undo_state **target);
 
-/* O(1) borrowed pre-group view during a mid-group replay yield, otherwise
- * NULL. Retain it to keep it after the group boundary. Cannot fail.
+/* Starts an allocation-free traversal of the complete prepared group.
+ * Initialize after successful nonempty preparation. Cursors, results and
+ * the borrowed target are valid until the owner commits or aborts. */
+void undo_splice_iter_init(undo_splice_iter *it, const undo_log *u);
+/* Returns the next splice in application order. At end returns false and
+ * leaves *out untouched. A pure delete has zero insertion spans. O(1). */
+bool undo_splice_iter_next(undo_splice_iter *it, undo_prepared_splice *out);
+/* Returns the indexed insertion span by value in document insertion order.
+ * ASSERT: index < splice->span_count. O(1). */
+piece_span undo_splice_span(const undo_prepared_splice *splice, size_t index);
+
+/* O(1) borrowed pre-group view during a multi-record replay, otherwise NULL.
+ * Retain it to keep it after the group boundary. Cannot fail.
  * ASSERT: live log. */
 piece_snapshot *undo_replay_snapshot(const undo_log *u);
 #endif

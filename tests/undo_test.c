@@ -126,6 +126,220 @@ static void text_eq(const piece_view *v, const char *s)
     }
 }
 
+static undo_err replay_commit(undo_log *u, undo_replay_direction direction, uint64_t deadline,
+                             const undo_state *want)
+{
+    const undo_state *target;
+    undo_err e = undo_replay_prepare(u, direction, deadline, &target);
+    if (e != UNDO_OK) return e;
+    ASSERT(target && (!want || memcmp(target, want, sizeof *want) == 0));
+    return undo_commit(u, target);
+}
+
+static void history_eq(undo_log *u, undo_history h, undo_stats s)
+{
+    undo_history after = undo_get_history(u);
+    undo_stats stats = undo_get_stats(u);
+    ASSERT(after.undo_groups == h.undo_groups && after.redo_groups == h.redo_groups);
+    ASSERT(after.group_serial == h.group_serial && after.evicted_groups == h.evicted_groups);
+    ASSERT(stats.records == s.records && stats.history_bytes == s.history_bytes);
+}
+
+typedef struct replay_image {
+    const uint8_t *original, *add;
+    /* (P) The directed fixtures use at most an original run and nine
+     * alternating runs, each one span-width long. */
+    char bytes[10 * sizeof(piece_span) + 1];
+} replay_image;
+
+static void apply_splices(undo_log *u, replay_image *image, size_t count)
+{
+    undo_splice_iter it;
+    undo_splice_iter_init(&it, u);
+    undo_prepared_splice splice = {0};
+    for (size_t i = 0; i < count; i++) {
+        ASSERT(undo_splice_iter_next(&it, &splice));
+        size_t n = strlen(image->bytes);
+        ASSERT(splice.off <= n && splice.removed <= n - splice.off);
+        size_t off = (size_t)splice.off, del = (size_t)splice.removed;
+        size_t inserted = 0;
+        for (size_t j = 0; j < splice.span_count; j++) {
+            piece_span span = undo_splice_span(&splice, j);
+            ASSERT(span.len && span.len < sizeof image->bytes - (n - del) - inserted);
+            inserted += (size_t)span.len;
+        }
+        memmove(image->bytes + off + inserted, image->bytes + off + del, n - off - del + 1);
+        for (size_t j = 0; j < splice.span_count; j++) {
+            piece_span span = undo_splice_span(&splice, j);
+            const uint8_t *source = span.src & PIECE_SPAN_ADD ? image->add : image->original;
+            ASSERT(source);
+            memcpy(image->bytes + off, source + (span.src & ~PIECE_SPAN_ADD), (size_t)span.len);
+            off += (size_t)span.len;
+        }
+    }
+    /* At end next must leave the output untouched. */
+    const undo_prepared_splice end = splice;
+    ASSERT(!undo_splice_iter_next(&it, &splice));
+    ASSERT(splice.off == end.off && splice.removed == end.removed && splice.span_count == end.span_count &&
+           splice.record == end.record && splice.direction == end.direction);
+}
+
+static void owner_replay(void)
+{
+    /* (P) Two differently sized backspaces coalesce into one inverse.
+     * The replacement contributes a contiguous literal and a forward
+     * ADD run. The final insertion contributes an empty inverse. */
+    const uint8_t original[] = "abcdef";
+    const uint8_t add[] = "efdcXY";
+    fixture f = open_copy(original, sizeof original - 1);
+    const piece_view *v = piece_tree_view(f.tree);
+    const undo_state *target = &idle;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_OK && !target);
+    ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 4, 2, NULL, 0) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 3, 1, NULL, 0) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 2, 1, (const uint8_t *)"X", 1) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"Y", 1) == UNDO_OK);
+    ASSERT(undo_commit(f.log, &last) == UNDO_OK);
+    undo_history h = undo_get_history(f.log);
+    undo_stats s = undo_get_stats(f.log);
+    ASSERT(s.records == 3);
+    target = &idle;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(piece_snapshot_view(undo_replay_snapshot(f.log)), "YabX");
+    text_eq(v, "abX");
+    history_eq(f.log, h, s);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "abc");
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_OK && target);
+    ASSERT(memcmp(target, &first, sizeof first) == 0);
+    history_eq(f.log, h, s);
+    replay_image before = {original, add, "YabX"};
+    replay_image image = before;
+    apply_splices(f.log, &image, s.records);
+    piece_snapshot *candidate;
+    ASSERT(piece_snapshot_take(f.tree, &candidate) == PIECE_OK);
+    undo_abort(f.log);
+    text_eq(v, before.bytes);
+    text_eq(piece_snapshot_view(candidate), image.bytes);
+    ASSERT(piece_add_length(f.tree) == sizeof add - 1);
+    ASSERT(undo_replay_snapshot(f.log) == NULL);
+    history_eq(f.log, h, s);
+    piece_snapshot_release(candidate);
+
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    image = before;
+    apply_splices(f.log, &image, s.records);
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
+    text_eq(v, image.bytes);
+    text_eq(v, (const char *)original);
+    ASSERT(undo_get_history(f.log).redo_groups == 1);
+
+    h = undo_get_history(f.log);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(piece_snapshot_view(undo_replay_snapshot(f.log)), (const char *)original);
+    undo_abort(f.log);
+    text_eq(v, (const char *)original);
+    history_eq(f.log, h, s);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "abc");
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "abX");
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_OK && target);
+    ASSERT(memcmp(target, &last, sizeof last) == 0);
+    history_eq(f.log, h, s);
+    apply_splices(f.log, &image, s.records);
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
+    text_eq(v, image.bytes);
+    text_eq(v, before.bytes);
+    ASSERT(undo_get_history(f.log).undo_groups == 1);
+    close_fixture(f);
+}
+
+static void span_replay(size_t splits)
+{
+    /* (P) Each split adds one pair-width ADD run between two ORIGINAL
+     * runs. One split stays inline, four cross the eight-span boundary. */
+    enum { run = sizeof(piece_span), max_splits = 4 };
+    uint8_t original[(max_splits + 1) * run], add[max_splits * run];
+    memset(original, 'o', sizeof original);
+    memset(add, 'a', sizeof add);
+    fixture f = open_copy(original, (splits + 1) * run);
+    for (size_t i = 1; i <= splits; i++)
+        ASSERT(insert_cmd(f.log, (2 * i - 1) * run, add, run, false, &idle, &idle) == UNDO_OK);
+    undo_clear(f.log);
+    const uint64_t len = (2 * splits + 1) * run;
+    ASSERT(erase_cmd(f.log, 0, len, false, &first, &last) == UNDO_OK);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_OK && target);
+    undo_splice_iter it;
+    undo_prepared_splice splice;
+    undo_splice_iter_init(&it, f.log);
+    ASSERT(undo_splice_iter_next(&it, &splice) && splice.span_count == 2 * splits + 1);
+    for (size_t i = 0; i < splice.span_count; i++) {
+        const uint64_t expected = (i / 2) * run + (i % 2 ? PIECE_SPAN_ADD : 0);
+        ASSERT(ph_span_eq(undo_splice_span(&splice, i), (piece_span){expected, run}));
+    }
+    replay_image image = {original, add, ""};
+    apply_splices(f.log, &image, 1); /* Restart after the sizing pass. */
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
+    text_eq(piece_tree_view(f.tree), image.bytes);
+    ASSERT(strlen(image.bytes) == len);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_OK && target);
+    apply_splices(f.log, &image, 1);
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
+    ASSERT(image.bytes[0] == '\0');
+    text_eq(piece_tree_view(f.tree), image.bytes);
+    close_fixture(f);
+}
+
+static void replay_admission(void)
+{
+    /* (P) Reinserting more than a leaf of ORIGINAL descriptors grows the
+     * tree. Hold the original root so that its slots cannot fund the restore. */
+    static uint8_t original[LARGE_LEN];
+    fixture f = open_copy(original, sizeof original);
+    const piece_view *v = piece_tree_view(f.tree);
+    piece_snapshot *large;
+    ASSERT(piece_snapshot_take(f.tree, &large) == PIECE_OK);
+    ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, sizeof original, NULL, 0) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"x", 1) == UNDO_OK);
+    ASSERT(undo_commit(f.log, &last) == UNDO_OK);
+    undo_history h = undo_get_history(f.log);
+    undo_stats s = undo_get_stats(f.log);
+    const undo_state *target;
+
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "");
+    size_t calls = ph_calls();
+    target = &idle;
+    ph_refuse(true);
+    undo_err e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target);
+    ph_refuse(false);
+    ASSERT(e == UNDO_ERR_NOMEM && !target && ph_calls() > calls);
+    text_eq(v, "x");
+    history_eq(f.log, h, s);
+    ASSERT(undo_replay_snapshot(f.log) == NULL);
+
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "");
+    target = &idle;
+    piece_test_set_height_limit(0); /* (P) A leaf root cannot gain a level. */
+    e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target);
+    piece_test_set_height_limit(PIECE_MAX_HEIGHT);
+    ASSERT(e == UNDO_ERR_RANGE && !target);
+    text_eq(v, "x");
+    history_eq(f.log, h, s);
+    ASSERT(undo_replay_snapshot(f.log) == NULL);
+
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
+    ASSERT(piece_length(v) == sizeof original);
+    piece_snapshot_release(large);
+    close_fixture(f);
+}
+
 static bool trusted(void *ctx, const piece_backing *b)
 {
     ASSERT(b != NULL);
@@ -166,19 +380,19 @@ static void one_span_mapped(void)
     ASSERT(pm_checkpoint_begin(model) == PIECE_OK);
     ASSERT(pm_replace(model, off, len, NULL, 0) == PIECE_OK);
     ph_check_lines(v, pm_tree_view(model), off, 1, true, "after mapped delete");
-    undo_change c;
+    const undo_state *target;
     /* A known identity change must stop before the planner can recount
      * the old mapped record in a sanitizer build. */
     expect_replay = &original;
     trust = false;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_ERR_CONFLICT);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_CONFLICT);
     ASSERT(expect_replay == &original);
-    ASSERT(c.len == 0 && undo_get_history(f.log).undo_groups == 1);
+    ASSERT(!target && undo_get_history(f.log).undo_groups == 1);
     ASSERT(piece_length(v) == sizeof sample - len);
     trust = true;
     expect_replay = &original;
     piece_test_reset_reads(f.tree);
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && expect_replay == NULL);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK && expect_replay == NULL);
     mapped_read += piece_test_measure(f.tree).mapped_reads;
     /* (P) Each cut lies one byte inside its chunk: the shorter halves are
      * 1 B at each end, for describe and for delete; the undo cuts nothing.
@@ -198,24 +412,25 @@ static void one_span_mapped(void)
     ASSERT(undo_replace(f.log, off, len, NULL, 0) == UNDO_OK);
     ASSERT(undo_replace(f.log, off, 0, (const uint8_t *)"x", 1) == UNDO_OK);
     ASSERT(undo_commit(f.log, &last) == UNDO_OK);
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_MORE);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
     ASSERT(piece_length(v) == sizeof sample - len);
     trust = false;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_ERR_CONFLICT && c.len == 0);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_CONFLICT && !target);
     ASSERT(piece_length(v) == sizeof sample - len + 1 && piece_byte_at(v, off) == 'x');
     trust = true;
     expect_replay = &original;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && expect_replay == NULL);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK && expect_replay == NULL);
 
     /* (G) Asymmetry: one mapped byte becomes an immutable ADD literal. */
     const uint64_t literal_at = piece_add_length(f.tree);
     ASSERT(erase_cmd(f.log, off, 1, false, &idle, &idle) == UNDO_OK);
     ASSERT(piece_add_length(f.tree) == literal_at + 1);
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     ph_describe(v, off, 1, true, &restored);
     ASSERT(restored.n == 1 && restored.s[0].src == (PIECE_SPAN_ADD | literal_at));
     ASSERT(restored.nl[0].head == 1 && piece_byte_at(v, off) == '\n');
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     ASSERT(piece_add_length(f.tree) == literal_at + 1);
     ph_spans_free(&original);
     ph_spans_free(&restored);
@@ -230,11 +445,10 @@ static void threshold(void)
     const uint8_t sample[sizeof(piece_span) + 1] = "\n0123456789abcdef";
     for (size_t n = sizeof(piece_span) - 1; n <= sizeof sample; n++) {
         fixture f = open_copy(sample, n);
-        undo_change c;
         ASSERT(erase_cmd(f.log, 0, n, false, &idle, &idle) == UNDO_OK);
         uint64_t copied = n < sizeof(piece_span) ? n : 0;
         ASSERT(piece_add_length(f.tree) == copied);
-        ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+        ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
         const piece_view *v = piece_tree_view(f.tree);
         piece_iter it;
         piece_iter_init(&it, v, 0);
@@ -242,7 +456,8 @@ static void threshold(void)
         piece_span_nl nl;
         ASSERT(piece_iter_next_span(&it, n, &s, &nl));
         ASSERT(s.src == (copied ? PIECE_SPAN_ADD : 0) && s.len == n && nl.head == 1);
-        ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+        ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
+        ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
         ASSERT(piece_add_length(f.tree) == copied);
         close_fixture(f);
     }
@@ -273,19 +488,18 @@ static void external_store(void)
     ASSERT(piece_add_length(f.tree) == add);
     undo_stats charged = undo_get_stats(f.log);
     ASSERT(charged.span_payload_bytes == payload && charged.history_bytes == GROUP_RECORD_BYTES + payload);
-    undo_change c;
     expect_replay = &desc;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && expect_replay == NULL);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK && expect_replay == NULL);
     ph_describe(v, 0, len, true, &restored);
     ASSERT(restored.n == desc.n);
     for (size_t i = 0; i < desc.n; i++) {
         ASSERT(ph_span_eq(desc.s[i], restored.s[i]));
         ASSERT(desc.nl[i].head == restored.nl[i].head && desc.nl[i].tail == restored.nl[i].tail);
     }
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     /* (P) The same nine runs can share a segment for two edits. Branching
      * discards redo's claim, while the new claim survives retirement. */
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     undo_stats old = undo_get_stats(f.log);
     fail_at_add_mark = add;
     ASSERT(erase_cmd(f.log, 0, len, false, &idle, &idle) == UNDO_ERR_NOMEM);
@@ -293,16 +507,16 @@ static void external_store(void)
     ASSERT(undo_get_history(f.log).redo_groups == 1);
     ASSERT(undo_get_stats(f.log).storage_bytes == old.storage_bytes);
     ASSERT(undo_get_stats(f.log).span_payload_bytes == old.span_payload_bytes);
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     expect_replay = &desc;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && expect_replay == NULL);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK && expect_replay == NULL);
     ASSERT(erase_cmd(f.log, 0, len, false, &idle, &idle) == UNDO_OK);
     ASSERT(undo_get_history(f.log).redo_groups == 0);
     (void)undo_maintain(f.log, SIZE_MAX);
     ASSERT(undo_get_stats(f.log).span_payload_bytes == old.span_payload_bytes);
     ASSERT(undo_get_stats(f.log).storage_bytes == old.storage_bytes);
     expect_replay = &desc;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && expect_replay == NULL);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK && expect_replay == NULL);
     undo_clear(f.log);
     ASSERT(undo_get_stats(f.log).span_payload_bytes == 0);
     /* (P, A20) One byte below the external-vector group charge. */
@@ -338,12 +552,9 @@ static void typing_record(void)
         ASSERT(s.records == 1);
         ASSERT(s.history_bytes == initial + i);
     }
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_OK);
-    ASSERT(c.groups == 1 && c.state.bytes[0] == 'a');
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, 0, &first) == UNDO_OK);
     text_eq(v, "");
-    ASSERT(undo_redo(f.log, 1, 0, &c) == UNDO_OK);
-    ASSERT(c.groups == 1 && c.state.bytes[0] == 'z');
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, 0, &last) == UNDO_OK);
     ASSERT(piece_length(v) == keys && piece_add_length(f.tree) == keys);
     for (size_t i = 0; i < keys; i++) ASSERT(piece_byte_at(v, i) == key);
     close_fixture(f);
@@ -366,10 +577,9 @@ static void typing_abort_reuse(void)
     ASSERT(piece_add_length(f.tree) == 1);
     ASSERT(insert_cmd(f.log, 1, (const uint8_t *)"b", 1, true, &idle, &idle) == UNDO_OK);
     ASSERT(undo_get_history(f.log).undo_groups == 1 && undo_get_stats(f.log).records == 1);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_OK && c.groups == 1);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, 0, NULL) == UNDO_OK);
     text_eq(v, "");
-    ASSERT(undo_redo(f.log, 1, 0, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, 0, NULL) == UNDO_OK);
     text_eq(v, "ab");
     text_eq(piece_snapshot_view(inside), "ax");
     piece_snapshot_release(inside);
@@ -382,18 +592,18 @@ static void typing_add_gap(void)
     const piece_view *v = piece_tree_view(f.tree);
     ASSERT(insert_cmd(f.log, 0, (const uint8_t *)"a", 1, false, &idle, &idle) == UNDO_OK);
     ASSERT(insert_cmd(f.log, 1, (const uint8_t *)"x", 1, false, &idle, &idle) == UNDO_OK);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_OK);
+    const undo_state *target;
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, 0, NULL) == UNDO_OK);
     /* (P) Undoing the branch does not rewind its one ADD byte.
      * The caller can join the applied group, but its tail's ADD run ends
      * before the new write. Replay must avoid the abandoned branch byte. */
     ASSERT(insert_cmd(f.log, 1, (const uint8_t *)"b", 1, true, &idle, &idle) == UNDO_OK);
     ASSERT(undo_get_history(f.log).undo_groups == 1 && undo_get_history(f.log).redo_groups == 0);
     ASSERT(undo_get_stats(f.log).records == 2);
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_MORE && c.groups == 0);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
     text_eq(v, "a");
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_OK && c.groups == 1);
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, 0, NULL) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "ab");
     close_fixture(f);
 }
@@ -412,12 +622,13 @@ static void burst_and_cap(void)
     undo_set_cap(f.log, undo_get_stats(f.log).history_bytes - old_bytes);
     undo_history h = undo_get_history(f.log);
     ASSERT(h.undo_groups == 1 && h.evicted_groups == 1);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 2, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1);
+    const undo_state *target;
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && !target);
     text_eq(v, "ab");
     ASSERT(insert_cmd(f.log, 2, NULL, 0, false, &idle, &idle) == UNDO_OK);
     ASSERT(undo_get_history(f.log).redo_groups == 1);
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "abc");
     close_fixture(f);
 }
@@ -429,17 +640,16 @@ static void erase_bursts(void)
     const uint8_t original[] = "abcde";
     fixture f = open_copy(original, sizeof original - 1);
     const piece_view *v = piece_tree_view(f.tree);
-    undo_change c;
     ASSERT(erase_cmd(f.log, 3, 2, false, &first, &idle) == UNDO_OK);
     ASSERT(erase_cmd(f.log, 2, 1, true, &idle, &last) == UNDO_OK);
     ASSERT(erase_cmd(f.log, 0, 1, false, &idle, &idle) == UNDO_OK);
     ASSERT(erase_cmd(f.log, 0, 1, true, &idle, &idle) == UNDO_OK);
     ASSERT(undo_get_history(f.log).undo_groups == 2 && undo_get_stats(f.log).records == 2);
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "ab");
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1 && c.state.bytes[0] == 'a');
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &first) == UNDO_OK);
     text_eq(v, "abcde");
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.state.bytes[0] == 'z');
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, &last) == UNDO_OK);
     text_eq(v, "ab");
     close_fixture(f);
 }
@@ -456,10 +666,10 @@ static void erase_reverses_direction(void)
     ASSERT(undo_replace(f.log, 0, 1, NULL, 0) == UNDO_OK);
     ASSERT(undo_commit(f.log, &idle) == UNDO_OK);
     ASSERT(undo_get_stats(f.log).records == 2 && undo_get_history(f.log).undo_groups == 1);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_MORE);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
     text_eq(piece_tree_view(f.tree), "cd");
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_OK && c.groups == 1);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, 0, NULL) == UNDO_OK);
     text_eq(piece_tree_view(f.tree), "abcd");
     close_fixture(f);
 }
@@ -488,12 +698,11 @@ static void erase_threshold(void)
             ASSERT(piece_add_length(f.tree) == (charge ? charge : sizeof(piece_span) - 1));
         }
         ASSERT(joined_descriptions == joins_before + len - 1);
-        undo_change c;
         expect_replay = &want;
-        ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1 && expect_replay == NULL);
+        ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK && expect_replay == NULL);
         ASSERT(piece_length(v) == sizeof original);
         for (uint64_t i = off; i < off + len; i++) ASSERT(piece_byte_at(v, i) == original[i]);
-        ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1);
+        ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
         ASSERT(piece_length(v) == sizeof original - len);
         ph_spans_free(&want);
         close_fixture(f);
@@ -512,8 +721,7 @@ static void erase_source_gap(void)
     ASSERT(erase_cmd(f.log, 0, 1, false, &idle, &idle) == UNDO_OK);
     ASSERT(erase_cmd(f.log, 0, 1, true, &idle, &idle) == UNDO_OK);
     ASSERT(undo_get_history(f.log).undo_groups == 1 && undo_get_stats(f.log).records == 2);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "ab");
     close_fixture(f);
 }
@@ -576,9 +784,8 @@ static void sliced_abort(void)
     const uint64_t add = piece_add_length(f.tree);
     undo_history h = undo_get_history(f.log);
     undo_stats s = undo_get_stats(f.log);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_MORE);
-    ASSERT(c.groups == 0 && c.len != 0 && !c.has_state);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
     text_eq(v, "b");
     piece_snapshot *pre = piece_snapshot_retain(undo_replay_snapshot(f.log));
     text_eq(piece_snapshot_view(pre), "bc");
@@ -587,11 +794,11 @@ static void sliced_abort(void)
     fail_replay = true;
     size_t calls = ph_calls();
     ph_refuse(true); /* Abort also succeeds with total base refusal. */
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_ERR_NOMEM);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_NOMEM);
     ph_refuse(false);
     fail_replay = false;
     ASSERT(ph_calls() == calls);
-    ASSERT(c.groups == 0 && c.len == 0 && !c.has_state);
+    ASSERT(!target);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
     ASSERT(piece_add_length(f.tree) == add);
     undo_history after = undo_get_history(f.log);
@@ -602,20 +809,20 @@ static void sliced_abort(void)
     text_eq(piece_snapshot_view(inside), "b");
     text_eq(piece_snapshot_view(pre), "bc");
     piece_snapshot_release(pre);
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1 && c.state.bytes[0] == 'a');
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &first) == UNDO_OK);
     text_eq(v, "a\n");
     ph_spans restore = {0};
     ph_describe(v, 0, 2, true, &restore);
     ASSERT(restore.n == 1 && restore.s[0].src == (PIECE_SPAN_ADD | (PIECE_CHUNK - 1)));
     ASSERT(restore.nl[0].head == 0 && restore.nl[0].tail == 1);
-    ASSERT(undo_redo(f.log, 1, 0, &c) == UNDO_MORE);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_MORE && !target);
     text_eq(v, "b");
     fail_replay = true;
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_ERR_NOMEM && c.len == 0);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_NOMEM && !target);
     fail_replay = false;
     text_eq(v, "a\n");
     ASSERT(undo_get_history(f.log).redo_groups == 1);
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1 && c.state.bytes[0] == 'z');
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, &last) == UNDO_OK);
     ASSERT(piece_add_length(f.tree) == add);
     text_eq(v, "bc");
     ph_spans_free(&restore);
@@ -628,6 +835,12 @@ static void cap_boundary(void)
     /* (P, A20) The independent first-key charge tests exact admission
      * and eviction at a cap one byte smaller. */
     const size_t key_bytes = GROUP_RECORD_BYTES + 1;
+    /* (G) Oracle history_keys from v1 src/editor/buffers.c:256.
+     * (P) LP64 charges the group slot, record slot and one input byte. */
+    if (sizeof(void *) == 8 && sizeof(long) == 8) {
+        ASSERT(key_bytes == 529);
+        ASSERT(undo_default_cap_bytes() == 17334272);
+    }
     for (size_t cap = key_bytes - 1; cap <= key_bytes; cap++) {
         fixture f = open_copy(NULL, 0);
         undo_set_cap(f.log, cap);
@@ -660,8 +873,9 @@ static void abandoned_add_lineage(void)
 
     ASSERT(insert_cmd(f.log, sizeof lower, lower, sizeof lower, false, &first, &last) == UNDO_OK);
     ASSERT(piece_add_length(f.tree) == sizeof upper);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 2, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1);
+    const undo_state *target;
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && !target);
     text_eq(v, "aaaaaaaaaaaaaaaa");
     close_fixture(f);
 }
@@ -671,8 +885,7 @@ static void abandoned_command_keeps_redo(void)
     fixture f = open_copy(NULL, 0);
     ASSERT(insert_cmd(f.log, 0, (const uint8_t *)"a", 1, false, &idle, &idle) == UNDO_OK);
     ASSERT(insert_cmd(f.log, 1, (const uint8_t *)"b", 1, false, &idle, &idle) == UNDO_OK);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     /* (P) The current two groups exactly fill the cap. An unpublished
      * command cannot branch or evict either one, even if it would be larger. */
     undo_set_cap(f.log, 2 * (GROUP_RECORD_BYTES + 1));
@@ -684,7 +897,7 @@ static void abandoned_command_keeps_redo(void)
     undo_history restored = undo_get_history(f.log);
     ASSERT(restored.undo_groups == 1 && restored.redo_groups == 1);
     ASSERT(restored.evicted_groups == h.evicted_groups && restored.group_serial == h.group_serial);
-    ASSERT(undo_redo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(piece_tree_view(f.tree), "ab");
     close_fixture(f);
 }
@@ -708,12 +921,12 @@ static void wrote_during_yield(void)
     /* (P) An insertion at the front keeps two separate replay mutations. */
     ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"c", 1) == UNDO_OK);
     ASSERT(undo_commit(f.log, &last) == UNDO_OK);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_MORE);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
     text_eq(piece_tree_view(f.tree), "ab");
     /* Deliberate contract violation. The bytes remain identical. */
     ASSERT(piece_replace(f.tree, 0, 1, (const uint8_t *)"a", 1) == PIECE_OK);
-    (void)undo_undo(f.log, 1, 0, &c);
+    (void)undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target);
 }
 
 static void later_group_refusal(void)
@@ -721,24 +934,23 @@ static void later_group_refusal(void)
     fixture f = open_copy(NULL, 0);
     const piece_view *v = piece_tree_view(f.tree);
     /* (P) Two records in the older group and one in the newest. The
-     * third mutation fails after the older group has begun to rewind. */
+     * second mutation of the older group fails after rewind begins. */
     ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
     ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"b", 1) == UNDO_OK);
     ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"a", 1) == UNDO_OK);
     ASSERT(undo_commit(f.log, &idle) == UNDO_OK);
     ASSERT(insert_cmd(f.log, 2, (const uint8_t *)"c", 1, false, &last, &idle) == UNDO_OK);
     const uint64_t add = piece_add_length(f.tree);
-    fail_replay_step = 3;
-    undo_change c;
-    ASSERT(undo_undo(f.log, 2, OS_DEADLINE_NEVER, &c) == UNDO_ERR_NOMEM);
-    ASSERT(fail_replay_step == 0);
-    ASSERT(c.groups == 1 && c.has_state && c.state.bytes[0] == 'z');
-    ASSERT(c.off == 2 && c.len == 1);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &last) == UNDO_OK);
+    fail_replay_step = 2;
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_NOMEM);
+    ASSERT(fail_replay_step == 0 && !target);
     text_eq(v, "ab");
     ASSERT(piece_add_length(f.tree) == add);
     undo_history h = undo_get_history(f.log);
     ASSERT(h.undo_groups == 1 && h.redo_groups == 1);
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "");
     close_fixture(f);
 }
@@ -785,21 +997,21 @@ static void late_fault_rollback(void)
     ASSERT(undo_replace(f.log, sizeof sample - 1, 0, (const uint8_t *)"y", 1) == UNDO_OK);
     ASSERT(undo_commit(f.log, &last) == UNDO_OK);
     const uint64_t add = piece_add_length(f.tree);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_MORE);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
     text_eq(v, "x\nb");
     late_replay = PH_POLL_ERROR;
-    ASSERT(undo_undo(f.log, 1, 0, &c) == UNDO_ERR_CONFLICT);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_ERR_CONFLICT);
     late_replay = PH_POLL_REAL;
     ph_poll_set(PH_POLL_REAL);
-    ASSERT(c.groups == 0 && c.len == 0 && !c.has_state);
+    ASSERT(!target);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
     ASSERT(piece_add_length(f.tree) == add);
     undo_history h = undo_get_history(f.log);
     ASSERT(h.undo_groups == 1 && h.redo_groups == 0);
     text_eq(v, "x\nby");
     check_rank_eof(v);
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK && c.groups == 1);
+    ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "a\nb");
     check_rank_eof(v);
     close_fixture(f);
@@ -827,8 +1039,16 @@ static void midpoint_reads(void)
     const piece_view *v = piece_tree_view(f.tree);
     piece_test_reset_reads(f.tree);
     ASSERT(erase_cmd(f.log, half, PIECE_CHUNK, false, &first, &last) == UNDO_OK);
-    undo_change c;
-    ASSERT(undo_undo(f.log, 1, OS_DEADLINE_NEVER, &c) == UNDO_OK);
+    const undo_state *target;
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
+    undo_splice_iter it;
+    undo_prepared_splice splice;
+    undo_splice_iter_init(&it, f.log);
+    ASSERT(undo_splice_iter_next(&it, &splice));
+    ASSERT(splice.off == half && splice.removed == 0 && splice.span_count == 1);
+    ASSERT(ph_span_eq(undo_splice_span(&splice, 0), (piece_span){half, PIECE_CHUNK}));
+    ASSERT(!undo_splice_iter_next(&it, &splice));
+    ASSERT(undo_commit(f.log, target) == UNDO_OK);
     size_t mapped_read = piece_test_measure(f.tree).mapped_reads;
     ASSERT(mapped_read == 4u * half && mapped_read <= 2u * PIECE_CHUNK);
     uint64_t rank;
@@ -839,17 +1059,27 @@ static void midpoint_reads(void)
     printf("undo mapped reads (P): describe + delete + undo %zu B <= 131,072 B (G, A13)\n", mapped_read);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    ASSERT(assert_death(mapped_without_validator, "src/undo/undo.c",
-                        "!piece_view_backing(piece_tree_view(tree)) || validate"));
-    ASSERT(assert_death(wrote_during_yield, "src/undo/undo.c", "now == u->replay.guard"));
-    one_span_mapped();
+    const bool no_faults = argc == 2 && strcmp(argv[1], "--no-faults") == 0;
+    ASSERT(argc == 1 || no_faults);
+    owner_replay();
+    span_replay(1);
+    span_replay(4);
+    replay_admission();
+    if (!no_faults) {
+        ASSERT(assert_death(mapped_without_validator, "src/undo/undo.c",
+                            "!piece_view_backing(piece_tree_view(tree)) || validate"));
+        ASSERT(assert_death(wrote_during_yield, "src/undo/undo.c", "now == u->replay.guard"));
+        one_span_mapped();
+        late_fault_rollback();
+        external_store();
+        typing_record();
+        sliced_abort();
+        later_group_refusal();
+    }
     midpoint_reads();
-    late_fault_rollback();
     threshold();
-    external_store();
-    typing_record();
     typing_abort_reuse();
     typing_add_gap();
     burst_and_cap();
@@ -858,11 +1088,9 @@ int main(void)
     erase_threshold();
     erase_source_gap();
     reclaim_and_retry();
-    sliced_abort();
     cap_boundary();
     abandoned_add_lineage();
     abandoned_command_keeps_redo();
-    later_group_refusal();
     ASSERT(ph_failures == 0);
     puts("undo_test: PASS");
     return EXIT_SUCCESS;
