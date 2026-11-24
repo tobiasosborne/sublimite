@@ -102,6 +102,8 @@ L5  src/app/       app_loop (straight-line ordered app_step, single app_work_pen
 - **Checkpoint abort invariant:** O(1) shared add-chunk directories preserve v1's private boundary-chunk prepayment (`piece.c:441`) whenever a live snapshot can observe uncommitted checkpoint bytes — gated by an OOM + concurrent-reader test in Wave 1.
 
 ### 4.2 L2 `edit` Kernel, Journal Publish Point & `SIGKILL` Kill Oracle
+> **Amended by A28** (the journal write model: one UI writer, per-buffer slots, the bracketed commit; no exclusive section) **and by the signed edit spec** (docs/decisions/wave1-edit-spec.md). Where the steps below differ, A28 and the signed spec win: the journal's final record follows undo_commit, and every other record precedes it.
+
 - **Ownership:** `L2 edit` owns selection state, atomic forward replacement/insertion, `piece_checkpoint` + `undo` reservation, and journal-staging preflight & emission (harvested from `view/edits.c` + `editor/input.c:108,404`). Wave 1's headless editor uses this exact production path.
 - **Staging preflight & frame fence:**
   1. Preflight journal staging capacity and `piece_checkpoint` + `undo` inverse reservation **before** mutating (`input.c:404`).
@@ -117,6 +119,8 @@ L5  src/app/       app_loop (straight-line ordered app_step, single app_work_pen
   3. Foreground navigation makes bounded progress even while `WORK_BULK` is saturated (`editor_large_test.c:1119`), and growth beyond initial reserved capacity is explicitly tested.
 
 ### 4.4 Orthogonal 4-Axis Save & Hot-Exit State Machine (`L2 savectl`)
+> **Amended by A27** (the four axes are observables; one stored tag of eleven values plus an open/close-pending enum, 22 states; no journal lease) **and A28** (no lease exists; save phases are appended records). Signed spec: docs/decisions/wave1-savectl-spec.md.
+
 Model the four independent axes explicitly under `-Wswitch-enum`:
 1. **`save_phase`:** `IDLE | PREPARING | WRITING | VERIFYING_FD | FINISHING | DIRSYNC_RETRY | CONFLICT_CANCEL`
 2. **`external_state`:** `CLEAN | CHANGED_ON_DISK | RELOADING`

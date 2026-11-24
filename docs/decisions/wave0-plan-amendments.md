@@ -441,3 +441,29 @@ A28 additions at signature of the wire amendment (advisor, 2026-11-24; docs/deci
   text the user just saved with the foreign bytes.
 - The runtime section (1b) is not signed. R1–R6 go back to Astra; edit.h and savectl.h follow in the same pass.
 
+## A27. savectl's state: four observables, one stored tag (advisor, 2026-11-24; signed with savectl.h at 48c608c)
+PLAN §4.4's "orthogonal four axes" are observables, not stored fields.
+- savectl stores one exhaustive phase tag of eleven values under -Wswitch-enum (IDLE clean/changed, RELOADING,
+  PREPARING, WRITING, VERIFYING, DIRSYNC_RETRY, FINISHING, RECOVERY_PENDING clean/changed, CONFLICT_CANCEL), plus an
+  open/close-pending enum. That gives 22 reachable states.
+- External change is projected from the tag.
+- The journal lease axis does not exist: A28 has no lease, and journal reports append suspension to the session.
+- No RETIRED state: savectl_destroy returns BUSY until the controller is closing, idle and free of obligations.
+- A complete FINISHED whose installed binding fails verification goes to IDLE_CHANGED at once. The outcome is
+  SAVE_FAILED/CHANGED, the saved id unknown, and the same conflict checkpoint as an idle detection is requested.
+- Full text: docs/decisions/wave1-savectl-spec.md "Draft A27".
+
+## Signatures of 2026-11-24 (advisor's full read at 48c608c)
+- edit.h is SIGNED: 5 phases, with FINAL_PENDING the only post-commit state. Textual cuts applied by the coordinator:
+  - edit_direction deleted (edit_replay takes undo_replay_direction);
+  - edit_create takes const edit_options *.
+- savectl.h is SIGNED: 22 states. Textual cuts applied by the coordinator:
+  - savectl_failure.detail became int service_error;
+  - the checkpoint callback's owner argument was cut. Every call site in the spec (Keep, idle detection, failed
+    verification, CONFLICT_CANCEL) passes the controller's own buffer; peers are protected by the session under fence.
+- Unblocked:
+  - the piece.h reader for pinned stores (S3): Astra writes the proposal;
+  - edit splits into EDIT-CORE (Sol, after N2, with a flat journal double) and EDIT-INTEGRATION (Claude/Muse, after
+    2b-1).
+- savectl's bead waits for L2-1 and L2-3.
+

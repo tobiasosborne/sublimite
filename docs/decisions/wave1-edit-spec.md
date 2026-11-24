@@ -1,5 +1,7 @@
 # Edit kernel · proposed contract for advisor signature
 
+STATUS: edit.h SIGNED by the advisor 2026-11-24 (full read at 48c608c), with the coordinator's textual cuts applied (docs/decisions/wave0-plan-amendments.md, "Signatures of 2026-11-24").
+
 ## Send-back disposition
 
 | Item | Disposition for signature |
@@ -142,12 +144,13 @@ typedef struct edit_splice {
 typedef enum edit_kind {
     EDIT_TYPE, EDIT_DELETE_FORWARD, EDIT_BACKSPACE
 } edit_kind;
-typedef enum edit_direction { EDIT_UNDO, EDIT_REDO } edit_direction;
 typedef enum edit_save_event {
     EDIT_SAVE_CAPTURED, EDIT_SAVE_INSTALLED, EDIT_SAVE_RELEASED
 } edit_save_event;
 
-/* On success edit adopts tree and starts an empty history with the
+/* The options carry the fields named below; edit_create copies them and
+ * does not retain the options object.
+ * On success edit adopts tree and starts an empty history with the
  * caller's history_cap_bytes. Config supplies the default of 32,768
  * records (G, v1 cfg.history_keys at buffers.c:256) times 529 B (P,
  * two 264 B undo slots plus one short input byte on LP64), or
@@ -165,10 +168,16 @@ typedef enum edit_save_event {
  * Creation claims O(1) control, log and snapshot storage. NOMEM leaves
  * *out NULL and tree with the caller. The caller supplies an unlogged tree,
  * a journal, an output pointer and nonzero buffer_id, cap and current_id. */
-edit_result edit_create(edit_buffer **out, piece_tree *tree, struct journal *journal,
-                        uint64_t buffer_id, size_t history_cap_bytes,
-                        piece_validate_fn validate, void *ctx,
-                        uint64_t current_id, uint64_t saved_id);
+typedef struct edit_options {
+    piece_tree *tree;
+    struct journal *journal;
+    uint64_t buffer_id;
+    size_t history_cap_bytes;
+    piece_validate_fn validate;
+    void *ctx;
+    uint64_t current_id, saved_id;
+} edit_options;
+edit_result edit_create(edit_buffer **out, const edit_options *options);
 /* Destroy releases the log, snapshot, tree and storage off the typing path.
  * It cannot fail and costs the work of draining remaining owners and records.
  * The buffer must be IDLE with the cutoff settled and kept text secured
@@ -228,7 +237,7 @@ edit_result edit_apply_plan(edit_buffer *b, const edit_splice *splices,
  * capture. Only the completed group restores cursor and anchor and rebases
  * the existing mark. Each slice costs its mutations and staging work.
  * The command returns the same results as edit_apply_plan. */
-edit_result edit_replay(edit_buffer *b, edit_direction direction, uint64_t deadline_ns);
+edit_result edit_replay(edit_buffer *b, undo_replay_direction direction, uint64_t deadline_ns);
 /* Resume provisional OPEN or REPLAYING work from owned cursors.
  * Use the replay clock and honor the deadline between ready units.
  * Resume at edit's first unconsumed member. Repair never moves this cursor.

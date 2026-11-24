@@ -1,5 +1,7 @@
 # savectl — proposed header for advisor signature
 
+STATUS: savectl.h SIGNED by the advisor 2026-11-24 (full read at 48c608c), with the coordinator's textual cuts applied (docs/decisions/wave0-plan-amendments.md, "Signatures of 2026-11-24").
+
 A save commits the bytes of a published edit boundary. A durable FINISHED installs that boundary's content ID after verification, even if later typing has changed the text. Save, Keep and conflict protection append to the named journal. File operations and journal sync run asynchronously. (G) marks a contract choice and (P) a consequence of the indicated construction. Source and trace numbers are identifiers.
 
 ## Draft A27 for PLAN §4.4
@@ -116,11 +118,11 @@ typedef enum savectl_origin {
  * exhausted limits, unsupported operations and service I/O. Diagnostics
  * use origin to decode the active service's exact code. native_error is
  * the OS error captured at that failure, or zero if none was supplied.
- * A controller-origin diagnostic has no service detail. */
+ * A controller-origin diagnostic has service_error zero. */
 typedef struct savectl_failure {
     savectl_err error;
     savectl_origin origin;
-    union { int file_error; int journal_error; } detail;
+    int service_error; /* The origin says which service's code this is. */
     int native_error;
 } savectl_failure;
 typedef struct savectl_identity {
@@ -137,7 +139,10 @@ typedef struct savectl_model {
 } savectl_model;
 
 /* The session knows the published boundaries and owns generation
- * membership. checkpoint supplies the indicated owner's current
+ * membership. ctx identifies this controller to the session. checkpoint
+ * is called only for the controller's own buffer (Keep, idle detection,
+ * failed verification, CONFLICT_CANCEL); peers are protected by the
+ * session itself under fence. checkpoint supplies that buffer's current
  * published text to journal_checkpoint_request with its canonical
  * TARGET, saved association, piece_validate_fn and borrowed context. The
  * validating owner refuses close through request release and retirement,
@@ -149,8 +154,8 @@ typedef struct savectl_model {
  */
 typedef struct savectl_session {
     void *ctx;
-    savectl_err (*checkpoint)(void *, uint64_t owner,
-                              const journal_target *, journal_request **out);
+    savectl_err (*checkpoint)(void *, const journal_target *,
+                              journal_request **out);
     savectl_err (*fence)(void *, uint64_t saver, uint64_t token,
                          uint64_t displaced_key);
     void (*release_fence)(void *, uint64_t saver, uint64_t token);
@@ -203,7 +208,7 @@ void savectl_content_identity(savectl *s, uint64_t current_id);
  * On failed verification of a complete FINISHED, publish SAVE_FAILED
  * with CHANGED on entry to IDLE_CHANGED. Checkpoint progress and its
  * settlement leave this outcome and error in place. If protection fails,
- * origin, service detail and native_error identify the retry cause.
+ * origin, service_error and native_error identify the retry cause.
  * target_identity borrows the binding expectation until the next controller
  * call. An unbound target returns NULL. Tick owns the installed declaration,
  * token and FINISHED append. The host observes the request through this model. */
