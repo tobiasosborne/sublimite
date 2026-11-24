@@ -1,7 +1,28 @@
 # HANDOFF — sublimité v2
 
 Read order: this file → `CLAUDE.md` → `docs/PLAN_V2.md`. Beads: `bd` in this worktree resolves to the v2 database
-(prefix `v2`; docs/decisions/wave0-beads-and-oracle-pin.md §1). Push branch `v2` only, after every verified landing.
+(prefix `v2`; docs/decisions/wave0-beads-and-oracle-pin.md §1). Push branch `v2` after every verified landing. Wip
+branches: push each at every pause or session end; delete the remote branch once its bead lands on v2 (Tobias, 2026-11-24).
+
+## Session 2 (2026-11-24 evening) — IN PROGRESS (worklog 2026-11-24 "Session 2")
+- Rules (advisor): one Opus lane on the critical path (second only at a dispatch-time Claude room >= 3; stop line 0.5);
+  act on events only, never poll quota or children; Codex carries all non-fault/kill/truncation work (filter routing
+  unchanged); 7b round 4 was its last design round — a send-back needs a correctness counter-example, taste and size go
+  to v2-0fv.27; landing reports carry the module's comment-free line count (`gcc -fpreprocessed -dD -E -P f | grep -c
+  '[^[:space:]]'`) beside v1's and one quota reading per account.
+- Environment faults: a lane failure naming a /tmp path, a missing corpus or an Xvfb display (e.g. after a reboot) is
+  rebuilt and rerun, never sent to a worker as a code defect.
+- Landed: 1.22 (cd8e357, v2-0fv.21 os export deletion + nm gate tools/check_exports.py; remote t3/audit-os-exports deleted).
+- 7b: round 4 merged on review/7b2 17da429, lanes green. Astra's admission read (docs/reviews/wave1-piece-7b-admission-
+  astra.md): step 1 MUST-FIX (n = 0 deletion with a non-NULL pointer leaks an ADD reference) sent to the 7b Opus thread;
+  step 4 MUST-FIX (two base requests when a capture crosses a full chunk) awaits the advisor's ruling (coordinator leans to
+  an A26 wording: base asked only for the exact remainder, one request per object, all before publication, any refusal
+  releases the tentative ones). Then merge, lanes, land, close v2-0fv.17, delete remote review/7b2; Opus lane -> L2-2b.
+- Specs for the advisor's read: docs/decisions/wave1-savectl-spec.md (Astra); Astra's edit spec (v2-0fv.15) running.
+- Tobias's decisions 2026-11-24: A23's large-file external-replacement contract ACCEPTED (L2-3 proceeds on it); v1
+  findings live in v1's tracker — edit-hagx (undo above 32 MiB terminates the editor), edit-v1f5 (post-rename save
+  conflict), edit-j4fp (Ctrl+S during an open), edit-9t6j (backlog) — cite these ids; pace rule: up to pace on every
+  account, not beyond.
 
 ## Session 1 (2026-11-22 night → 2026-11-24 morning, ThinkPad) — ENDED on Tobias's "time to pause work now" (2026-11-24)
 
@@ -35,7 +56,7 @@ to). The run takes ~137 s (parallel displays :190–:195): ask the Paris-talk th
    /home/tobias/.t3/worktrees/sublimite-v2/t3-de932866-2c152938cbe90882, wip a94af15. Compiles; next item: its mutation
    reds M4–M6. Wire unchanged (no amendment). Built on the piece model; after 7b lands it moves to the real tree
    (tests/piece_model.c is deleted in 7b round 2: the harness drives the pm_* model side by side).
-3. v2-0fv.21 os export deletion + nm gate (Sol thread "v2-0fv.21 os export deletion + nm gate (Sol)", worktree
+3. (LANDED in session 2 as 1.22) v2-0fv.21 os export deletion + nm gate (Sol thread "v2-0fv.21 os export deletion + nm gate (Sol)", worktree
    /home/tobias/.t3/worktrees/sublimite-v2/t3-f672f5f8-c90c59b8e9d757d9, branch t3/audit-os-exports, wip 17bb383): paused; see its
    decision file docs/decisions/v2-0fv.21.md in that checkout for done/missing (gate check_exports: ok on its tree).
 
@@ -48,14 +69,8 @@ line queries after any edit, Q6's G1-under-writeback number, Q3's 10 GiB recover
 step oracle, X3 as PASS on v2), then the whole-wave Astra deletion read before the gate.
 Filed and waiting: v2-0fv.22 empty-tab footprint, v2-0fv.27 54-bit node-prefix packing (deletion review).
 
-### Open questions for Tobias (the advisor carries them)
-- v1 findings to file in v1's tracker (worklog 2026-11-22/23: post-rename save conflict, >32 MiB delete+undo exit 1,
-  editor_session_test ivv_save race, test_install_omarchy EDITOR export, finding 9: R3's counting window allocates in
-  about one run in six).
-- The large-file external-replacement contract of A23 (PLAN's product-contract paragraph): unsaved difference can be lost
-  if another program replaces a file above the self-contained size and the editor is killed before its conflict
-  checkpoint; the conflict is always detected and reported.
-- The Codex pace rule (Codex ran far below pace all night because its work routes away from fault-heavy beads).
+### Open questions for Tobias
+- None open (the three session-1 questions were decided 2026-11-24; see Session 2).
 
 ### Quota at session end (one reading, 2026-11-24 06:45 CET)
 Claude weekly 92.0 % (1.9 behind pace, reset 17:00 CET), Fable weekly 68.0 %; Codex weekly 7.0 % (4.2 behind); Muse
@@ -93,5 +108,3 @@ unreadable by `quota` ("server_sent_no_usage"; last read weekly 16 %, ~1.5 over 
   HOME for any tool that writes caches is under the checkout's build/, build under build/, report instead of running
   anything that needs approval; never profile the oracle (perf record -N if ever). T3 thread timestamps are UTC.
 - Battery: Tobias could not plug in on 2026-11-23; stop line 20 % (advisor rule, worklog).
-- v1 findings for Tobias (advisor reports them): post-rename save conflict and >32 MiB delete+undo (known-bugs doc),
-  editor_session_test ivv_save race, test_install_omarchy EDITOR export.
