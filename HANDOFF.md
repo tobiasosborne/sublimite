@@ -30,17 +30,15 @@ Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream +
 (1.10, 1.12, 1.15), ASSERT migration (1.14), no test env vars + dead exports (1.20). Landed L1: scan (1.6), utf8 (1.7),
 indent (1.9, 1.13), piece 7a = frozen piece.h incl. Lines + flat model + model-run suite (1.16–1.18, erratum d028acf,
 piece_span_nl_join with undo), find (1.19), undo (1.21). lineidx removed (A19). Early leaves (A21): dnd (4.1).
-In flight (state at 00:45 CET 2026-11-24):
-- 7b real piece tree (v2-0fv.17): merged on branch review/7b (6269bed), all lanes green; landing read split: Astra
-  (source) HOLD with A–G, Muse (suites) LAND with 3 should-fix; ONE fix round on the Opus thread (A24 rulings + the
-  advisor's items 1–4: admission-order invariants, base reset function, delete the unused model wrapper, scan's
-  nth-newline in piece_lines_start); then Astra re-reads its own findings (source only), then land. Empty-tab footprint
-  is v2-0fv.22.
-- L2-2a journal wire + codec (Muse): wire approved with amendments A–F; codec, tests, fuzz in progress.
-- Briefs ready, not dispatched (docs/briefs/): L2-2b journal runtime (Opus when Claude is > 3 behind), L2-3 save
-  transaction (advisor reads it after L2-2b lands), L2-1 file (Opus after 7b), v2-0fv.15 edit (provisional).
-- Filed: v2-0fv.21 os export deletion + nm gate (incl. os_file_clone, A23), v2-0fv.22 empty-tab footprint.
-L2/L5 decisions: A19–A24; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
+In flight (state at 01:30 CET 2026-11-24):
+- 7b real piece tree (v2-0fv.17): three rounds done; merged on branch review/7b2 (5633ba1), lanes green on the merged
+  tree; Astra's third read (A, E, H only, source) pending; lands when it is clean. Then L2-2b / L2-1 move to the real tree.
+- L2-2b journal runtime (v2-0fv.24): paused at the Claude stop line (01:25); resumes on its Opus thread when Claude is
+  more than 3 behind (about two idle hours).
+- L2-2a landed (2.1). Briefs ready: L2-3 (advisor reads after L2-2b lands), L2-1 file (after 7b), v2-0fv.15 edit
+  (provisional; maintenance order reclaim, resolve, replenish, undo_maintain per A24).
+- Filed: v2-0fv.21 os export deletion + nm gate, .22 empty-tab footprint, .27 54-bit node-prefix packing (deletion review).
+L2/L5 decisions: A19–A25; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
 L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md, wave1-L2-derivations.md, wave1-L2-q2-crash-consistency.md,
 wave1-L2-q2-protocol.md. Briefs live in docs/briefs/ named by bead and are committed with their dispatch.
 
