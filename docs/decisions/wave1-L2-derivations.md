@@ -54,7 +54,7 @@ Capacity is finite: **64** slots and **256** messages per worker (G, `WORK_MAX_J
 
 ### Q8 — SETTLED · Supplied undo contract
 
-Undo owns the logged tree's checkpoint. After an `undo_replace` error the caller may only abort. Stage privately after the last replace and before commit. Commit's only failure is source CONFLICT and it aborts internally. Publish staging only on success. A yielded replay owns its checkpoint until the group resolves. Q7, Q10 and Q15 use that boundary.
+Undo owns the logged tree's checkpoint. After an `undo_replace` error the caller may only abort. Stage privately after the last replace and before commit. Commit's only failure is source CONFLICT. (Superseded wording, D1' 2026-11-24:) No undo call ever closes a checkpoint by itself (D1', advisor 2026-11-24): after any result other than OK or MORE from undo_begin, undo_replace, undo_replay_prepare (initial or resumed) or undo_commit, the owner releases its provisional pins and calls undo_abort; undo_abort is valid after any failed call and does nothing if that call opened no checkpoint. Publish staging only on success. A yielded replay owns its checkpoint until the group resolves. Q7, Q10 and Q15 use that boundary.
 
 ### Q9 — SETTLED · Give an unresolved preparation its own phase
 
