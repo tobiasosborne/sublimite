@@ -194,3 +194,212 @@ These questions name concrete callers. No proposed answer below is assumed to be
 **Out of scope.** Implementation and amendments to the lower headers belong to their owners. GUI input, platform/backend selection, painting, tab widgets, modal conflict UI, viewport layout and a new VIEW schema belong to later waves. Test-only fault injection and measurement belong to the implementation/gate lanes. The v1 oracle supplies the open identity trace in `editor/buffers.c`, the step/queue trace in `editor/editor.c`, immutable publication and spin traces in `editor/session.c`, and unsaved-first selection in `editor/recovery.c`. Its private pool, reentrant waits, path scan per existing tab, live pointer in a leaf and save-tracking flags have no L5 owner here. [Harvest §5](wave1-L2-L5-harvest.md#5-minimal-l5--srcapp-app_loop-app_buffers-app_session-app_save)
 
 **Advisor disposition** ____________________  **Date** ____________________
+
+## Errata proposed by the L5 spec
+
+These are proposals for the lower owners. Source lines identify the signed text above which each change is proposed. The fence ruling comes first. The remaining headings follow the question table in source order. The quoted text and declarations are the proposed header text.
+
+### Destination ownership and the end of the reservation (question at line 187)
+
+**Savectl and edit erratum.** In `savectl_session`, replace the fence and release declarations and their timing contract at savectl lines 150–160 with the following.
+
+```c
+typedef enum savectl_destination_result {
+    SAVECTL_PRIOR, SAVECTL_INSTALLED, SAVECTL_FOREIGN
+} savectl_destination_result;
+
+typedef struct savectl_settlement {
+    savectl_destination_result result;
+    /* Valid only for INSTALLED, from the same verified FINISHED. */
+    struct { uint64_t key; os_stat stat; } installed;
+} savectl_settlement;
+
+/* Members of savectl_session. */
+savectl_err (*fence)(void *ctx, uint64_t token, os_identity incoming);
+void (*release_fence)(void *ctx, uint64_t token, savectl_settlement settlement);
+```
+
+> Successful capture associates the caller's existing destination claim with its admitted token before yielding. On the first fence call after temp sync, atomically extend that claim to the witness identity before approving PREPARED. Compare against existing live owners, acquisitions about to publish, and competing reservations. Refuse a conflicting held reservation without waiting on its holder. Each later call checks the same claim. Before returning OK, drain incompatible peer dispositions and fund the eventual index publication so release cannot fail. The index already owns its destination and displaced dependencies. On refusal before capture the caller unwinds its intake claim.
+>
+> Call release exactly once per admitted token, including definitive failure before the first fence call. Invoke it at definitive settlement, serialized with publication of the final model and before any new admission. Drop the matching reservation only after applying the index action below. A pending barrier, ambiguous append or unresolved rename retains the reservation. A failed verification of a complete FINISHED reports its outcome immediately and releases only after durable conflict protection. A later observation is a new binding decision.
+
+| Release value | Reachable savectl transition | Index action under the reservation |
+|---|---|---|
+| `SAVECTL_PRIOR` | PREPARING → IDLE_CLEAN on definite temp failure before PREPARED, or RECOVERY_PENDING_CLEAN → IDLE_CLEAN after durable cancellation on the prior branch (lines 293, 298). | Leave prior claims and peers in place, including an absent destination. Drop the temporary claims. This save conveys no new ownership. Independent observations continue to govern prior bindings. |
+| `SAVECTL_INSTALLED` | FINISHING → IDLE_CLEAN on verified, durable FINISHED (line 297). | Use the reserved path and returned fd stat/key to register the saver, release its superseded binding, and detach/rebase just the still-displaced peers in the same index publication. Preserve independent aliases, text and newer decisions. Transfer the matching edit cutoff to saved. |
+| `SAVECTL_FOREIGN` | RECOVERY_PENDING_CHANGED or CONFLICT_CANCEL → IDLE_CHANGED after protected cancellation with a conflicting destination (lines 299–300), or FINISHING → IDLE_CHANGED on foreign complete FINISHED, followed by durable protection in that idle phase (lines 291, 297). A definite pre-marker refusal can already have classified the destination as foreign (line 293). | The saver gains no claim on the missing, foreign or unverifiable destination. Withdraw live claims that relied on the disproved binding, keep independently verified claims and the peers' recoverable drafts, and send unverified admissions back through observation. Never install the candidate key. |
+
+The three values (P) distinguish keeping prior ownership, transferring ownership, and withdrawing authority for a conflicted destination. Classify the **destination** from the actual branch. A conflict on the saver's source alone during Save As does not disprove the destination. No value represents a pending effect. The callback argument carries the decision once, without another stored controller phase or a model query from inside a callback.
+
+At edit lines 150–152 add `EDIT_SAVE_FORGOTTEN` to `edit_save_event`. Replace “The other events require an owned cutoff” at line 265 with the following.
+
+> INSTALLED and RELEASED require the matching owned edit cutoff. FORGOTTEN clears only the saved bookmark, is idempotent and requires no cutoff. Deliver it in the same UI publication in which savectl invalidates the saved association, including Keep, detachment and idle conflict. It preserves any independent in-flight bookmark. For complete FINISHED rejected at verification, release the edit cutoff and forget saved on entry to IDLE_CHANGED, as specified at edit line 397. The reservation and journal cutoff can outlive that edit notification. On other definitive non-install settlements release any still-owned edit cutoff once.
+
+**Invariant.** An admitted save has one reservation through its last obligatory disposition. Only its verified install can transfer the destination or mark its cutoff saved. **Simplest alternative.** Release on SAVE_FAILED and look at the path. **Defeating input.** Fail the PREPARED barrier after its record reached disk. The old path still matches and the client sees SAVE_FAILED while the cutoff is owned. Conversely, substitute a foreign inode after complete FINISHED and fail the conflict-checkpoint sync. The edit bookmark must disappear immediately while a new Save As must still wait.
+
+### First-open registration (line 183)
+
+**Journal runtime erratum.** Extend the independent-control contract at journal lines 405–421 with these declarations and text.
+
+```c
+journal_err journal_new_owner(journal *j, uint64_t *owner);
+journal_err journal_source_key(journal *j, const journal_generation *source,
+                               uint64_t *key, journal_request **declaration);
+```
+
+> Allocate a checked fresh owner from the writer's buffer high-water. For a validated file acquisition, source supplies the canonical location, fd-derived identity and prefix witness. Its key and flags are ignored. Reuse the active matching declaration, inheriting its policy, or allocate from the same generation high-water as capture and admit its GENERATION append. On reuse return the key and a null declaration. On admission of a write return its original owned request. Serialize concurrent lookups for the same declaration through visibility or reconciliation. Exclude staged and abandoned install keys. Check outputs and counter exhaustion before admission. Burn allocated numbers for this writer lifetime. Restart above the preamble and every retained mention, including discarded owners, orphan declarations and TABS entries. Carry both high-waters through rotation.
+
+L5 retains the verified binding from acquisition. NEW needs only the owner and the wire empty-origin key. Recovery of the same owner keeps its ID. A distinct imported draft takes a fresh local owner and translates or materializes its foreign-lineage sources by value. L5 issues BASE, TARGET and the membership decision through the existing append contract, holding admission through visible prerequisites. A partly published registration has no published tab until membership commits. No combined call needs to return the binding already held by the index.
+
+**Invariant.** A persisted identifier never changes meaning across eviction, damage at the tail or rotation. **Simplest alternative.** Number the next open after the largest surviving tab ID and assign a new source key on every open. **Defeating input.** Evict the highest ID, rotate and restart. Its number can be reused, and reopening a source under a fresh unrestricted key can undo an earlier capture embargo.
+
+### Destination representation and source lifetime (line 184)
+
+**File and savectl erratum.** After `file_expectation` at review file.h line 148 insert the following value type. Replace the retain language at savectl lines 185–190 and the opaque source field at line 167 as below. Use `typedef struct file_expectation savectl_identity;` in place of the duplicate comparison type at savectl lines 128–131.
+
+```c
+typedef struct file_target {
+    char path[OS_PATH_MAX];          /* checked canonical destination */
+    file_expectation expectation;
+} file_target;
+
+/* savectl_options.source */
+struct file_backing_impl *source;
+```
+
+> The caller lends a const file_target for construction, a save request or rebase. Copy the path and expectation on admission into controller-owned storage. A null binding represents an untitled or detached controller. The index keeps the former target for a detached draft. An explicitly named absent destination carries its canonical name and FILE_ABSENT. Refuse an overlong name or failed observation with its diagnosis. For a new name resolve the parent and validate the leaf. For a bound name take the accepted expectation and recheck it. Use file_expectation_observe_path/at for a newly observed destination. An observation alone does not accept a changed target. Take const pointers in each binding/destination input. The target_identity accessor borrows the accepted file_expectation.
+>
+> The source option is the nullable owned-backing type behind file_source. Retain it on create and release after all borrowers retire. A caller with an acquired file uses file_source_acquire. Caller-owned struct file storage stays with its acquisition or watch owner. A controller with private text can prepare a save with the file_temp API without constructing a dummy opened file.
+
+**Invariant.** The backing used to validate bytes can outlive its acquisition, and the save destination can differ from that backing. **Simplest alternative.** Keep a pointer into the open file's path and baseline. **Defeating input.** Save an untitled draft to an absent path, or Save As from a mapped source while its tab closes. The first has no file object and the second needs both the old backing and the new destination.
+
+### File messages, watches and the output descriptor (line 185)
+
+**File erratum.** Use the existing single-consumer rule at review file.h line 436. The owner of a file acquisition (including a controller's reload) calls file_msg_decode once and uses that decoded result. Savectl's own jobs run the synchronous file_temp core and deliver their immutable result to savectl_receive. Distinct recipients route before decode. Ordinary file_save_begin callers can keep their documented baseline behavior. L5 can watch the accepted parent/name directly with os_watch_read (os.h lines 475–484), drain to would-block in bounded turns, and send matching, ended or overflow hints to savectl_file_event. Refresh a lost watch. Focus supplies the same hint. A hint schedules one off-input-path check of accepted destination and original backing.
+
+Replace “on every other outcome custody is DONE” at review file.h line 290 and the discard contract at lines 296–299 with the following. Add the declaration immediately after file_temp_retry_barrier.
+
+```c
+int file_temp_verify(const file_temp *t, file_expectation *installed,
+                     uint32_t *prefix_crc32c, os_err *oserr);
+int file_temp_recover(file_temp *t, const char *path,
+                      const file_witness *prepared, os_err *oserr);
+```
+
+> VERIFIED, RENAME_UNCERTAIN and CONFLICT retain the written fd and pinned destination directory in the temp until the caller discards custody. These outcomes permit verification and reconciliation. INSTALLED_UNSYNCED additionally permits retry of the original directory barrier. Publish may rename only from SYNCED and only once. PRE_RENAME may clean up an identified unpublished temp. Discard closes held descriptors and may unlink only the still-owned, definitely unpublished temp name. An uncertain rename never authorizes unlinking the destination or a reused temp name.
+>
+> Verify against the held fd and the named path, check the prepared whole-text witness on a stable observation, and return its post-rename full fd expectation and wire prefix CRC on success. The prefix length follows from the wire rule and fd size. Return CHANGED/CONFLICT or the actual I/O failure without changing custody or baseline. Savectl obtains the candidate off path, revalidates at FINISHED issue and durable adoption, and rejects a stale result after a newer observation. At each UI decision confirm the fd/path identity and stat against the stable checked candidate, deferring on any uncertainty. Expensive content reads run off the input path. Only verified durable adoption changes the accepted binding. The source lease still validates the original bytes. The one-shot file_save_write caller discards retained custody before returning.
+>
+> file_temp_recover is the restart entry for a selected open PREPARED. Open the named candidate and parent off path. On a stable path/fd match to the whole prepared witness, transfer both descriptors to the empty temp in INSTALLED_UNSYNCED so the ordinary barrier-only retry and verification path apply. On mismatch or I/O failure release partial acquisitions, report the cause and leave the output empty.
+
+In file_temp_state at review file.h line 232, insert `FILE_TEMP_HELD` before DONE for that verify/discard custody. On an uncertain rename, if verification establishes installation, settle the still-unproved parent barrier on the original directory before finish. The caller may use file_temp_retry_barrier on HELD after that proof. No retry of the rename is implied.
+
+**Invariant.** The declaration and accepted binding identify the descriptor whose bytes satisfied PREPARED. **Simplest alternative.** Accept FILE_PUB_VERIFIED as final and later stat just the name. **Defeating input.** Replace the name between SAVE_DONE and the FINISHED barrier. The later stat describes the foreign file and cannot establish that it contains the saved snapshot.
+
+### Recovered and kept drafts (line 186)
+
+**Journal runtime, file and savectl erratum.** At journal line 390 extend the BUFFER member by `journal_cutoff *pending;`. After journal line 375 insert the following.
+
+> BUFFER transfers the original writer cutoff for a selected open PREPARED, otherwise null. Match it to the selected CONTROL by owner/token. Preserve its image, reserved closing credits, embargo and evidence. The cursor releases untaken holds. A taken hold transfers exactly once to the recovering disposition owner. A mapped BUFFER tree uses a file-created piece_backing whose context owns the file_source for that very mapping. Private and unresolved text require no mapped source. EVIDENCE remains available for each unresolved origin.
+
+At review file.h line 220 replace “ctx is the struct file” with “A non-null ctx is the struct file. A null ctx selects the source of the supplied file-created mapped backing: its piece_backing.ctx is the file_source for that mapping. Validate the supplied backing against its own acquisition.” Tree/snapshot references already pin it (piece.h lines 182–197). This preserves existing live-file calls and lets recovered and kept text use the same validator after the acquisition object retires.
+
+At savectl line 190 replace the create sentence with the following and add the indicated optional options member.
+
+```c
+typedef struct savectl_recovery {
+    const journal_target *intended;
+    const journal_save *prepared;       /* selected open PREPARED, if any */
+    journal_cutoff *pending;            /* transfers on successful create */
+} savectl_recovery;
+/* savectl_options */
+const savectl_recovery *recovery;
+```
+
+> Fresh creation starts in IDLE_CLEAN. On recovery copy the effective target and any selected prepare, and take the matching cutoff on success. Before admission compare a fresh full file observation with the selected wire expectation and the verified origin. Supply an ordinary binding only with its real full expectation. Preserve a mismatching intended TARGET for conflict protection. Accept a verified saved ID only together with its matching binding. Idle foreign/missing enters IDLE_CHANGED and requests protection before save. Failure to observe retains the staged draft and diagnostic for retry. An unresolved tree remains evidence-only. With an open prepare, reinstall the index reservation before enabling opens or saves. Reconcile the old expectation, installed whole-file witness and namespace under that reservation. Prior enters recovery-pending cancellation, foreign enters changed protection/cancellation, and a matched installed candidate requires a held, freshly verified fd and the target-parent barrier before FINISHING. Reuse the original token, position and installed key. A failed check preserves the recovery obligation. No second rename is authorized. The verified recovery opener supplies the equivalent fd/directory custody for the same file verification and barrier operations. A selected complete FINISHED has no open token.
+
+L5 stages BUFFER plus selected controls before creating the controller. For a missing private/untitled target the wire binding tag distinguishes intentional absence from conflict. Recovery settlement can use the staged unlogged tree for checkpoints before edit_create, as edit line 167 requires. Construct the editor with the reconciled IDs, without fabricating a live edit cutoff from a pre-crash history. For KEEP, retain the immutable snapshot and its validator. Reopen by iterating its validated bytes into a fresh private unlogged tree off the input path, validating after the final mapped read. A refused copy preserves the kept leaf. Treat materialized private spans as literals unless provenance is proved. This needs no mutable-tree constructor over a snapshot and never substitutes the current pathname for kept bytes.
+
+**Invariant.** Recovered text, backing validation, and permission to save each have their own evidence. **Simplest alternative.** Reopen the name, fill a full stat from TARGET, then create clean. **Defeating input.** Recover a kept mapped draft and an open PREPARED after another process replaced its destination. A new fd can validate the wrong inode, a wire projection lacks mode and ownership, and fresh-save admission would strand the first token.
+
+### Displaced generations and checkpoint coverage (line 188)
+
+**Journal runtime and savectl erratum.** At journal line 527 and savectl line 174 replace scalar `uint64_t displaced_key` with `const uint64_t *displaced_keys, size_t displaced_count` (separate fields in the request). The count is the number of distinct affected declarations. At journal line 521 add the following.
+
+> Capture consumes the borrowed set in the admission call. An empty set needs no generation embargo. Validate and reserve the complete set and its VALUE_ONLY obligations atomically before capture succeeds. On refusal install none. The PREPARED payload still has one saver origin and one installed key. The set affects existing generation policy, not that payload. Each required VALUE_ONLY declaration must be visible and covered before rename.
+
+Extend the runtime after journal line 438 with the following read interface.
+
+```c
+bool journal_next_source(const journal *j, uint64_t after_key,
+                         journal_generation *declaration);
+bool journal_depends(const journal *j, uint64_t owner, uint64_t key);
+journal_position journal_owner_boundary(const journal *j, uint64_t owner);
+```
+
+> Return the next effective declaration in ascending key order, starting after the reserved zero key. Its views are borrowed through the current decision. Include reachable historical source declarations even after an owner's TARGET detaches. depends tests whether the owner's selectable origin or complete suffix can still need that key. Include unresolved branches until excluded by evidence. owner_boundary returns the current image position of that owner's last complete published text boundary, including its initial origin. Read it only in the same serialized decision as the matching published snapshot, after any pending edit final has been adopted. An absent required boundary defers the request.
+
+On first open, use the declaration returned by registration. On recovery and on a verified finish, the writer's effective declaration index includes the recovered or newly activated key. Before capture, match declaration **location and generation evidence** against what replacing the reserved name can remove. Check every potentially affected declaration under the name, including equal identities under different keys. An unchanged independently accessible alias need not be protected solely because it names the same inode. Account for unresolved observations by deferring or securing independent coverage. Recheck membership, declarations, provisional operands and destination if enumeration spans turns. Checkpoint the union of the dependent owners under the fence, once per owner when its proof covers the whole set. Embargo also covers later history restores. For a specific cutoff use the position from capture (journal lines 523–529). For a required current peer boundary use owner_boundary. For any adequate independent origin use the already signed all-zero minimum (line 533). Restart a request invalidated by an image switch.
+
+**Invariant.** At rename, every draft that could lose a selected source has durable independent text and suffix. **Simplest alternative.** Protect the key on the peer's current TARGET and use its edit revision as the checkpoint sequence. **Defeating input.** Import two independently numbered declarations of the same source at the same name, detach one owner, and interleave another buffer's key before Undo. A single TARGET lookup misses a dependent and Undo's revision names no position in the shared image.
+
+### Checkpoint invalidation and validator retirement (line 189)
+
+**Journal runtime erratum.** After journal line 574 insert the following declarations and contract.
+
+```c
+void journal_checkpoint_invalidate(journal_request *request);
+journal_request *journal_request_retain(journal_request *request);
+```
+
+> On the UI, invalidate the checkpoint producer identified by this request before attempting replacement. Revocation is idempotent and allocation-free. Revoke authority to issue or adopt another record from that producer, including COMMIT. All joined callers observe the supersession. A stale call cannot revoke a successor. An already-visible COMMIT remains in the image. The changed external decision invalidates its use as a current proof. Reconcile any torn physical frame. Retain gives the caller its own observation of the same request and physical retirement, with the same release obligation as an admitted reference.
+
+When lending its validator, the index takes an observation reference **before** transferring the callback result to savectl. It releases the context only after the original producer's terminal result following its last physical retirement, as journal lines 544–548 require, and after any other borrower retires. A join continues using the original validator. Its caller need not keep a new, unused validator for the producer. A replacement gets its own hold. Terminal status for retirement is distinct from an intermediate I/O diagnosis on a POSSIBLE effect. L5 also invalidates pending barrier adoption for the obsolete decision, even if the original barrier eventually succeeds.
+
+**Invariant.** An obsolete producer cannot close its successor's slot, and its last physical read always has a live validator. **Simplest alternative.** Replace first and free ctx when savectl drops its request. **Defeating input.** A watch invalidates a self-checkpoint joined by another consumer. Replacement funding fails while a literal delivery is in flight. The old consumer can otherwise issue a stale COMMIT or read freed storage.
+
+### Runnable work, fairness and wakes (line 190)
+
+**Journal runtime, savectl, edit and work erratum.** Add the readiness declarations beside journal_service and savectl_tick. Replace the declaration at edit lines 281–282 as below. Append the physical-finish paragraph to work.h line 191.
+
+```c
+bool journal_runnable(const journal *j);
+bool savectl_runnable(const savectl *s);
+edit_result edit_maintain(edit_buffer *b, size_t reclaim_steps,
+                          size_t resolve_visits, size_t undo_records,
+                          bool *more);
+```
+
+> These UI queries inspect present continuations without I/O. True means another service opportunity can advance a ready record, adoption, barrier or retirement now. Waiting solely for a worker, a failed operation's explicit retry, or an unchanged external dependency is quiescent. Deliveries, capacity returns and relevant dependency changes re-enable service. L5 offers a waiting controller another tick when its session-owned fence or checkpoint dependency changes. These services have no timer-driven retry. A runnable continuation schedules the next turn immediately.
+>
+> In a turn, admit input at its published boundary, then give each ready record class an opportunity and rotate instances within it. Each edit call may issue one ready journal record before returning MORE if another record remains (G, use the minimum positive record quantum for a turn). Yield before owner commit if the final needs the next turn. Keep the health check, owner commit and final indivisible. Apply the same quantum to control appends inside tick and checkpoint production inside service. An admitted journal_sync records its required position and returns its owned request. Only the writer submits ready barriers, at the end of the record round after external producers have had their opportunities. A closed or blocked class counts as visited. A newly ready record can start the next turn. A barrier covering PREPARED still has to complete before target publication.
+>
+> edit_maintain sets *more if another funded maintenance slice can progress on the same idle tree. Propagate piece_reclaim's remaining-work result and piece_lines_resolve's more result. If undo retires its full positive budget, schedule a probe slice when the remaining queue is unknown. WAIT sets *more false until edit settlement. A refused claim returns NOMEM and waits for capacity or explicit retry for that action. Independent runnable work still sets *more. Count adoption, snapshot release and an edit boundary reschedule relevant idle maintenance.
+>
+> Publish physical completion and returned capacity before signaling the pool wake, including completion without a message and completion after cancellation. UI-side cancellation that retires synchronously is itself a dependency change. The waiter registers the wake, drains through the mailbox protocol, and checks finished handles, readiness and remaining mail before sleeping.
+
+Rule 6 is already specified at journal lines 635–643 and savectl line 323. The end-of-turn test uses these predicates, edit's returned continuation and L5's own ready admissions. It arms the earliest actual application deadline or OS_DEADLINE_NEVER. A finishing worker that races that last check leaves a waitable wake. No per-controller polling interval or second copy of a phase is required.
+
+**Invariant.** Each ready producer gets service under sustained input, and each sleeping dependency has a concrete wake. **Simplest alternative.** Run the loop only on new input or mailbox messages, or run it whenever a handle exists. **Defeating input.** Stop typing after the first checkpoint slice, then cancel a different worker after its last message. The first policy strands ready records or physical retirement. The second spins while a sync is blocked.
+
+### First acknowledged small draft and rotation (line 191)
+
+**Journal runtime erratum.** After journal line 574 add the threshold declaration and the following contract.
+
+```c
+uint64_t journal_self_contained_limit(void);
+```
+
+> Return the inclusive text size in bytes from the journal-volume policy in the rotation brief: v1's pinned whole-text/delta split, reduced only by the demonstrated rotation budget and stated margin. The journal owner supplies the derived constant. The session receives the edit ACK boundary, retains its validated published snapshot, IDs and intended TARGET, and after submit compares its length with this limit. If eligible and still dependent, it admits the ordinary by-value checkpoint and requests sync through its visible COMMIT. No second checkpoint slot or ACK barrier is created. Secure an independent suffix from the selected BEGIN, including Undo between the checkpoint literals. For the tree's restart-resolvable ORIGINAL, publish the existing monotone VALUE_ONLY redeclaration before BEGIN, after settling any provisional reference to that key. ADD and materialized private bytes already emit literals. Recheck on source change. If intervening commands advanced the boundary, take the current matching snapshot and IDs at BEGIN. Retry a failed claim on progress, retaining the protection obligation. A newer qualifying boundary can satisfy it. First becoming small on a later acknowledged edit also qualifies.
+
+**The rotation portion is already answered at journal lines 648–654.** L5 can enforce the condition without passing a session version. Publish the effective membership, TARGET, required VIEW and policy controls before admitting rotation. During the build, make each such decision effective on the UI only when its controls are complete and visible to the writer. Until then keep the previous effective decision and withhold dependent ACKs. A policy effective at capture already belongs to the writer, and its live cutoff bars rotation. At the switch every effective decision is therefore in the writer's index. A newly visible control changes the writer's exact-match inputs. A still-pending intent rechecks its dependencies and publishes on whichever image is current. Edits already have complete finals before ACK. A worker needs neither live editor pointers nor a second copy of the membership version.
+
+**Invariant.** Covering sync protects the eligible draft and its independent suffix. Rotation switches only to an image representing every effective session decision at that instant. **Simplest alternative.** Infer eligibility from the file-copy threshold and switch on worker success. **Defeating input.** Type into a small draft, Undo a mapped span between its checkpoint literals, then close it KEEP while a rotation worker holds an older TABS. The checkpoint can otherwise depend on a replaced BASE, and switching can resurrect the prior membership.
+
+### Disconnection with a retained possible effect (line 192)
+
+**Already answered by the lower header.** Journal line 399 explicitly makes close return WAIT while a request lives. Line 402 includes commands and cutoffs and makes success the consuming result. Line 617 preserves the original effect across reconciliation. Savectl line 276 requires idle close with all obligations clear before destruction. These contracts determine object custody. The headless executable owns the terminal process decision.
+
+On disconnect, stop admission, finish any immediately eligible work and wait normally for outstanding work that can settle the effect. If settlement reaches a diagnosed failure whose only next action is an explicit retry and no command connection remains, end the headless process with failure. Report the session path, owner/token, last proved publication and originating service/native error on the diagnostic stream. Preserve the named image, any set-aside evidence and uncertain namespace as found. Do not issue another terminal, unlink evidence, acknowledge durable close, or run success-only destructors on live objects. Process exit ends outstanding in-process custody as at a crash cut. Next startup reconciles the surviving prefix and actual binding. If storage cannot record evidence still held only in RAM, say so in the diagnostic. Connected DRAINING retains its normal resolution path.
+
+**Invariant.** An unattended exit neither claims durability nor changes an ambiguous effect into a completed cancellation. **Simplest alternative.** Retry journal_close until it succeeds. **Defeating input.** Disconnect after a possible FINISHED append and a persistent writeback error. Only explicit recovery could release the cutoff. Repeated close returns the same WAIT forever.
