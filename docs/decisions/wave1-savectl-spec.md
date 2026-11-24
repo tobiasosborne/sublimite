@@ -156,9 +156,8 @@ typedef struct savectl_session {
     void *ctx;
     savectl_err (*checkpoint)(void *, const journal_target *,
                               journal_request **out);
-    savectl_err (*fence)(void *, uint64_t saver, uint64_t token,
-                         uint64_t displaced_key);
-    void (*release_fence)(void *, uint64_t saver, uint64_t token);
+    savectl_err (*fence)(void *, uint64_t token, uint64_t displaced_key);
+    void (*release_fence)(void *, uint64_t token);
 } savectl_session;
 typedef struct savectl_options {
     savectl_session session;

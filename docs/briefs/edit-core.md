@@ -1,5 +1,5 @@
-Bead EDIT-CORE: the edit kernel against the signed journal runtime header (edit split, advisor 2026-11-24). For the
-advisor's read before dispatch. sublimité v2 is a clean-slate C11 editor rebuild. Your checkout is a worktree of
+Bead EDIT-CORE: the edit kernel against the signed journal runtime header (edit split, advisor 2026-11-24). SIGNED by the advisor
+2026-11-24. sublimité v2 is a clean-slate C11 editor rebuild. Your checkout is a worktree of
 /home/tobias/Projects/sublimite-v2 (branch v2). One worker, one bead: do exactly this scope, then stop.
 
 Routing: Sol. No process kill, no truncated mapping, no real journal. Kill cuts and the real journal are EDIT-INTEGRATION
@@ -13,6 +13,10 @@ Depends on:
 LANDING ORDER (coordinator's note for the advisor): EDIT-CORE can be written and tested against the double as soon as
 those three land. It LANDS only after 2b-1. The L2 layer check links libL2.a whole-archive, and edit.o's journal_*
 calls resolve only once 2b-1 defines them. The worker adds no stub definitions to src/journal/.
+Advisor's ruling on sequencing: as written. There are no stub definitions in src/journal/, and the whole-archive
+layer check is not relaxed. While EDIT-CORE waits for 2b-1, its wip branch is pushed, and the landing reads (Astra on
+the production source, and the advisor) are done on the wip, so that after 2b-1 only the rebase and the merged-tree
+lanes remain.
 
 Read first (absolute paths under /home/tobias/Projects/sublimite-v2):
 1. CLAUDE.md:

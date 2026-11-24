@@ -466,4 +466,8 @@ PLAN §4.4's "orthogonal four axes" are observables, not stored fields.
   - edit splits into EDIT-CORE (Sol, after N2, with a flat journal double) and EDIT-INTEGRATION (Claude/Muse, after
     2b-1).
 - savectl's bead waits for L2-1 and L2-3.
+- (Advisor, later the same day.) The fence and release_fence callbacks lose their saver argument: ctx identifies the
+  controller. token and displaced_key stay, because they change per save.
+- The edit-core and edit-integration briefs are SIGNED. EDIT-CORE is developed against the double after N2, v2-bkz and
+  the piece reader erratum, and lands after 2b-1, with its landing reads done on the wip.
 
