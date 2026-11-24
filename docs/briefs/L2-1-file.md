@@ -21,6 +21,7 @@ Scope (dossier §1.2 API table, with these decided points):
   (1) an owned target handle with the full comparison and error contract (acquire full tagged target expectations, retain and release immutable bindings, and on every check tell a missing path apart from a failed observation);
   (2) custody and resumption of a synced temp across asynchronous jobs (fd, temp name, metadata and witness intact), with cleanup after refusal or close;
   (3) classified publication evidence (definitely before rename, rename uncertain, installed but directory barrier failed, verified, post-rename conflict) and a barrier-only retry on the original handle, which never renames again.
+- Temp name (advisor, 2026-11-24): os_now_ns() ^ os_thread_self() with exclusive create and retry; the exclusive create is the guarantee, not the name. No pid accessor.
 - The six save step hooks (TEMP_CREATED, MID_WRITE, TEMP_WRITTEN, FSYNCED, RENAMED, DIR_SYNCED) only under FILE_TEST_HOOKS.
 
 Acceptance (each a test, red first):
