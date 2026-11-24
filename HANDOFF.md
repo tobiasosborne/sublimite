@@ -27,7 +27,9 @@ branches: push each at every pause or session end; delete the remote branch once
       the four fixes and their tests only. No further Muse dispatch tonight without asking the advisor.
     - L2-1's adversarial source read: a fresh Opus reviewer in the Claude queue, after v2-40h and before 2b-1, each at
       Claude room >= 1.0. Then the advisor's owner read, and L2-1 lands (review/l2-1 1ce753a, lanes green).
-    - Astra: the L5 spec. Next on Codex after L2-1 lands: v2-677 permission bits (Sol; fix in os_file_copy_metadata).
+    - Codex (serial): v2-677 permission bits (Sol, running; fix in os_file_copy_metadata, test in os_persist_test; the
+      file-suite assertion is added by the L2-1 merge). Then Astra answers her ten L5 questions as errata (section
+      "Errata proposed by the L5 spec" in wave1-app-spec.md). The advisor reads the L5 spec and the errata together.
   - Serial chains:
     - Codex: N2 (LANDED 1.27), then Astra's N2 landing read (docs/reviews/wave1-N2-astra.md), then Astra's minimal
       L5 spec (docs/decisions/wave1-app-spec.md; PLAN 4.7: app_loop, app_buffers, app_save, app_session, the headless
