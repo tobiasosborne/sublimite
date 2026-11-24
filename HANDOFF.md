@@ -30,15 +30,18 @@ Landed L0: os (1.1), base (1.2), trace (1.3), work (1.4), ipc (1.5), os stream +
 (1.10, 1.12, 1.15), ASSERT migration (1.14), no test env vars + dead exports (1.20). Landed L1: scan (1.6), utf8 (1.7),
 indent (1.9, 1.13), piece 7a = frozen piece.h incl. Lines + flat model + model-run suite (1.16–1.18, erratum d028acf,
 piece_span_nl_join with undo), find (1.19), undo (1.21). lineidx removed (A19). Early leaves (A21): dnd (4.1).
-In flight (state at 01:30 CET 2026-11-24):
-- 7b real piece tree (v2-0fv.17): three rounds done; merged on branch review/7b2 (5633ba1), lanes green on the merged
-  tree; Astra's third read (A, E, H only, source) pending; lands when it is clean. Then L2-2b / L2-1 move to the real tree.
-- L2-2b journal runtime (v2-0fv.24): paused at the Claude stop line (01:25); resumes on its Opus thread when Claude is
-  more than 3 behind (about two idle hours).
-- L2-2a landed (2.1). Briefs ready: L2-3 (advisor reads after L2-2b lands), L2-1 file (after 7b), v2-0fv.15 edit
-  (provisional; maintenance order reclaim, resolve, replenish, undo_maintain per A24).
-- Filed: v2-0fv.21 os export deletion + nm gate, .22 empty-tab footprint, .27 54-bit node-prefix packing (deletion review).
-L2/L5 decisions: A19–A25; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
+In flight (state at 02:31 CET 2026-11-24):
+- 7b real piece tree (v2-0fv.17): rounds 1–3 merged on review/7b2 (5633ba1), lanes green on the merged tree; Astra's third
+  read HOLD on I, J, K; the advisor replaced the admission rule (A26: exact at quiescence, four-step sequence). Round 4
+  (A26, a deletion round: remove piece_fund_exact's loop and predicates; I/A(1) traces assert retry success; J, K test
+  steps 4, 2, 1) is READY TO SEND to the warm 7b thread when Claude reads >= 2.0 behind; then Astra reads the new admission
+  section only; then 7b lands (merge review/7b2 + round 4 onto v2, lanes on the merged tree).
+- L2-2b journal runtime (v2-0fv.24): paused at a94af15 on its branch (compiles; next: mutation reds M4–M6); resumes on its
+  Opus thread after 7b lands and Claude is > 3 behind; then it switches from the piece model to the real tree.
+- Landed tonight: 0.87, 1.20, 1.21 undo, 2.0 L2-0a, 2.1 L2-2a, 4.1 dnd, 4.2 TOML. Briefs ready: L2-3, L2-1, v2-0fv.15.
+- Filed: v2-0fv.21 os export deletion + nm gate, .22 empty-tab footprint, .27 54-bit node-prefix packing.
+- Quota: the coordinator's own turns consume Claude room at about the accrual rate; go quiet to recover it.
+L2/L5 decisions: A19–A26; save protocol A23 (no retention; rules 1–7; T5 product contract in PLAN).
 L2/L5 plan: docs/decisions/wave1-L2-L5-harvest.md, wave1-L2-derivations.md, wave1-L2-q2-crash-consistency.md,
 wave1-L2-q2-protocol.md. Briefs live in docs/briefs/ named by bead and are committed with their dispatch.
 
