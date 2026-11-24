@@ -1,5 +1,7 @@
 # Journal wire amendment and runtime header for joint signature
 
+STATUS (advisor, 2026-11-24): lines 1–286 (wire amendment and pure reader contract) SIGNED, with the saved-association rule added at FINISHED. The runtime section (from "Proposed runtime section") is NOT signed: R1–R6 pending.
+
 This replaces the indicated paragraphs and declarations in `src/journal/journal.h` before the first on-disk release. Retain the preamble, field offsets, sizes, endian encoding, CRC coverage, identity witnesses, payload encoders and family/version refusal rules. Keep wire version 1 (G, pre-freeze amendment procedure). The following text belongs in the header. Numbers in names and section citations identify existing contracts. (G) denotes a format or product choice and (P) a consequence of the stated construction. [Signed A28](wave0-plan-amendments.md#a28-the-journal-write-model-advisor-2026-11-24-w1-with-repair-a-docsdecisionswave1-journal-write-modelmd) · [Landed header](../../src/journal/journal.h)
 
 ## Wire header text
@@ -114,7 +116,15 @@ Replace the marker, descriptor placement, generation eligibility and SAVE interp
  * key, s, content id and path and the preceding declaration must agree
  * with the path and witness inode and size. Complete FINISHED activates
  * the declaration and the saver's origin, binding and saved id at s in
- * one plan operation. A later range needs the active, verified generation
+ * one plan operation. A saved association is adopted only together with a
+ * verified binding, live and in recovery (advisor, at signature): a
+ * complete FINISHED whose installed file is not at the path when it is
+ * verified yields an origin candidate, never a saved id. The live outcome
+ * is SAVE_FAILED with CHANGED: the saved id unknown, the buffer dirty and
+ * the conflict checkpoint written. There is no second terminal record.
+ * Dirty costs the user a prompt; clean could cost the text, because a
+ * clean buffer whose file changed is eligible for the silent reload of
+ * unmodified text. A later range needs the active, verified generation
  * and must obey the permanent VALUE_ONLY policy. Ordinary redeclarations
  * retain their strict identity and monotone flags. A pending or abandoned
  * installed declaration never enables an operand. The allocator advances

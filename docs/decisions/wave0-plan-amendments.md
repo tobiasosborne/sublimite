@@ -430,4 +430,14 @@ Next:
 - N1: Astra writes the wire amendment, edit.h and savectl.h redrawn on A28 (all three to the advisor together).
 - N2: once signed, Sol takes the wire amendment plus the pure two-pass reader as one bead.
 - N3: the coordinator rewrites the L2-2b and L2-3 briefs on A28 (advisor reads both before dispatch).
+A28 additions at signature of the wire amendment (advisor, 2026-11-24; docs/decisions/wave1-journal-wire-amendment.md):
+- The wire amendment and the pure reader contract (journal_plan_read: a pure function of the image bytes with caller
+  workspace) are SIGNED, and N2 is filed for Sol.
+- A saved association is adopted only together with a verified binding, live and in recovery. A complete FINISHED
+  whose installed file is not at the path yields an origin candidate, never a saved id.
+- Live outcome of that case: SAVE_FAILED with CHANGED, the saved id unknown, the buffer dirty, the conflict checkpoint
+  written. No second terminal record, because the token is already consumed.
+  Reason: a clean, changed-on-disk buffer is eligible for the silent reload of unmodified text, which would replace the
+  text the user just saved with the foreign bytes.
+- The runtime section (1b) is not signed. R1–R6 go back to Astra; edit.h and savectl.h follow in the same pass.
 
