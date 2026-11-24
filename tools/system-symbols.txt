@@ -53,6 +53,7 @@ epoll_create1          os # wait set (the one wait primitive)
 epoll_ctl              os # add, modify and remove wait set members
 epoll_wait             os # wait set readiness with a deadline
 eventfd                os # Linux event counter descriptor
+fchmod                 os # give a replacement file the original mode (os_file_copy_metadata)
 fchown                 os # give a replacement file the original owner (os_file_copy_metadata)
 fcntl                  os # query descriptor flags or duplicate with close-on-exec
 fdatasync              os # flush file data and required metadata

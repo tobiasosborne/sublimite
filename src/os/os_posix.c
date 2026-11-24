@@ -1514,5 +1514,6 @@ os_err os_file_copy_metadata(os_file *dst, const os_file *src, os_xattr_scratch 
         errno = set_errno;
         return fail();
     }
-    return OS_OK;
+    RETRY(rc, fchmod(dst->fd, s.st_mode & 07777));
+    return rc != 0 ? fail() : OS_OK;
 }

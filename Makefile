@@ -230,7 +230,7 @@ $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/undo_test: $(B)/$(c)/src/piece/p
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
 # Watch and metadata-copy faults are injected beneath os (L2-0a).
-OS_PERSIST_TEST_WRAPS := inotify_init1 inotify_add_watch inotify_rm_watch read fchown fstat \
+OS_PERSIST_TEST_WRAPS := inotify_init1 inotify_add_watch inotify_rm_watch read fchmod fchown fstat \
                          flistxattr fgetxattr fsetxattr fremovexattr
 LDFLAGS_os_persist_test := $(foreach s,$(OS_PERSIST_TEST_WRAPS),-Wl,--wrap=$(s))
 # The watch fuzzer forges kernel records beneath os (L2-0a): read(2) of the

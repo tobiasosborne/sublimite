@@ -484,7 +484,7 @@ void os_watch_remove(os_watch *w, os_watch_id id);
 os_err os_watch_read(os_watch *w, os_watch_event *ev, size_t cap, size_t *n);
 
 /* ---- metadata copy (L2-0a, docs/decisions/L2-0a.md) ----
- * Gives dst src's owner and src's whole extended-attribute set: every name
+ * Gives dst src's owner, mode bits and whole extended-attribute set: every name
  * the process can list, ACLs (system.posix_acl_*) and security labels
  * included, with no namespace allowlist. In order:
  *   1. Owner: fchown dst to src's uid and gid, only when they differ (an
@@ -495,6 +495,8 @@ os_err os_watch_read(os_watch *w, os_watch_event *ev, size_t cap, size_t *n);
  *   3. Each src name is set on dst. A set that fails where dst already holds
  *      the identical value counts as copied (an immutable label that already
  *      matches); a different value returns the set's error.
+ *   4. Permission and special mode bits from src's stat are applied with
+ *      fchmod, since ownership and ACL changes can affect those bits.
  * When neither descriptor supports xattrs there is no state to copy; when
  * only one does, OS_E_NOTSUP. Every refusal is the failing call's error
  * (OS_E_ACCESS, OS_E_NOTSUP, OS_E_RANGE for a list or value past the kernel

@@ -41,7 +41,7 @@ static void expect(os_err got, os_err want, const char *expression, int line)
 #define MS UINT64_C(1000000)
 
 /* ---- injection ---------------------------------------------------------- */
-enum { W_INIT, W_ADD, W_RM, W_READ, W_FCHOWN, W_FSTAT, W_LIST, W_GET, W_SET, W_REMOVE, W_COUNT };
+enum { W_INIT, W_ADD, W_RM, W_READ, W_FCHMOD, W_FCHOWN, W_FSTAT, W_LIST, W_GET, W_SET, W_REMOVE, W_COUNT };
 static int inject_left[W_COUNT], inject_errno[W_COUNT], inject_fd[W_COUNT];
 static unsigned calls[W_COUNT];
 /* Fail the next `times` calls of w (on descriptor fd, or any when fd < 0). */
@@ -79,6 +79,7 @@ int __real_inotify_init1(int);
 int __real_inotify_add_watch(int, const char *, uint32_t);
 int __real_inotify_rm_watch(int, int);
 ssize_t __real_read(int, void *, size_t);
+int __real_fchmod(int, mode_t);
 int __real_fchown(int, uid_t, gid_t);
 int __real_fstat(int, struct stat *);
 ssize_t __real_flistxattr(int, char *, size_t);
@@ -89,6 +90,7 @@ int __wrap_inotify_init1(int);
 int __wrap_inotify_add_watch(int, const char *, uint32_t);
 int __wrap_inotify_rm_watch(int, int);
 ssize_t __wrap_read(int, void *, size_t);
+int __wrap_fchmod(int, mode_t);
 int __wrap_fchown(int, uid_t, gid_t);
 int __wrap_fstat(int, struct stat *);
 ssize_t __wrap_flistxattr(int, char *, size_t);
@@ -118,6 +120,7 @@ ssize_t __wrap_read(int fd, void *b, size_t n)
     }
     return __real_read(fd, b, n);
 }
+int __wrap_fchmod(int fd, mode_t mode) { return take(W_FCHMOD, fd) ? -1 : __real_fchmod(fd, mode); }
 int __wrap_fchown(int fd, uid_t u, gid_t g) { return take(W_FCHOWN, fd) ? -1 : __real_fchown(fd, u, g); }
 int __wrap_fstat(int fd, struct stat *st)
 {
@@ -776,6 +779,82 @@ static void case_meta_rules(void)
     remove_leaf("dst");
 }
 
+static void check_copied_mode(mode_t mode, mode_t mask)
+{
+    os_dir dir = OS_DIR_INIT;
+    os_file src = os_file_from_fd(open_leaf("src")), tmp = OS_FILE_INIT;
+    CHECK(fchmod(src.fd, mode) == 0);
+    OK(os_dir_open(&dir, root));
+
+    mode_t old_mask = umask(mask);
+    OK(os_file_open_at(&tmp, &dir, "temp", OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_EXCL));
+    os_stat st;
+    OK(os_file_stat(&tmp, &st));
+    CHECK(st.perm == 0600);
+    OK(os_file_copy_metadata(&tmp, &src, &scratch));
+    (void)umask(old_mask);
+    OK(os_file_stat(&tmp, &st));
+    CHECK(st.perm == (uint32_t)mode);
+
+    os_file_close(&tmp);
+    os_file_close(&src);
+    OK(os_unlink_at(&dir, "temp"));
+    OK(os_unlink_at(&dir, "src"));
+    os_dir_close(&dir);
+}
+
+static void case_meta_executable(void)
+{
+    /* Group and other execute bits survive even under a restrictive umask. */
+    check_copied_mode(0755, 0077);
+}
+
+static void case_meta_private(void)
+{
+    /* A zero umask gives no help keeping the temp private. */
+    check_copied_mode(0600, 0000);
+}
+
+static void case_new_destination(void)
+{
+    os_dir dir = OS_DIR_INIT;
+    os_file tmp = OS_FILE_INIT;
+    os_stat st;
+    OK(os_dir_open(&dir, root));
+    EXPECT(os_stat_at(&dir, "new", OS_STAT_NOFOLLOW, &st), OS_E_NOENT);
+
+    /* The OS creates the temp with 0600 & ~0200 = 0400. At the v1 pin,
+     * file.c:908,919 applies the final default 0644 explicitly before rename. */
+    mode_t old_mask = umask(0200);
+    os_err err = os_file_open_at(&tmp, &dir, "temp", OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_EXCL);
+    (void)umask(old_mask);
+    EXPECT(err, OS_OK);
+    OK(os_file_stat(&tmp, &st));
+    CHECK(st.perm == 0400);
+    OK(os_rename_at(&dir, "temp", &dir, "new", OS_RENAME_NOREPLACE));
+    OK(os_stat_at(&dir, "new", OS_STAT_NOFOLLOW, &st));
+    CHECK(st.perm == 0400);
+
+    os_file_close(&tmp);
+    OK(os_unlink_at(&dir, "new"));
+    os_dir_close(&dir);
+}
+
+static void case_meta_mode_fault(void)
+{
+    os_file src = os_file_from_fd(open_leaf("src")), dst = os_file_from_fd(open_leaf("dst"));
+    CHECK(fchmod(src.fd, 0755) == 0);
+    reset_calls();
+    inject(W_FCHMOD, EPERM, 1, dst.fd);
+    EXPECT(os_file_copy_metadata(&dst, &src, &scratch), OS_E_ACCESS);
+    CHECK(errno == EPERM && calls[W_FCHMOD] == 1);
+    FIRED();
+    os_file_close(&src);
+    os_file_close(&dst);
+    remove_leaf("src");
+    remove_leaf("dst");
+}
+
 static const struct {
     const char *name;
     void (*run)(void);
@@ -784,6 +863,8 @@ static const struct {
     {"watch_overflow", case_watch_overflow}, {"watch_faults", case_watch_faults},
     {"watch_misuse", case_watch_misuse},     {"meta_roundtrip", case_meta_roundtrip},
     {"meta_owner", case_meta_owner},         {"meta_rules", case_meta_rules},
+    {"meta_executable", case_meta_executable}, {"meta_private", case_meta_private},
+    {"new_destination", case_new_destination}, {"meta_mode_fault", case_meta_mode_fault},
 };
 
 int main(int argc, char **argv)
