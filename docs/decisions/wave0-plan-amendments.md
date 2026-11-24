@@ -339,3 +339,24 @@ RESTORE_BASE_RANGE, GROUP_BEGIN/COMMIT, CHECKPOINT_BY_VALUE, SAVE(PREPARED/FINIS
 - A bound that justifies an ASSERT is structural or address-space, never installed memory (node reference counts:
   widened if the signed node prefix allows, else saturating at UINT32_MAX — a never-freed node, never an abort).
 
+## A26. Piece admission: exact at quiescence, a sequence not a loop (advisor, 2026-11-24; supersedes A25's fixpoint)
+
+Reason: a point-in-time refusal cannot be made exact against concurrent release — a worker can always free storage one
+instruction after base has refused us (Astra's third 7b read, finding I); no ordering of signals and no supply epoch
+closes that window, a fixpoint only narrows it. Four rounds on A25's rule were the signal.
+Contract (piece.h STORAGE): exactness is promised at quiescence. With no release by another thread in flight, a call
+returns PIECE_ERR_NOMEM only when base refused the exact remainder after every local source was used. While another
+thread is releasing storage, a call may be refused that an immediate retry would not be; nothing latches, the next call
+tries afresh.
+Procedure (at most two plan computations and one base request per call):
+1. Fast path: the scalar claim AND the companion storage the command needs (ADD chunks, the boundary chunk) are both
+   present locally: proceed, no plan, no base call.
+2. Otherwise compute the exact plan; if its remainder is zero, proceed (no drain).
+3. Otherwise use every local source once: drain this tree's retirement queue, take what the reserve and its inbox offer,
+   then compute the exact plan again, once (the drain can remove the sharing that made copies necessary); if the
+   remainder is now zero, proceed.
+4. Return to base every whole free extent beyond the exact slot need, then ask base once for exactly the remainder:
+   granted -> proceed; refused -> PIECE_ERR_NOMEM, nothing changed.
+Tests: I's and A(1)'s traces assert the contract (refused during the race, the identical retry succeeds, nothing
+latched); J and K test steps 4, 2 and 1. piece_fund_exact's loop and its predicates are deleted (a deletion round).
+
