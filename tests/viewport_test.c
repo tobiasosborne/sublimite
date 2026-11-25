@@ -1,0 +1,351 @@
+#include "support/viewport_flat.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#define TEXT(s) (const uint8_t *)(s), (sizeof(s) - 1)
+
+static viewport_intent intent(viewport_action action, uint64_t caret, uint64_t mark)
+{
+    return (viewport_intent){.key = {1, 2, 3}, .serial = 1, .action = action,
+        .selection = {caret, mark, UINT64_MAX}};
+}
+
+static void selection(viewport_answer a, uint64_t caret, uint64_t mark, bool trailing)
+{
+    assert(a.selection.caret == caret);
+    assert(a.selection.mark == mark);
+    assert(a.top.visual_end == trailing);
+}
+
+static void actions(viewport_motion *m)
+{
+    /* Three whole rows at ten pixels apiece. */
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 30, 10, &frame));
+    viewport_flat f = flat_open(TEXT("  foo.bar \r\n12345\nxy\nfinal\n"), 0);
+    const struct {
+        viewport_action action;
+        uint64_t from, to;
+    } motions[] = {
+        {VIEWPORT_LEFT, 12, 10}, {VIEWPORT_RIGHT, 10, 12},
+        {VIEWPORT_WORD_LEFT, 10, 6}, {VIEWPORT_WORD_RIGHT, 0, 5},
+        {VIEWPORT_WORD_RIGHT, 10, 12}, {VIEWPORT_HOME, 4, 2},
+        {VIEWPORT_HOME, 2, 0}, {VIEWPORT_END, 4, 10},
+        {VIEWPORT_DOC_HOME, 10, 0}, {VIEWPORT_DOC_END, 4, 27},
+        {VIEWPORT_UP, 16, 4}, {VIEWPORT_DOWN, 4, 16},
+        {VIEWPORT_PAGE_DOWN, 4, 25}, {VIEWPORT_PAGE_UP, 25, 4}
+    };
+    for (size_t i = 0; i < sizeof motions / sizeof *motions; ++i) {
+        viewport_intent in = intent(motions[i].action, motions[i].from, motions[i].from);
+        viewport_answer a = flat_motion(m, &f, in, frame, 1);
+        selection(a, motions[i].to, motions[i].to, false);
+        if (in.action == VIEWPORT_PAGE_DOWN)
+            assert(a.top.byte == 21);
+        if (in.action == VIEWPORT_PAGE_UP)
+            assert(a.top.byte == 0);
+    }
+
+    viewport_intent in = intent(VIEWPORT_LEFT, 4, 9);
+    selection(flat_motion(m, &f, in, frame, 1), 4, 4, false);
+    in.action = VIEWPORT_RIGHT;
+    selection(flat_motion(m, &f, in, frame, 1), 9, 9, false);
+    in.extend = true;
+    selection(flat_motion(m, &f, in, frame, 1), 5, 9, false);
+    in = intent(VIEWPORT_SELECT_WORD, 4, 4);
+    selection(flat_motion(m, &f, in, frame, 1), 5, 2, false);
+    in.selection.mark = 1;
+    selection(flat_motion(m, &f, in, frame, 1), 4, 1, false);
+    in = intent(VIEWPORT_SELECT_WORD, 10, 10);
+    selection(flat_motion(m, &f, in, frame, 1), 10, 10, false);
+    selection(flat_motion(m, &f, intent(VIEWPORT_SELECT_ALL, 4, 4), frame, 1), 27, 0, false);
+
+    size_t bytes = f.bytes;
+    in = intent(VIEWPORT_SELECT_LINE, 12, 3);
+    selection(flat_motion(m, &f, in, frame, 1), 12, 0, false);
+    in.selection.mark = 0;
+    selection(flat_motion(m, &f, in, frame, 1), 18, 0, false);
+    assert(f.bytes == bytes);
+    f.counted = 12; /* exact ranks and a select blocked after a known LF */
+    selection(flat_motion(m, &f, in, frame, 1), 18, 0, false);
+    assert(f.bytes - bytes == 6); /* scan only [12,18), no exact-bound rescan */
+    f.counted = 15;
+    bytes = f.bytes;
+    in = intent(VIEWPORT_SELECT_LINE, 12, 12);
+    selection(flat_motion(m, &f, in, frame, 1), 18, 12, false);
+    assert(f.bytes - bytes == 3); /* inexact select supplies prefix [0,15) */
+    f.counted = 0;
+    in = intent(VIEWPORT_SELECT_LINE, 15, 13);
+    selection(flat_motion(m, &f, in, frame, 1), 18, 12, false);
+
+    in = intent(VIEWPORT_RESTORE, 4, 2);
+    in.origin.top = (viewport_anchor){UINT64_MAX, 1, 17, true};
+    viewport_answer a = flat_motion(m, &f, in, frame, 1);
+    assert(a.top.byte == f.length && a.top.subrow_q8 == 17);
+    selection(a, 4, 2, true);
+    in.origin.top.byte = 12;
+    in.action = VIEWPORT_FOLLOW;
+    assert(flat_motion(m, &f, in, frame, 1).top.byte == 12);
+    in.action = VIEWPORT_SEEK_BYTE;
+    in.target = 14;
+    assert(flat_motion(m, &f, in, frame, 1).top.byte == 14);
+    in.action = VIEWPORT_SEEK_LINE;
+    in.target = 2;
+    f.counted = f.length;
+    assert(flat_motion(m, &f, in, frame, 1).top.byte == 18);
+    f.counted = 12;
+    viewport_port rank_port = {&f, flat_query};
+    viewport_motion_begin(m, &in, frame);
+    size_t credit = UTF8_GRAPHEME_BUDGET;
+    a = (viewport_answer){0};
+    assert(viewport_motion_step(m, &rank_port, &credit, &a) == VP_MORE && a.intent_serial == 0);
+    f.counted = f.length;
+    assert(viewport_motion_step(m, &rank_port, &credit, &a) == VP_DONE && a.top.byte == 18);
+    in.action = VIEWPORT_REFLOW;
+    in.selection.preferred_col = 7;
+    in.origin.top.subrow_q8 = 10 * 256 + 17;
+    a = flat_motion(m, &f, in, frame, 1);
+    assert(a.top.byte == 18 && a.top.subrow_q8 == 17 && a.selection.preferred_col == UINT64_MAX);
+    in.action = VIEWPORT_SCROLL_Q8;
+    in.origin.top.subrow_q8 = 17;
+    in.pixels_q8 = -18;
+    a = flat_motion(m, &f, in, frame, 1);
+    assert(a.top.byte == 0 && a.top.subrow_q8 == 10 * 256 - 1);
+    selection(a, 4, 2, true);
+    flat_close(&f);
+}
+
+static void seams(viewport_motion *m)
+{
+    /* LF at 0 blocks S; a four-byte scalar at 2S-1 shifts the next
+     * eligible seam to 2S+3, producing the S1 span of 2S+2. */
+    const size_t seam = 2 * FLAT_S + 3, len = seam + 4;
+    uint8_t *text = malloc(len);
+    assert(text);
+    memset(text, 'a', len);
+    text[0] = '\n';
+    memcpy(text + seam - 4, "\xf0\x9f\x98\x80", 4);
+    viewport_flat f = flat_open(text, len, 0);
+    assert(f.rows == 3 && f.row[1].byte == 1 && f.row[1].next == seam);
+    assert(f.row[2].approximate && f.row[2].byte == seam);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    selection(flat_motion(m, &f, intent(VIEWPORT_END, 2, 2), frame, 1), seam, seam, true);
+    f.window_cap = 3; /* Split a four-byte scalar even at large grants. */
+    size_t bytes = f.bytes, windows = f.calls[VP_WINDOW], rows = f.calls[VP_ROW];
+    viewport_intent in = intent(VIEWPORT_LEFT, seam, seam);
+    selection(flat_motion(m, &f, in, frame, 2), seam - 4, seam - 4, false);
+    assert(f.bytes - bytes <= FLAT_D + 2); /* D plus the prefix of one two-byte window */
+    assert(f.calls[VP_WINDOW] - windows <= f.bytes - bytes + 1); /* one metadata query */
+    assert(f.calls[VP_ROW] - rows == 1);
+    size_t ranks = f.calls[VP_LOGICAL_RANK], starts = f.calls[VP_LOGICAL_START];
+    bytes = f.bytes;
+    selection(flat_motion(m, &f, intent(VIEWPORT_HOME, seam + 1, seam + 1), frame, 2),
+              1, 1, false);
+    assert(f.calls[VP_LOGICAL_RANK] - ranks == 1 && f.calls[VP_LOGICAL_START] - starts == 1);
+    assert(f.bytes - bytes <= FLAT_D + 2); /* only the first display line's Home scan */
+    selection(flat_motion(m, &f, intent(VIEWPORT_WORD_LEFT, seam + 2, seam + 2), frame, 9), 1, 1, false);
+    selection(flat_motion(m, &f, intent(VIEWPORT_WORD_RIGHT, seam - 4, seam - 4), frame, 9), len, len, false);
+    selection(flat_motion(m, &f, intent(VIEWPORT_SELECT_WORD, seam, seam), frame, 9), len, 1, false);
+    flat_close(&f);
+
+    memset(text, 'a', len);
+    text[FLAT_S - 1] = '\r';
+    text[FLAT_S] = '\n';
+    f = flat_open(text, len, 0);
+    assert(f.row[0].end == FLAT_S - 1 && f.row[1].byte == FLAT_S + 1 && !f.row[1].approximate);
+    selection(flat_motion(m, &f, intent(VIEWPORT_RIGHT, FLAT_S - 1, FLAT_S - 1), frame, 2),
+              FLAT_S + 1, FLAT_S + 1, false);
+    flat_close(&f);
+
+    memset(text, 0x80, len);
+    f = flat_open(text, len, 0);
+    assert(f.row[1].byte == FLAT_S && f.row[1].approximate);
+    selection(flat_motion(m, &f, intent(VIEWPORT_LEFT, FLAT_S + 1, FLAT_S + 1), frame, 1),
+              FLAT_S, FLAT_S, false);
+    flat_close(&f);
+    f = flat_open(text, FLAT_S, 0);
+    assert(f.rows == 1 && f.row[0].next == UINT64_MAX);
+    flat_close(&f);
+
+    /* A combining cluster straddles a scalar-safe seam. The two pieces
+     * are legal display clusters on their respective sides of the fold. */
+    memset(text, 'a', len);
+    text[FLAT_S] = 0xcc;
+    text[FLAT_S + 1] = 0x81;
+    f = flat_open(text, FLAT_S + 2, 0);
+    selection(flat_motion(m, &f, intent(VIEWPORT_RIGHT, FLAT_S - 1, FLAT_S - 1), frame, 3),
+              FLAT_S, FLAT_S, false);
+    selection(flat_motion(m, &f, intent(VIEWPORT_RIGHT, FLAT_S, FLAT_S), frame, 3),
+              FLAT_S + 2, FLAT_S + 2, false);
+    flat_close(&f);
+    free(text);
+}
+
+static void unicode(viewport_motion *m)
+{
+    /* The pin's horizontal sequence: tab, wide CJK, combining sequence,
+     * emoji ZWJ cluster, malformed standalone byte. */
+    viewport_flat f = flat_open(TEXT("\t中é👩‍💻\xff\n123456789"), 0);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    const uint64_t edges[] = {0, 1, 4, 7, 18, 19};
+    for (size_t i = 1; i < sizeof edges / sizeof *edges; ++i) {
+        viewport_intent in = intent(VIEWPORT_RIGHT, edges[i - 1], edges[i - 1]);
+        selection(flat_motion(m, &f, in, frame, 1), edges[i], edges[i], false);
+        in = intent(VIEWPORT_LEFT, edges[i], edges[i]);
+        selection(flat_motion(m, &f, in, frame, 2), edges[i - 1], edges[i - 1], false);
+    }
+    flat_close(&f);
+}
+
+static void affinity(viewport_motion *m)
+{
+    viewport_flat f = flat_open(TEXT("abcdef\n123456789\nxyz"), 3);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 30, 30, 10, &frame));
+    viewport_intent in = intent(VIEWPORT_END, 1, 1);
+    in.origin.wrap = true;
+    viewport_answer a = flat_motion(m, &f, in, frame, 2);
+    selection(a, 3, 3, true);
+    in.origin.top = a.top;
+    in.selection = a.selection;
+    in.action = VIEWPORT_HOME;
+    selection(flat_motion(m, &f, in, frame, 2), 0, 0, false);
+    in.origin.top.visual_end = false;
+    selection(flat_motion(m, &f, in, frame, 2), 3, 3, false);
+
+    /* A continuation can carry synthetic indentation in its certificate. */
+    f.row[1].indent = 1;
+    in.action = VIEWPORT_UP;
+    in.selection.caret = in.selection.mark = 5;
+    in.extend = true;
+    a = flat_motion(m, &f, in, frame, 2);
+    selection(a, 3, 5, true);
+    assert(a.selection.preferred_col == 3);
+    in.action = VIEWPORT_DOWN;
+    in.origin.top = a.top;
+    in.selection = a.selection;
+    selection(flat_motion(m, &f, in, frame, 2), 5, 5, false);
+
+    /* One Q8 unit obscures the first row and exposes a bottom overscan row.
+     * The page consists of the two whole rows between them. */
+    in = intent(VIEWPORT_PAGE_DOWN, 0, 0);
+    in.origin.wrap = true;
+    in.origin.top.subrow_q8 = 1;
+    assert(viewport_plan(in.origin.top, 30, 30, 10, &frame));
+    size_t hops = f.row_hops;
+    a = flat_motion(m, &f, in, frame, 2);
+    assert(a.top.byte == 7 && a.selection.caret == 7 && f.row_hops - hops == 4);
+    flat_close(&f);
+}
+
+static void frame_math(void)
+{
+    viewport_frame f;
+    viewport_anchor a = {.subrow_q8 = 129}; /* half a pixel plus one Q8 unit */
+    assert(viewport_plan(a, 80, 20, 10, &f) && f.layout_rows == 3 && f.origin_y_q8 == -129);
+    uint32_t row, within;
+    assert(viewport_pixel_row(&f, 0, &row, &within) && row == 0 && within == 129);
+    assert(viewport_pixel_row(&f, 10 * 256 - 129, &row, &within) && row == 1 && within == 0);
+    assert(viewport_pixel_row(&f, 20 * 256 - 1, &row, &within) && row == 2 && within == 128);
+    assert(!viewport_pixel_row(&f, 20 * 256, &row, &within));
+    assert(!viewport_pixel_row(&f, -1, &row, &within));
+    assert(!viewport_plan(a, 80, 20, 0, &f));
+    assert(!viewport_plan(a, 80, 20, UINT32_MAX, &f));
+    assert(viewport_plan(a, 0, 20, 10, &f) && f.layout_rows == 0);
+    assert(viewport_rebase(5, 5, 0, 2, false) == 5);
+    assert(viewport_rebase(5, 5, 0, 2, true) == 7);
+    assert(viewport_rebase(7, 5, 2, 1, false) == 6);
+    assert(viewport_rebase(6, 5, 2, 1, true) == 6);
+    assert(viewport_rebase(8, 5, 2, 1, false) == 7);
+    assert(viewport_wrap_default("dir.c/README") && viewport_wrap_default("C:\\dir.c\\.notes"));
+    assert(viewport_wrap_default("notes.tex") && !viewport_wrap_default("notes.md.c"));
+}
+
+static void witness(viewport_motion *m)
+{
+    /* R8 cold PageUp: three fully visible rows per operand, plus overscan
+     * in R. Delay each request independently (R6's viewport boundary). */
+    viewport_flat f = flat_open(TEXT("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\n"), 3);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 30, 30, 10, &frame));
+    f.delay = true;
+    viewport_intent in = intent(VIEWPORT_PAGE_UP, 24, 24);
+    in.origin.wrap = true;
+    in.origin.top.byte = 21;
+    viewport_answer a = flat_motion(m, &f, in, frame, 1);
+    selection(a, 15, 15, false);
+    assert(a.top.byte == 12 && f.row_hops == 6 && f.row_hops <= 2 * frame.layout_rows);
+    assert(f.calls[VP_NEIGHBOR] == 4 && f.bytes == 0); /* two operands, one stall each */
+
+    /* Leave a read pending on the prior intent, then let the owner retire it. */
+    viewport_port port = {&f, flat_query};
+    viewport_motion_begin(m, &in, frame);
+    size_t credit = 1;
+    viewport_answer pending = a;
+    assert(viewport_motion_step(m, &port, &credit, &pending) == VP_MORE);
+    assert(f.waiting && pending.top.byte == a.top.byte);
+    f.waiting = false;
+
+    /* R1/R2/R24: L5's transformed origin and committed caret pass through
+     * together, including after supersession. R25: MORE leaves output alone. */
+    in = intent(VIEWPORT_FOLLOW, 27, 27);
+    in.serial = 2;
+    in.origin.top.byte = viewport_rebase(21, 15, 0, 3, false);
+    a = flat_motion(m, &f, in, frame, 1);
+    assert(a.top.byte == 24 && a.selection.caret == 27);
+    viewport_state state = in.origin;
+    viewport_selection installed = {0};
+    viewport_intent current = in;
+    ++current.serial;
+    assert(!viewport_accept(&state, &installed, &current, &a) && installed.caret == 0);
+    current = in;
+    ++current.key.text;
+    assert(!viewport_accept(&state, &installed, &current, &a) && installed.caret == 0);
+    assert(viewport_accept(&state, &installed, &in, &a) && installed.caret == 27);
+    current = in;
+    current.origin.wrap = true;
+    a.top.hscroll_cols = 9;
+    a.selection.preferred_col = 4;
+    assert(viewport_accept(&state, &installed, &current, &a));
+    assert(state.wrap && state.top.hscroll_cols == 0 && installed.preferred_col == UINT64_MAX);
+    a = flat_motion(m, &f, in, frame, 1);
+
+    /* R7 and S4's 10 GiB gate at the viewport boundary. Supply a length
+     * without storage so an accidental text/rank scan cannot pass. */
+    size_t extent = (size_t)(UINT64_C(10) << 30);
+    viewport_flat virtual_file = {.length = extent};
+    selection(flat_motion(m, &virtual_file, intent(VIEWPORT_DOC_END, 0, 0), frame, 1),
+              extent, extent, false);
+    selection(flat_motion(m, &virtual_file, intent(VIEWPORT_SELECT_ALL, 0, 0), frame, 1),
+              extent, 0, false);
+    assert(!virtual_file.bytes && !virtual_file.calls[VP_LOGICAL_RANK]);
+    assert(virtual_file.calls[VP_WINDOW] == 2 && !virtual_file.calls[VP_ROW]);
+
+    /* S9: same intent after unrelated work, with fresh provider and cursor. */
+    viewport_flat fresh = flat_open(f.text, f.length, f.wrap_cols);
+    viewport_motion *new_cursor = malloc(viewport_motion_size());
+    assert(new_cursor);
+    viewport_answer b = flat_motion(new_cursor, &fresh, in, frame, UTF8_GRAPHEME_BUDGET);
+    assert(a.top.byte == b.top.byte && a.top.subrow_q8 == b.top.subrow_q8);
+    assert(a.selection.caret == b.selection.caret && a.top.visual_end == b.top.visual_end);
+    free(new_cursor);
+    flat_close(&fresh);
+    flat_close(&f);
+}
+
+int main(void)
+{
+    viewport_motion *m = malloc(viewport_motion_size());
+    assert(m);
+    frame_math();
+    actions(m);
+    seams(m);
+    unicode(m);
+    affinity(m);
+    witness(m);
+    free(m);
+    puts("viewport_test: ok");
+    return 0;
+}
