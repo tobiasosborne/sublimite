@@ -85,6 +85,16 @@ branches: push each at every pause or session end; delete the remote branch once
     - R3-C: recover classifies EACCES/NOENT as a mismatch.
     Then a re-check limited to MF-E, R3-A, R3-C and a rerun of all mutants; then the advisor's single owner read;
     then the landing.
+  - L2-1 ROUND 5 (round-2 worker): MF-F (file_check's source comparison for mapped only; Keep must not make the
+    buffer deaf); R4-A (a pre-rename observation, no errno trusted); the R4l rule in file.h; and an ENUMERATION
+    table of every source and destination check site, with its backing kinds and its killing test, fixing any
+    third MF-E-class site in this round. Then the reviewer verifies the table, the three fixes and the mutants;
+    then the advisor's single owner read; then the landing.
+  - Wave 1 deletion review question (advisor): does a copy buffer need to hold the original fd after the load? If
+    not, close it at OPEN_READY.
+  - Viewport/layout r2: SIGNED IN SUBSTANCE. Errata E1–E4 (S from G5, not the slice: candidate S = 32,768) are in
+    docs/briefs/wave2-viewport-layout-errata.md, for Astra after the render spec. A29 is entered after that pass.
+    Then Sol implements viewport (wip, Astra review, advisor owner read). Layout waits for render and font.
   - v2-4xk (P2, Claude, after L2-1, blocks the Wave 1 exit and savectl): the changed side named, plus named tests for
     the 15 round-3 survivors and X12.
   - L5 SPEC SIGNED (2026-11-25 20:25). Erratum placement and the three L5-brief corrections are recorded in
