@@ -6,8 +6,13 @@
 #include <stdint.h>
 
 /* A29: S is the nominal byte grid and D the conservative bound on one
- * display line, including any terminator. Layout certifies the aligned
- * seams. Viewport consumes the certificates without recomputing them. */
+ * display line including any terminator. Layout uses the emitter's rows
+ * in both modes. BOF and bytes after LF start display lines. A raw grid
+ * point strictly between BOF and EOF is eligible when the preceding S
+ * bytes contain no LF. Align a cut inside a valid scalar to its end,
+ * coalesce a cut between CR and LF with the hard start after LF, and
+ * suppress synthetic starts at EOF. Invalid bytes are separate units.
+ * Every certified row start is an artificial segmentation boundary. */
 enum { VIEWPORT_GRID_BYTES = 32768, VIEWPORT_DISPLAY_MAX = 2 * VIEWPORT_GRID_BYTES + 4 };
 
 typedef enum {
@@ -29,13 +34,14 @@ typedef struct viewport_anchor {
  * selects its successor. A hard terminator occupies [end,next), with
  * newline set for LF and CRLF. The terminal row has next == UINT64_MAX
  * and end at EOF, including an empty row after a final LF. Every other
- * row advances. Each byte start is a certified segmentation boundary.
- * line_start is the display-line start. approximate marks a synthetic
- * start and still describes exact geometry. continuation marks a soft
- * wrap. col, end_column and indent are cell counts. A clipped row may
+ * row advances. Each row byte start is a certified segmentation boundary.
+ * line_start is the display-line start. approximate stays true throughout
+ * a synthetically started display line, including its soft continuations.
+ * continuation marks a soft wrap. col and end_column count from line_start.
+ * indent is synthetic continuation cells with no bytes. A clipped row may
  * have end_column == UINT64_MAX if its final column was not computed.
- * ordinal is publication-relative. exact_line is a zero-based logical
- * line rank, usable only when has_exact_line is true. */
+ * ordinal starts at zero in the publication. exact_line is a zero-based
+ * logical line rank, usable only when has_exact_line is true. */
 typedef struct viewport_row_cert {
     uint64_t byte, end, next, line_start, col, end_column, indent, ordinal, exact_line;
     bool has_exact_line, newline, continuation, approximate;
@@ -43,8 +49,12 @@ typedef struct viewport_row_cert {
 typedef struct viewport_key {
     uint64_t buffer, text, geometry;
 } viewport_key;
-/* Byte offsets within the bound snapshot. Either selection end is a
- * cluster boundary or the walker treats it as one. UINT64_MAX means
+/* Selection endpoints may be any byte offsets in [0,length]. A content
+ * walk starting on a continuation byte checks at most three preceding
+ * bytes with the strict decoder (E10). If a valid scalar spans the
+ * endpoint, a forward walk starts at its end and a backward walk at
+ * its start. A scalar boundary inside a cluster requires no correction.
+ * Stray continuations remain single invalid units. UINT64_MAX means
  * preferred_col is unset. Vertical movement latches a screen column. */
 typedef struct viewport_selection {
     uint64_t caret, mark, preferred_col;
@@ -57,7 +67,9 @@ typedef struct viewport_state {
  * REFLOW carries the issuer's selection as-is (E7): the issuer clears
  * preferred_col on a width change. SCROLL_Q8 uses signed pixels_q8.
  * extend retains the mark for movement. origin.top.byte is a leading
- * scroll anchor, and origin.top.visual_end is the caret's affinity. */
+ * scroll anchor, and origin.top.visual_end is the caret's affinity.
+ * Word walks classify a cluster by its first scalar (E9). A forward
+ * word walk only steps into a cluster after accepting its class. */
 typedef struct viewport_intent {
     viewport_key key;
     uint64_t serial, target;
@@ -106,34 +118,45 @@ typedef struct viewport_evidence {
     uint64_t count; bool exact;      /* rank or select prefix count; select offset in off */
 } viewport_evidence;
 /* query receives an immutable request and a positive remaining grant.
- * On DONE it fills the fields below. Other fields are unused.
+ * The request, result and credits pointer are call-local. The port owns
+ * pending I/O and backing errors. It serves validated resident bytes
+ * and certificates for the intent's text and geometry without recursively
+ * starting an emitter. On DONE fill the fields below.
  *
  * VP_WINDOW: bytes, off and len describe a nonempty borrowed interval
- * inside the snapshot covering the requested byte (strictly below EOF).
- * It may begin before that byte. The bytes stay valid through consumption
- * in the current step, at least until the next query. The cursor retains
- * any needed bytes before yielding or issuing another query.
- * VP_ROW: row and screen_column for the requested byte and affinity.
+ * covering the requested byte below EOF. It may begin before that byte.
+ * Viewport copies what it needs before another query or step return.
+ * VP_ROW: row and screen_column for any byte in [0,length], including
+ * interior bytes and EOF. The affinity chooses the row at a shared seam.
+ * An interior scalar or cluster byte uses the cluster's starting column.
+ * All bytes of a terminator use the drawable end's column. An empty
+ * terminal row contributes column zero. Convert a display-line column
+ * to screen cells by subtracting row.col and adding row.indent. Supply
+ * the column even when a clip certificate omits its end_column.
  * VP_NEIGHBOR: row after the signed displacement from that byte and
  * affinity, clamped to the first or terminal row.
  * VP_COLUMN: point, the cluster boundary at or before the screen column
  * on the certified row identified by row_byte, clamped to its drawable
- * interval. The column is relative to the text area's left edge.
- * VP_LOGICAL_RANK: count is the LF count before byte (EOF allowed), with
- * exact indicating whether that rank is exact.
+ * interval. Choose the earliest boundary at an exact coincident column,
+ * including zero-width clusters. A column past the drawable end maps
+ * to row.end.
+ * VP_LOGICAL_RANK: count is the LF count before byte (EOF allowed) when
+ * exact is true, otherwise a lower bound.
  * VP_LOGICAL_START: off and count give the exact logical start and rank
  * when exact is true (EOF and its actual rank past the last line). On
- * inexact evidence they describe the known prefix ending at off.
+ * inexact evidence from trusted backing, off is the end of the known
+ * prefix and count is the exact LF count in [0,off), below the requested
+ * line.
  *
- * Value evidence is copied. On MORE or WAIT the port supplies no usable
- * output and keeps any resumable service state for the same request.
- * MORE resumes on a work slice. WAIT resumes on a driver wake for new
- * evidence. The port debits its own work, including at least one credit
- * per delivered window byte. This byte debit includes retaining the
- * returned window in the motion cursor. For other work the port charges
- * one credit per byte operation, summary/directory visit or cell operated
- * on, or per bounded metadata answer. An indivisible indexed rank/select
- * is driver work under the signed S4 bound. Never debit below zero. */
+ * The cursor copies value evidence. On MORE or WAIT there is no usable
+ * output. The port retains any pending request by value and resumes it
+ * on the next slice or evidence wake respectively. Debit at least len
+ * credits on the successful WINDOW call itself, including retention
+ * in the cursor. For other work debit one credit per byte operation,
+ * summary or directory visit, cell operation, or bounded metadata answer.
+ * Perform at most one new indivisible piece rank/select of O(H+K) per
+ * slice (S4). Yield or serve retained results for further requests.
+ * Never debit below zero. */
 typedef struct viewport_port {
     void *ctx;
     viewport_progress (*query)(void *, const viewport_request *,
@@ -145,23 +168,30 @@ size_t viewport_motion_size(void);
 
 /* Starts or replaces a motion in that storage. in is readable, frame has
  * the destination geometry prepared by viewport_plan, and length is the
- * bound snapshot's byte length (including zero). Selection ends are in
- * [0,length]. Copies the inputs. Clamps the incoming top for every action.
- * A REFLOW origin may carry a saved remainder from a taller row. Writes
- * only the cursor. Retire any outstanding port operation for a replaced
- * intent before reusing its provider state. */
+ * bound text's length in [0,2^60] (the piece length bound). On actions
+ * other than REFLOW the frame and normalized origin have the same metrics.
+ * REFLOW may carry an old remainder from a taller row in the intent.
+ * Copies the inputs, clamps the incoming top and writes only the cursor.
+ * Retire any outstanding port operation for a replaced intent before
+ * reusing its provider state. */
 void viewport_motion_begin(viewport_motion *, const viewport_intent *, viewport_frame, uint64_t length);
 
-/* Advances a begun cursor. port, credits and out are valid for the call,
- * with stable snapshot/geometry and matching provider state until DONE
- * or cancellation. Cursor work debits one credit per inspected, copied
- * or decoded byte operation, or reverse-summary visit. It can prepay a
- * split scalar across grants and caps decoding at the S4 per-step limit.
- * Zero credit performs no work and returns MORE. Writes out only on
- * DONE. MORE keeps the cursor for another grant. WAIT leaves out
- * untouched and suspends at the same request until evidence changes.
- * In particular an inexact SEEK_LINE returns WAIT. The driver issues
- * at most one indexed attempt per new rank observation. */
+/* Advances a begun cursor. port, credits and out are valid for the call.
+ * The cursor holds offsets and retained byte copies. It holds no snapshot
+ * reference and no window borrow lives past the step that consumes it.
+ * Use any validated snapshot of the intent's text serial with matching
+ * geometry. After a rank WAIT the driver resumes only with a snapshot of
+ * that same text serial and newer line knowledge, answering the pending
+ * request from it. This is Q10's late-rank rule applied to the port. The
+ * driver issues one indexed attempt per new rank observation.
+ *
+ * Cursor work debits one credit per inspected, copied or decoded byte
+ * operation, or reverse-summary visit. It may prepay a split scalar across
+ * grants and caps per-step decoding at 4,096 bytes (S4). Zero credit
+ * performs no work and returns MORE. DONE writes a placement and selection
+ * proposal for layout and L5. MORE retains the cursor for the next grant.
+ * WAIT leaves out untouched and suspends the request until the driver
+ * obtains new evidence. In particular an inexact SEEK_LINE returns WAIT. */
 viewport_progress viewport_motion_step(viewport_motion *, const viewport_port *,
                                        size_t *credits, viewport_answer *);
 

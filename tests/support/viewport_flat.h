@@ -14,7 +14,7 @@ typedef struct {
     uint64_t column;
 } viewport_flat_byte;
 
-typedef enum { FLAT_READY, VIEWPORT_DISPLAY_MAXELAYED, FLAT_COLUMN } flat_query_state;
+typedef enum { FLAT_READY, FLAT_DELAYED, FLAT_COLUMN } flat_query_state;
 
 typedef struct {
     const uint8_t *text;
@@ -201,6 +201,10 @@ static inline viewport_progress flat_column_query(viewport_flat *f, const viewpo
             break;
         f->column_cursor = next;
     }
+    if (row.byte == row.end) {
+        --*credit;
+        ++f->work;
+    }
     e->point = f->column_cursor;
     return VP_DONE;
 }
@@ -214,7 +218,7 @@ static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
     flat_query_state previous = f->state;
     if (f->delay && previous == FLAT_READY) {
         f->pending = *r;
-        f->state = VIEWPORT_DISPLAY_MAXELAYED;
+        f->state = FLAT_DELAYED;
         return VP_MORE;
     }
     if (previous != FLAT_READY)

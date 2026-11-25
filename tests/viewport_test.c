@@ -113,14 +113,6 @@ static void actions(viewport_motion *m)
     in.target = 2;
     f.counted = f.length;
     assert(flat_motion(m, &f, in, frame, 1).top.byte == 18);
-    f.counted = 12;
-    viewport_port rank_port = {&f, flat_query};
-    viewport_motion_begin(m, &in, frame, f.length);
-    size_t credit = UTF8_GRAPHEME_BUDGET;
-    a = (viewport_answer){0};
-    assert(viewport_motion_step(m, &rank_port, &credit, &a) == VP_WAIT && a.intent_serial == 0);
-    f.counted = f.length;
-    assert(viewport_motion_step(m, &rank_port, &credit, &a) == VP_DONE && a.top.byte == 18);
     in.action = VIEWPORT_REFLOW;
     in.selection.preferred_col = 7;
     in.origin.top.subrow_q8 = 10 * 256 + 17;
@@ -313,7 +305,7 @@ static void witness(viewport_motion *m)
     size_t credit = 1;
     viewport_answer pending = a;
     assert(viewport_motion_step(m, &port, &credit, &pending) == VP_MORE);
-    assert(f.state == VIEWPORT_DISPLAY_MAXELAYED && pending.top.byte == a.top.byte);
+    assert(f.state == FLAT_DELAYED && pending.top.byte == a.top.byte);
     f.state = FLAT_READY;
 
     /* R1/R2/R24: L5's transformed origin and committed caret pass through
@@ -621,9 +613,9 @@ static void arrow_cost(viewport_motion *m)
     } cases[] = {
         {VIEWPORT_LEFT, at, at - 1, at - 1, 1},
         {VIEWPORT_RIGHT, at, at + 1, at + 1, 1},
-        {VIEWPORT_WORD_LEFT, at + 2, at - 1, at - 1, 4},
-        {VIEWPORT_WORD_RIGHT, at - 1, at + 2, at + 2, 4},
-        {VIEWPORT_SELECT_WORD, at, at + 2, at - 1, 5}
+        {VIEWPORT_WORD_LEFT, at + 2, at - 1, at - 1, 3},
+        {VIEWPORT_WORD_RIGHT, at - 1, at + 2, at + 2, 3},
+        {VIEWPORT_SELECT_WORD, at, at + 2, at - 1, 3}
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; ++i) {
         size_t bytes = f.bytes, decoded = decoder_bytes;
@@ -685,18 +677,10 @@ static void evidence_wait(viewport_motion *m)
     viewport_flat f = flat_open(TEXT("a\nb"), 0);
     viewport_frame frame;
     assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
-    viewport_intent in = intent(VIEWPORT_SEEK_LINE, 0, 0);
-    in.target = 1;
-    f.counted = 0;
-    viewport_motion_begin(m, &in, frame, f.length);
-    viewport_port port = {&f, flat_query};
-    viewport_answer a = {0};
-    size_t credit = UTF8_GRAPHEME_BUDGET;
-    viewport_progress progress = viewport_motion_step(m, &port, &credit, &a);
-    assert(progress == VP_WAIT);
-    assert(credit && !a.intent_serial && f.calls[VP_LOGICAL_START] == 1);
-    f.counted = f.length;
-    assert(viewport_motion_step(m, &port, &credit, &a) == VP_DONE && a.top.byte == 2);
+    viewport_intent in;
+    viewport_port port;
+    viewport_answer a;
+    size_t credit;
     const viewport_query blocked[] = {VP_ROW, VP_WINDOW};
     for (size_t i = 0; i < sizeof blocked / sizeof *blocked; ++i) {
         waiting_port wait = {&f, blocked[i], false};
@@ -725,6 +709,181 @@ static void follow_clamp(viewport_motion *m)
     assert(a.top.byte == 1);
 }
 
+/* Astra's rejected cluster has one punctuation lead and 4,000
+ * two-byte combining units. Only the initial ASCII a is accepted. */
+static void rejected_cluster(viewport_motion *m, viewport_action action)
+{
+    enum { COPIES = 4000 };
+    const char mark[] = "\xcc\x81";
+    uint8_t text[sizeof "a.z" - 1 + COPIES * (sizeof mark - 1)];
+    text[0] = 'a';
+    text[1] = '.';
+    for (size_t i = 2; i < sizeof text - 1; i += sizeof mark - 1)
+        memcpy(text + i, mark, sizeof mark - 1);
+    text[sizeof text - 1] = 'z';
+    viewport_flat f = flat_open(text, sizeof text, 0);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    size_t before = decoder_bytes;
+    viewport_intent in = intent(action, 0, 0);
+    selection(flat_motion(m, &f, in, frame, UTF8_GRAPHEME_BUDGET),
+              1, action == VIEWPORT_SELECT_WORD ? 0 : 1, false);
+    size_t consumed = decoder_bytes - before;
+    if (consumed != 1)
+        fprintf(stderr, "decoder consumed %zu bytes, expected the accepted ASCII byte\n", consumed);
+    assert(consumed == 1);
+    flat_close(&f);
+}
+
+static void rejected_word(viewport_motion *m) { rejected_cluster(m, VIEWPORT_WORD_RIGHT); }
+static void rejected_select(viewport_motion *m) { rejected_cluster(m, VIEWPORT_SELECT_WORD); }
+
+static void synthetic_proof(viewport_motion *m, size_t wrap)
+{
+    const char mark[] = "\xcc\x81";
+    uint8_t text[VIEWPORT_GRID_BYTES + sizeof mark - 1];
+    memset(text, 'a', VIEWPORT_GRID_BYTES);
+    memcpy(text + VIEWPORT_GRID_BYTES, mark, sizeof mark - 1);
+    viewport_flat f = flat_open(text, sizeof text, wrap);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    viewport_intent in = intent(VIEWPORT_LEFT, sizeof text, sizeof text);
+    in.origin.wrap = wrap != 0;
+    size_t before = decoder_bytes;
+    selection(flat_motion(m, &f, in, frame, UTF8_GRAPHEME_BUDGET),
+              VIEWPORT_GRID_BYTES, VIEWPORT_GRID_BYTES, false);
+    assert(decoder_bytes - before == sizeof mark - 1);
+    assert(f.calls[VP_ROW] == 1);
+    flat_close(&f);
+}
+
+static void synthetic_clip(viewport_motion *m) { synthetic_proof(m, 0); }
+static void synthetic_wrap(viewport_motion *m) { synthetic_proof(m, 80); }
+
+static void active_row_proof(viewport_motion *m)
+{
+    enum { COPIES = 4000 }; /* Astra's two-byte units, one per soft row. */
+    const char letter[] = "\xc3\xa9";
+    uint8_t text[COPIES * (sizeof letter - 1)];
+    for (size_t i = 0; i < sizeof text; i += sizeof letter - 1)
+        memcpy(text + i, letter, sizeof letter - 1);
+    viewport_flat f = flat_open(text, sizeof text, 1);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 1, 20, 10, &frame));
+    viewport_intent in = intent(VIEWPORT_LEFT, sizeof text, sizeof text);
+    in.origin.wrap = true;
+    size_t before = decoder_bytes;
+    uint64_t last = sizeof text - (sizeof letter - 1);
+    selection(flat_motion(m, &f, in, frame, UTF8_GRAPHEME_BUDGET), last, last, false);
+    size_t consumed = decoder_bytes - before;
+    if (consumed != sizeof letter - 1)
+        fprintf(stderr, "decoder consumed %zu bytes for a %zu-byte LEFT\n", consumed, sizeof letter - 1);
+    assert(consumed == sizeof letter - 1);
+    assert(f.calls[VP_ROW] == 1);
+    flat_close(&f);
+}
+
+static void newer_rank(viewport_motion *m)
+{
+    const uint8_t original[] = "a\nb";
+    const uint8_t newer[] = "a\nb";
+    viewport_flat first = flat_open(original, sizeof original - 1, 0);
+    viewport_flat second = flat_open(newer, sizeof newer - 1, 0);
+    first.counted = 0; /* Frozen rank knowledge of the original snapshot. */
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    viewport_intent in = intent(VIEWPORT_SEEK_LINE, 0, 0);
+    in.target = 1;
+    viewport_motion_begin(m, &in, frame, first.length);
+    viewport_port port = {&first, flat_query};
+    viewport_answer a = {0};
+    size_t credit = UTF8_GRAPHEME_BUDGET;
+    assert(viewport_motion_step(m, &port, &credit, &a) == VP_WAIT);
+    assert(a.intent_serial == 0 && first.calls[VP_LOGICAL_START] == 1 && first.counted == 0);
+    flat_close(&first); /* Release the old view before the Q10 wake. */
+    port.ctx = &second;
+    assert(viewport_motion_step(m, &port, &credit, &a) == VP_DONE && a.top.byte == 2);
+    assert(a.key.text == in.key.text && a.intent_serial == in.serial &&
+           second.calls[VP_LOGICAL_START] == 1 && !second.bytes);
+    flat_close(&second);
+}
+
+static void interior_walk(viewport_motion *m, const uint8_t *text, size_t len)
+{
+    viewport_flat f = flat_open(text, len, 0);
+    f.window_cap = 1; /* Force the scalar probe to resume across borrows. */
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    viewport_intent in = intent(VIEWPORT_RIGHT, 1, 1);
+    selection(flat_motion(m, &f, in, frame, 1), len, len, false);
+    in.action = VIEWPORT_LEFT;
+    selection(flat_motion(m, &f, in, frame, 1), 0, 0, false);
+    in.action = VIEWPORT_WORD_RIGHT;
+    selection(flat_motion(m, &f, in, frame, 1), len, len, false);
+    in.action = VIEWPORT_WORD_LEFT;
+    selection(flat_motion(m, &f, in, frame, 1), 0, 0, false);
+    flat_close(&f);
+}
+
+static void interior_emoji(viewport_motion *m)
+{
+    interior_walk(m, TEXT("\xf0\x9f\x98\x80")); /* U+1F600 */
+}
+
+static void interior_paste(viewport_motion *m)
+{
+    /* A paste of E2 before the pre-existing stray bytes makes U+20AC.
+     * The insertion endpoint is the gap at byte one. */
+    uint8_t text[] = {0, 0x82, 0xac};
+    assert(!utf8_decode(text + 1, sizeof text - 1).valid);
+    text[0] = 0xe2;
+    interior_walk(m, text, sizeof text);
+}
+
+static void scalar_edges(viewport_motion *m)
+{
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    viewport_flat f = flat_open(TEXT("x\xf0\x9f\x98\x80" "z"), 0);
+    viewport_intent in = intent(VIEWPORT_RIGHT, 2, 2);
+    selection(flat_motion(m, &f, in, frame, 1), 6, 6, false);
+    in.action = VIEWPORT_LEFT;
+    selection(flat_motion(m, &f, in, frame, 1), 0, 0, false);
+    /* Collapse to a chosen end without another cluster move. */
+    in.selection.mark = 6;
+    selection(flat_motion(m, &f, in, frame, 1), 1, 1, false);
+    flat_close(&f);
+
+    f = flat_open(TEXT("\x82\xac" "x"), 0);
+    in = intent(VIEWPORT_RIGHT, 1, 1);
+    selection(flat_motion(m, &f, in, frame, 1), 2, 2, false);
+    flat_close(&f);
+}
+
+static void interior_columns(void)
+{
+    /* The orphan combining mark adds zero cells. b ends at byte 3
+     * before CRLF, then a four-byte emoji starts at byte 5. */
+    viewport_flat f = flat_open(TEXT("\xcc\x81" "b\r\n\xf0\x9f\x98\x80z\n"), 0);
+    const struct { uint64_t byte, row, column; } cases[] = {
+        {1, 0, 0}, {3, 0, 1}, {4, 0, 1}, {7, 5, 0}, {11, 11, 0}
+    };
+    viewport_evidence e;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; ++i) {
+        viewport_request q = {.kind = VP_ROW, .as.row = {cases[i].byte, false}};
+        size_t credit = 1;
+        assert(flat_query(&f, &q, &credit, &e) == VP_DONE);
+        assert(!credit && e.row.byte == cases[i].row && e.screen_column == cases[i].column);
+    }
+    viewport_request q = {.kind = VP_COLUMN, .as.column = {0, 0}};
+    size_t credit = 1;
+    assert(flat_query(&f, &q, &credit, &e) == VP_DONE && e.point == 0 && !credit);
+    q.as.column.row_byte = f.length;
+    credit = 1;
+    assert(flat_query(&f, &q, &credit, &e) == VP_DONE && e.point == f.length && !credit);
+    flat_close(&f);
+}
+
 int main(int argc, char **argv)
 {
     viewport_motion *m = malloc(viewport_motion_size());
@@ -734,7 +893,11 @@ int main(int argc, char **argv)
         {"witness", witness}, {"home", home_review}, {"reflow", reflow_review},
         {"scroll", scroll_review}, {"decoder", decoder_review}, {"reverse", reverse_review},
         {"grids", grids_review}, {"page", page_review}, {"empty", empty_snapshot},
-        {"arrows", arrow_cost}, {"proof", proof_context}, {"rows", port_rows}, {"wait", evidence_wait}, {"follow", follow_clamp}
+        {"arrows", arrow_cost}, {"proof", proof_context}, {"rows", port_rows}, {"wait", evidence_wait},
+        {"follow", follow_clamp}, {"rejected-word", rejected_word}, {"rejected-select", rejected_select},
+        {"synthetic-clip", synthetic_clip}, {"synthetic-wrap", synthetic_wrap}, {"active-proof", active_row_proof},
+        {"rank-wake", newer_rank}, {"emoji-endpoint", interior_emoji}, {"paste-endpoint", interior_paste},
+        {"scalar-edges", scalar_edges}
     };
     bool matched = argc == 1;
     if (argc == 1 || (argc == 2 && !strcmp(argv[1], "accept"))) {
@@ -742,6 +905,7 @@ int main(int argc, char **argv)
         frame_math();
         accept_review();
         flat_credit();
+        interior_columns();
     }
     for (size_t i = 0; i < sizeof cases / sizeof *cases; ++i)
         if (argc == 1 || (argc == 2 && !strcmp(argv[1], cases[i].name))) {
