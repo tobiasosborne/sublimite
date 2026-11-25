@@ -12,7 +12,7 @@ backends (raster XShm, GL 3.3). It uses the same required form as the earlier sp
 - the headers as text;
 - the v1 structure not carried;
 - a line budget.
-The G1 budget is 1.0 ms p50 / 2 ms p99, with UI slices of at most 0.5 ms (perf/01-perf-target.md §0.2).
+The G1 budget is 1.0 ms p50 / 2 ms p99, with UI slices of at most 0.5 ms (/home/tobias/Projects/sublimite-v1-oracle/perf/01-perf-target.md §0.2, read-only).
 
 F1 (from the font send-back, decided HERE): the simplest alternative for Q4/Q9 was not evaluated: a backend-owned atlas
 with tile deltas carried by the frame. Adopt it, or refute it with a counter-example.
