@@ -118,11 +118,12 @@ branches: push each at every pause or session end; delete the remote branch once
     1. viewport + layout SIGNED (16ffada, now on v2; A29 entered). Sol implements viewport (running);
     2. render frame contract: done (fb7776c), signed in substance;
     3. font and render SIGNED (af0e95e, both on v2; A30 entered);
-    4. plat SIGNED IN SUBSTANCE (c81c4ce); errata PL-1..PL-3 (docs/briefs/wave2-plat-errata.md) for Astra after her
-       viewport re-review; A31 proposed (per-thread guard; base bead). Astra re-reviews viewport round 3 (it goes first if Sol's round arrives while plat
+    4. plat SIGNED (ae7a836, on v2); A31 SIGNED (v2-ze1 must land before the first backend bead). ALL FOUR WAVE 2
+       DESIGNS SIGNED. Astra re-reviews viewport round 3 (it goes first if Sol's round arrives while plat
        is far from done).
     SOL'S ORDER after viewport lands, one bead each: (1) render_types.h, the common render service with render_submit
-    and the null driver; (2) layout; (3) font and font_async; (4) the backends, after plat is signed. Astra reviews
+    and the null driver (v2-jj1, running); viewport round 4; (2) layout; (3) font and font_async; (4) plat; (5) the
+    backends (after v2-ze1). Astra reviews
     each; the advisor reads the header in full, her review, and the diff of any send-back.
     EVERY WAVE 2 IMPLEMENTATION BRIEF carries three lines: (a) the header holds the whole contract as comments, so the
     next module's implementer never opens the .c file; (b) a rule another module also needs has one implementation

@@ -534,7 +534,7 @@ The atomic inline PLAT_EV_KEY, the coherent PLAT_EV_SURFACE, X11 GL/XShm and Way
 Signed with the Wave 2 render frame contract and the Wave 2 font contract (docs/decisions/wave2-font-spec.md at
 af0e95e).
 
-## A31 (PROPOSED, for the advisor's signature). The Law-2 guard attributes allocations by thread (advisor ruling, 2026-11-25, plat errata PL-2)
+## A31. The Law-2 guard attributes allocations by thread (advisor, 2026-11-25; SIGNED with the plat errata at ae7a836)
 - The guard attributes allocations by thread.
 - The enforced count is the UI thread's, between ingest and submit: the v2 typing path (ingest of prepaid records,
   mutation, layout, submit) runs on the UI thread.
@@ -543,4 +543,6 @@ af0e95e).
   joins the enforced set.
 - W0.9's finding 8, an allocation on the UI thread, is still caught.
 - No production threading is shaped to fit the guard: no phase handoff per key.
+A31's implementation is base bead v2-ze1. It must land before the first Wave 2 bead whose acceptance runs the guard with
+native traffic, which is the first backend bead (not render's null driver).
 
