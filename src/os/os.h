@@ -84,6 +84,14 @@ _Noreturn void os_assert_fail(const char *file, int line, const char *expr);
 /* The build supplies EDIT_APP_ID. */
 const char *os_app_id(void);
 
+/* The process file-creation mask (umask), read once at the first call from
+ * the "Umask:" line of /proc/self/status: a read that changes nothing, so
+ * it has no window and assumes nothing about threads. umask(2) is never
+ * called. If the line cannot be read the mask is 077 (the private side).
+ * A later change by the process is not seen (L2-1 round 3, advisor). Any
+ * thread. */
+uint32_t os_creation_mask(void);
+
 /* Monotonic time for deadlines, in nanoseconds. */
 uint64_t os_now_ns(void);
 /* Restarts interrupted sleeps with the remaining time. */
@@ -156,6 +164,7 @@ typedef struct os_stat {
     int64_t ctime_ns;
     uint32_t perm; /* Permission and special mode bits (st_mode & 07777). */
     uint32_t uid, gid;
+    uint64_t nlink; /* Hard links (st_nlink): 0 once the last name is gone. */
 } os_stat;
 
 typedef struct os_file { int fd; } os_file;
@@ -188,6 +197,9 @@ os_err os_file_pwrite_once(os_file *f, const void *buf, size_t n, uint64_t offse
 os_err os_file_stat(const os_file *f, os_stat *st);
 os_err os_file_set_size(os_file *f, uint64_t size);
 os_err os_file_sync(os_file *f);      /* Data and metadata. */
+/* Applies permission and special mode bits (perm & 07777) through the
+ * descriptor, never by name. */
+os_err os_file_set_perm(os_file *f, uint32_t perm);
 os_err os_file_sync_data(os_file *f); /* Data and the metadata needed to read it. */
 
 /* Advisory, nonblocking flock. Other opens can still read and write.
