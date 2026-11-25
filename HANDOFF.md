@@ -68,8 +68,10 @@ branches: push each at every pause or session end; delete the remote branch once
     - then the reviewer re-checks again, then the advisor's owner read, then L2-1 LANDS with MF-A and MF-C stated OPEN.
     Branch review/l2-1c (2108374).
     - MF-C is accepted as a stated limit (same class as N1).
-    - MF-A gets a source-witness design (Astra, docs/decisions/wave1-file-source-witness.md), then bead v2-hy8 (P1,
-      Claude, blocks the Wave 1 exit).
+    - MF-A: source-witness design (d50a3a3). Its CORE is signed; the contract waits for Astra's pass 2 (W1 start at
+      the first committed edit, W2 five states, W3 tickets in the validator context;
+      docs/briefs/source-witness-pass2.md), which runs after Sol's v2-sve. Bead v2-hy8 (Claude) blocks the WAVE 2
+      exit and is implemented after savectl lands. No direct Save As from IDLE_CHANGED now.
     - Tobias questions: v2-jh7 (chown), v2-b4y (export-to-new-name).
     - Sol: v2-sve (work wake-on-drain) after Astra's job.
     - The savectl brief carries custody hand-over (GAP 2) as an explicit open item.
