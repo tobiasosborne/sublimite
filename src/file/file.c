@@ -321,6 +321,9 @@ file_mode file_source_mode(const file_source *source)
 int file_source_validate(file_source *source, os_err *oserr)
 {
     ASSERT(source != NULL);
+    /* Only a mapped backing holds its original (owner read O2): a copy's
+     * bytes are private and nothing it holds can drift. */
+    if (!os_file_is_open(&source->fd)) return FILE_OK;
     if (backing_poll_changed(source)) return FILE_ERR_CHANGED;
     file_expectation want = { .presence = FILE_PRESENT, .stat = source_baseline(source) };
     file_expectation got;
@@ -328,6 +331,13 @@ int file_source_validate(file_source *source, os_err *oserr)
     if (rc != FILE_OK) return rc;
     return file_expectation_diff(&want, &got) == FILE_CHG_NONE ? FILE_OK
                                                                : FILE_ERR_CHANGED;
+}
+
+/* A piece backing file created: its ctx is that mapping's file_source. */
+static bool backing_is_ours(const piece_backing *pb)
+{
+    return pb->acquire == backing_acquire_cb && pb->release == backing_release_cb &&
+           pb->ctx != NULL;
 }
 
 bool file_backing_validate(void *ctx, const piece_backing *backing)
@@ -340,9 +350,7 @@ bool file_backing_validate(void *ctx, const piece_backing *backing)
         if (b == NULL || backing->ctx != (void *)b) return false;
     } else {
         /* Erratum 5: the backing's own source, if file created it. */
-        if (backing->acquire != backing_acquire_cb ||
-            backing->release != backing_release_cb || backing->ctx == NULL)
-            return false;
+        if (!backing_is_ours(backing)) return false;
         b = backing->ctx;
     }
     if (backing->bytes != b->backing.bytes || backing->len != b->backing.len)
@@ -395,7 +403,6 @@ typedef struct prepare_args {
     const piece_snapshot *snap;
     const file_expectation *expect;
     unsigned flags;
-    file_source *source;   /* optional: the mapped original S reads */
     const work_ctx *stop;  /* optional: worker cancellation */
     void (*step)(void *, int);
     void *step_ctx;
@@ -515,6 +522,12 @@ static int temp_prepare_core(file_temp *t, const prepare_args *a, os_err *oserr)
     t->state = FILE_TEMP_DONE; /* every early refusal owns nothing */
     if (a->expect->presence == FILE_PRESENT && a->expect->stat.kind != OS_KIND_FILE)
         return FILE_ERR_NOTREG; /* refused before any open or wait (MF9) */
+    /* The source is the snapshot's own (owner read O1; erratum 5): the
+     * file_source of the file-created mapping S reads. A mapping file did
+     * not create cannot be validated, so it is refused. No caller can
+     * lend "no source" for a mapped snapshot. */
+    const piece_backing *sb = piece_view_backing(piece_snapshot_view(a->snap));
+    if (sb != NULL && !backing_is_ours(sb)) return FILE_ERR_STATE;
     char dirpath[OS_PATH_MAX];
     os_err e = split_path(a->dest_path, dirpath, sizeof dirpath, t->base, sizeof t->base);
     if (e == OS_OK) e = os_dir_open(&t->dir, dirpath);
@@ -523,7 +536,7 @@ static int temp_prepare_core(file_temp *t, const prepare_args *a, os_err *oserr)
         temp_release(t, false);
         return FILE_ERR_IO;
     }
-    if (a->source != NULL) t->source = file_source_retain(a->source);
+    if (sb != NULL) t->source = file_source_retain(sb->ctx);
 
     /* Temp leaf: ".<base>.sublimite-v2-<stamp>-<attempt>.tmp", created
      * exclusively beside the destination (v1's shape). The base is
@@ -602,22 +615,14 @@ static int temp_prepare_core(file_temp *t, const prepare_args *a, os_err *oserr)
     }
     if (rc == FILE_OK && !mid_fired) STEP(a->step, a->step_ctx, 2);
     if (rc == FILE_OK) STEP(a->step, a->step_ctx, 3 /* TEMP_WRITTEN */);
-    /* One closing poll after the last mapped load the write used, then
-     * the retained source in full (a same-size in-place overwrite
-     * raises no fault: only its fd stat shows it). Only when S reads a
-     * mapped backing: a copy's bytes are private, so its original's
-     * drift cannot reach what is written (review MF-E; file.h). */
-    if (rc == FILE_OK) {
-        const piece_backing *sb = piece_view_backing(view);
-        if (sb != NULL) {
-            uint64_t epoch = 0;
-            if (os_fault_poll(sb->fault, &epoch) != OS_OK || epoch != 0)
-                rc = FILE_ERR_CHANGED;
-            os_err ve = OS_OK;
-            if (rc == FILE_OK && t->source != NULL &&
-                file_source_validate(t->source, &ve) != FILE_OK)
-                rc = FILE_ERR_CHANGED;
-        }
+    /* After the last mapped load the write used, the retained source in
+     * full: its poll is the closing poll (the snapshot's backing is this
+     * source's, one fault id), and its fd stat catches a same-size
+     * in-place overwrite, which raises no fault. Only a mapped S has a
+     * source: a copy's bytes are private (review MF-E; file.h). */
+    if (rc == FILE_OK && t->source != NULL) {
+        os_err ve = OS_OK;
+        if (file_source_validate(t->source, &ve) != FILE_OK) rc = FILE_ERR_SOURCE;
     }
     if (rc == FILE_OK) rc = temp_metadata(t, a, oserr);
     if (rc == FILE_OK) {
@@ -681,15 +686,19 @@ static int temp_verify_installed(const file_temp *t, file_save_outcome *out)
 {
     os_stat now;
     os_err oe = OS_OK;
-    if (!temp_proven(t, &now, &oe) || pair_foreign(t)) {
-        out->pub = FILE_PUB_CONFLICT;
+    if (!temp_proven(t, &now, &oe)) {
+        out->pub = FILE_PUB_CONFLICT; /* the DESTINATION side */
         out->oserr = oe;
         return FILE_ERR_CONFLICT;
     }
-    out->pub = FILE_PUB_VERIFIED;
     out->installed.presence = FILE_PRESENT;
     out->installed.stat = now;
     out->oserr = OS_OK;
+    if (pair_foreign(t)) {
+        out->pub = FILE_PUB_CONFLICT; /* our text is installed; the SOURCE moved */
+        return FILE_ERR_SOURCE;
+    }
+    out->pub = FILE_PUB_VERIFIED;
     return FILE_OK;
 }
 
@@ -715,19 +724,15 @@ static int temp_barrier_and_verify(file_temp *t, const prepare_args *hooks,
 }
 
 /* The source is the displaced generation: our rename drops its link.
- * Mapped sources only: the pair exists to keep a mapped backing's bytes
- * validating; a copy's bytes are private, so its old inode's drift is
- * nobody's evidence (enumeration §14, the third MF-E site). */
+ * Custody holds a source only for a mapped snapshot, so the pair keeps a
+ * mapped backing's bytes validating and never runs for a copy, whose
+ * bytes are private (enumeration §14, the third MF-E site). A foreign
+ * write into the displaced destination during our rename is therefore
+ * not reported for a copy (review R5-A, a sub-window of N1). */
 static bool source_displaced(const file_temp *t)
 {
-    if (t->source == NULL) return false;
-    switch (t->source->mode) {
-    case FILE_MODE_MMAP:
-        break;
-    case FILE_MODE_COPY:
-        return false;
-    }
-    return t->expect.presence == FILE_PRESENT &&
+    /* A copy never has a source (owner read O1): no mode test needed. */
+    return t->source != NULL && t->expect.presence == FILE_PRESENT &&
            identity_eq(&t->source->stat.id, &t->expect.stat.id);
 }
 
@@ -949,14 +954,13 @@ static int witness_check(os_file *fd, const os_dir *dir, const char *name,
 }
 
 int file_temp_prepare(file_temp *t, const char *dest_path,
-                      const piece_snapshot *snap, file_source *source,
+                      const piece_snapshot *snap,
                       const file_expectation *expect, unsigned flags,
                       os_err *oserr)
 {
     ASSERT(t != NULL && dest_path != NULL && snap != NULL && expect != NULL);
     prepare_args a = {
         .dest_path = dest_path, .snap = snap, .expect = expect, .flags = flags,
-        .source = source,
     };
 #ifdef FILE_TEST_HOOKS
     a.step = sync_step_hook;
@@ -1002,7 +1006,8 @@ int file_temp_verify(const file_temp *t, file_expectation *installed,
     installed->presence = FILE_PRESENT;
     installed->stat = st;
     *prefix_crc32c = pcrc;
-    return FILE_OK;
+    /* The destination side verified; name the source side if it moved. */
+    return pair_foreign(t) ? FILE_ERR_SOURCE : FILE_OK;
 }
 
 int file_temp_recover(file_temp *t, const char *path,
@@ -1071,9 +1076,8 @@ void file_temp_forget(file_temp *t)
 }
 
 int file_save_write(const char *dest_path, const piece_snapshot *snap,
-                    file_source *source, const file_expectation *expect,
-                    unsigned flags, file_witness *witness,
-                    file_save_outcome *out)
+                    const file_expectation *expect, unsigned flags,
+                    file_witness *witness, file_save_outcome *out)
 {
     ASSERT(dest_path != NULL && snap != NULL && expect != NULL && out != NULL);
     memset(out, 0, sizeof *out);
@@ -1081,7 +1085,7 @@ int file_save_write(const char *dest_path, const piece_snapshot *snap,
     file_temp t;
     temp_reset(&t);
     os_err oe = OS_OK;
-    int rc = file_temp_prepare(&t, dest_path, snap, source, expect, flags, &oe);
+    int rc = file_temp_prepare(&t, dest_path, snap, expect, flags, &oe);
     if (rc != FILE_OK) {
         out->pub = FILE_PUB_PRE_RENAME;
         out->oserr = oe;
@@ -1286,8 +1290,7 @@ static void acquire_work(file *f, file_job_slot *slot, struct file_acquired *r,
             r->status = rc;
             goto done;
         }
-        b->fd = fd;
-        fd = (os_file)OS_FILE_INIT;
+        /* The copy keeps no descriptor: done closes the original (O2). */
         backing_set_stat(b, &first);
         r->backing = b;
         break;
@@ -1318,8 +1321,6 @@ static void acquire_work(file *f, file_job_slot *slot, struct file_acquired *r,
             goto done;
         }
         b->view = view;
-        b->fd = fd;
-        fd = (os_file)OS_FILE_INIT;
         b->backing.bytes = view.addr;
         b->backing.len = view.len;
         b->backing.fault = fid;
@@ -1332,13 +1333,26 @@ static void acquire_work(file *f, file_job_slot *slot, struct file_acquired *r,
         /* Validate descriptor and canonical entry after the read/map. */
         os_stat after, at_path;
         file_expectation now = { .presence = FILE_PRESENT };
-        if (os_file_stat(&r->backing->fd, &after) != OS_OK ||
+        if (os_file_stat(&fd, &after) != OS_OK ||
             (now.stat = after, file_expectation_diff(&r->baseline, &now) != FILE_CHG_NONE) ||
             os_stat_at(&dir, leaf, OS_STAT_NOFOLLOW, &at_path) != OS_OK ||
             !identity_eq(&at_path.id, &first.id)) {
             r->status = FILE_ERR_CHANGED;
         }
         if (r->status == FILE_OK && stopped(ctx)) r->status = FILE_ERR_CANCELLED;
+    }
+    /* Only a mapped backing keeps the original's descriptor: its bytes
+     * are read from that inode for its whole life. A copy's are not, so
+     * its descriptor closes here (owner read O2, review R5-B). */
+    if (r->status == FILE_OK) {
+        switch (r->mode) {
+        case FILE_MODE_MMAP:
+            r->backing->fd = fd;
+            fd = (os_file)OS_FILE_INIT;
+            break;
+        case FILE_MODE_COPY:
+            break;
+        }
     }
 done:
     os_file_close(&fd);
@@ -1426,7 +1440,6 @@ static void save_job_fn(work_ctx *ctx)
         a.snap = f->save_snap;
         a.expect = &f->save_expect;
         a.flags = f->save_flags;
-        a.source = f->save_source;
         a.stop = ctx;
         os_err oe = OS_OK;
         int rc = temp_prepare_core(&f->save_temp, &a, &oe);
@@ -1471,8 +1484,6 @@ static void save_release_inputs(file *f)
         piece_snapshot_release(f->save_snap);
         f->save_snap = NULL;
     }
-    file_source_release(f->save_source);
-    f->save_source = NULL;
 }
 
 /* The phase a settled job leaves, from custody alone. A cancelled job's
@@ -1901,29 +1912,22 @@ bool file_check(file *f, uint32_t *reasons)
             bits |= file_expectation_diff(&f->baseline, &now);
         }
     }
-    /* The source leg: the mapped inode the text reads. A copy buffer's old
-     * inode backs nothing on screen, so it has no source leg (review MF-F;
-     * the rule of file.h file_temp_prepare). The path leg above sees every
-     * change at the path for both kinds. */
-    if (f->backing != NULL) {
+    /* The source leg: the original the text reads, which only a mapped
+     * backing holds (owner read O2: a copy closed its descriptor at
+     * acquisition, so it has nothing to observe; review MF-F). The path
+     * leg above sees every change at the path for both kinds. */
+    if (f->backing != NULL && os_file_is_open(&f->backing->fd)) {
         file_source *b = f->backing;
-        switch (b->mode) {
-        case FILE_MODE_COPY:
-            break;
-        case FILE_MODE_MMAP: {
-            if (backing_poll_changed(b)) bits |= FILE_CHG_FAULTED;
-            file_expectation want = { .presence = FILE_PRESENT, .stat = source_baseline(b) };
-            file_expectation got;
-            os_err oe = OS_OK;
-            if (file_expectation_observe_fd(&b->fd, &got, &oe) != FILE_OK) {
-                bits |= FILE_CHG_METADATA; /* review N3 */
-                f->oserr = oe;
-            } else {
-                bits |= file_expectation_diff(&want, &got); /* ctime included (MF6) */
-                if (got.stat.size < b->backing.len) bits |= FILE_CHG_TRUNCATED;
-            }
-            break;
-        }
+        if (backing_poll_changed(b)) bits |= FILE_CHG_FAULTED;
+        file_expectation want = { .presence = FILE_PRESENT, .stat = source_baseline(b) };
+        file_expectation got;
+        os_err oe = OS_OK;
+        if (file_expectation_observe_fd(&b->fd, &got, &oe) != FILE_OK) {
+            bits |= FILE_CHG_METADATA; /* review N3 */
+            f->oserr = oe;
+        } else {
+            bits |= file_expectation_diff(&want, &got); /* ctime included (MF6) */
+            if (got.stat.size < b->backing.len) bits |= FILE_CHG_TRUNCATED;
         }
     }
     f->last_reasons = bits;
@@ -1948,18 +1952,14 @@ int file_resolve_keep(file *f)
     if (now.presence == FILE_PRESENT && now.stat.kind != OS_KIND_FILE)
         return FILE_ERR_CHANGED;
     if (f->backing != NULL) {
-        switch (f->backing->mode) {
-        case FILE_MODE_COPY:
-            break; /* a private original can keep any disk state */
-        case FILE_MODE_MMAP:
-            /* The mapped inode must still validate in full. Any ctime
-             * move, a dropped link included, is indistinguishable from an
-             * in-place rewrite with mtime restored (MF6): refuse. */
-            rc = file_source_validate(f->backing, &oe);
-            if (rc == FILE_ERR_IO) f->oserr = oe;
-            if (rc != FILE_OK) return rc;
-            break;
-        }
+        /* A mapped inode must still validate in full: any ctime move, a
+         * dropped link included, is indistinguishable from an in-place
+         * rewrite with mtime restored (MF6), so Keep refuses. A copy holds
+         * no original and validates by construction (O2): it can keep any
+         * disk state. */
+        rc = file_source_validate(f->backing, &oe);
+        if (rc == FILE_ERR_IO) f->oserr = oe;
+        if (rc != FILE_OK) return rc;
     }
     f->baseline = now;
     f->changed = false;
@@ -2067,8 +2067,6 @@ int file_save_begin(file *f, piece_snapshot *snap, const char *dest_path,
     f->save_expect = *expect;
     f->save_flags = flags;
     f->save_snap = piece_snapshot_retain(snap);
-    f->save_source = NULL;
-    if (f->backing != NULL) (void)file_source_acquire(f, &f->save_source);
     temp_reset(&f->save_temp);
     memset(&f->save_outcome, 0, sizeof f->save_outcome);
     f->save_status = FILE_OK;
