@@ -118,7 +118,8 @@ branches: push each at every pause or session end; delete the remote branch once
     1. viewport + layout SIGNED (16ffada, now on v2; A29 entered). Sol implements viewport (running);
     2. render frame contract: done (fb7776c), signed in substance;
     3. font and render SIGNED (af0e95e, both on v2; A30 entered);
-    4. plat (Astra, running); then Astra re-reviews viewport round 3 (it goes first if Sol's round arrives while plat
+    4. plat SIGNED IN SUBSTANCE (c81c4ce); errata PL-1..PL-3 (docs/briefs/wave2-plat-errata.md) for Astra after her
+       viewport re-review; A31 proposed (per-thread guard; base bead). Astra re-reviews viewport round 3 (it goes first if Sol's round arrives while plat
        is far from done).
     SOL'S ORDER after viewport lands, one bead each: (1) render_types.h, the common render service with render_submit
     and the null driver; (2) layout; (3) font and font_async; (4) the backends, after plat is signed. Astra reviews
