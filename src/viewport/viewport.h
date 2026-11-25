@@ -70,8 +70,11 @@ typedef struct viewport_request {
 } viewport_request;
 typedef struct viewport_evidence {
     const uint8_t *bytes; size_t len; /* resident window starting at off */
-    uint64_t off, length, point;     /* snapshot length and resolved byte */
+    uint64_t off, point;             /* window/select offset and resolved column-to-byte point */
     viewport_row_cert row;
+    /* VP_ROW only: the queried byte and affinity's column in cells from
+     * the text area's left edge, including synthetic continuation indent. */
+    uint64_t screen_column;
     uint64_t count; bool exact;      /* rank or select prefix count; select offset in off */
 } viewport_evidence;
 typedef struct viewport_port {
@@ -80,7 +83,7 @@ typedef struct viewport_port {
                                size_t *credits, viewport_evidence *);
 } viewport_port;
 size_t viewport_motion_size(void);
-void viewport_motion_begin(viewport_motion *, const viewport_intent *, viewport_frame);
+void viewport_motion_begin(viewport_motion *, const viewport_intent *, viewport_frame, uint64_t length);
 viewport_progress viewport_motion_step(viewport_motion *, const viewport_port *,
                                        size_t *credits, viewport_answer *);
 bool viewport_wrap_default(const char *path);
