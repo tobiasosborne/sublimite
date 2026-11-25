@@ -37,7 +37,8 @@ branches: push each at every pause or session end; delete the remote branch once
           6fec2e8; the advisor adds it to v1's backlog), recorded in docs/decisions/L2-1-file.md with the reason: it
           agrees with v1 under umask 022 and never widens past the user's umask. Assertions: umask 022 gives 0644,
           umask 077 gives 0600, and the temp is never wider than the result.
-    - Codex (serial): v2-677 permission bits (Sol, running; fix in os_file_copy_metadata, test in os_persist_test; the
+    - Open with Tobias (advisor): may Codex run two jobs at once (Astra on documents, Sol on code, disjoint files) while far behind pace? Until he answers, one Codex job at a time.
+  - Codex (serial): v2-677 permission bits (Sol, running; fix in os_file_copy_metadata, test in os_persist_test; the
       file-suite assertion is added by the L2-1 merge). Then Astra answers her ten L5 questions as errata (section
       "Errata proposed by the L5 spec" in wave1-app-spec.md). The advisor reads the L5 spec and the errata together.
   - L5 RULING (advisor, 2026-11-25 01:30): Wave 1 gets a MINIMAL L5. A save whose displaced generation has any
@@ -111,7 +112,7 @@ branches: push each at every pause or session end; delete the remote branch once
     4. EDIT-CORE's finishing pass;
     5. later, v2-hy8 (after savectl).
     Codex (advisor, 07:55): Wave 2 design runs now on Astra, one at a time. It touches no Wave 1 file.
-    1. viewport + layout (r2 SIGNED IN SUBSTANCE; errata E1–E4 running); then Sol implements viewport;
+    1. viewport + layout SIGNED (16ffada, now on v2; A29 entered). Sol implements viewport (running);
     2. render frame contract: done (fb7776c), signed in substance;
     3. font revision F3–F8 + R-C (replacing F2), WITH the render errata R-A and R-B in the same Astra job (briefs
        wave2-font-sendback.md and wave2-render-errata.md). Render is SIGNED IN SUBSTANCE (fb7776c), including the

@@ -492,3 +492,19 @@ Where each erratum goes:
   (2) the active owner is defined at the ADMISSION of CLOSE_DISCARD;
   (3) app_next_deadline_ns returns OS_DEADLINE_NEVER in Wave 1 unless a real deadline source is named.
 
+## A29. Display lines on a byte grid (advisor, 2026-11-25 22:10 CET; docs/decisions/wave2-viewport-layout-spec.md at 16ffada)
+Amends PLAN §4.5.
+- In both modes, display lines break at BOF, after each LF, and at the aligned interior grid starts, at a fixed grid
+  spacing S = 32,768 bytes. The maximum display-line span is D = 2S + 4 = 65,540 bytes.
+- S is derived from the G5 cold placement: an ordinary wrapped placement stages at most two display lines, and
+  2(2S + 4) x 30.87 ns <= 5,000,000 ns gives S <= 40,490, whose largest power of two is 32,768. That is a 4.046 ms
+  two-line scan estimate; the whole viewport is unmeasured.
+- Decoder, grapheme, column, indentation and wrap state reset at each start. The local upward row cache is kept.
+  Absolute grid arithmetic replaces long-line checkpoints.
+- In a row certificate, `line_start` is the current display-line start, and `approximate` means "this display line
+  starts synthetically"; all its rows have exact geometry under this rule.
+- Logical line numbers still count LF only, with knowledge expressed separately by has_exact_line.
+- The byte anchor is preserved, and the same rows are certified on every restore.
+- Visible behaviour (for Tobias): physical lines longer than S fold at the grid with wrap on or off, and tabs,
+  indentation and grapheme segmentation restart at a fold. Valid UTF-8 scalars and CRLF stay intact.
+
