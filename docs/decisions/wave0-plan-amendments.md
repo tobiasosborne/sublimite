@@ -508,3 +508,22 @@ Amends PLAN §4.5.
 - Visible behaviour (for Tobias): physical lines longer than S fold at the grid with wrap on or off, and tabs,
   indentation and grapheme segmentation restart at a fold. Valid UTF-8 scalars and CRLF stay intact.
 
+## L2-1 landed (1.33; advisor's owner read, 2026-11-25)
+Findings, none blocking:
+- O1 (v2-4xk, code): remove the `source` parameter of file_temp_prepare and file_save_write. Prepare takes and retains
+  the source from the snapshot's backing (erratum 5: piece_backing.ctx is the file_source of a file-created mapping),
+  and refuses a mapped backing that file did not create. This also removes file_save_begin's loan of a copy source, the
+  save_source field, and one column of §14.
+- O2 (v2-4xk, code): a copy backing closes its original fd at the end of acquisition (R5-B). After that, the copy case
+  of source_displaced and of file_check's source leg is gone by construction.
+- O3 (on the N1 bead, P2): the uniform form of the rename-window check is a before/after fstat pair on an fd of the
+  DESTINATION opened at publish, for every save over a present destination. Evaluate it together with
+  publish-by-exchange.
+- O4 (a ruling for savectl's brief): savectl drives the file_temp_* core from its own operation slot. The file object's
+  asynchronous save pipeline is DELETED in savectl's bead: eight functions, file_save_phase, file_save_op, the save
+  fields and their tests. A reason to keep it is a counter-argument for the advisor before the brief is signed.
+- O5 (Wave 1 deletion review): decide whether struct file, file_acquired and file_job_slot become opaque.
+- O6 (note): witness_check keeps a 65,536-byte buffer on the stack; revisit only with a small-stack thread.
+- Survivors R5f, R5h and R5i/j go to v2-4xk. R5i/j needs a decision there: either os distinguishes EMFILE from EIO, or
+  the recover rule is restated in terms of what os can report.
+

@@ -358,9 +358,11 @@ int file_temp_prepare(file_temp *t, const char *dest_path,
 /* Publish a SYNCED temp: re-observe the destination against the stored
  * expectation (unless FORCE), rename once (NOREPLACE when the
  * expectation is ABSENT and not FORCE), sync the directory, verify the
- * path against the written fd. When the custody's source is the
- * displaced inode, its fd is stat'ed immediately before and after the
- * rename: a pair differing in ctime and a falling link count only
+ * path against the written fd. When the custody's source is a MAPPED
+ * backing and is the displaced inode, its fd is stat'ed immediately
+ * before and after the rename (a copy source is not: it backs no byte the
+ * save writes, and a foreign write into the destination during our own
+ * rename is then not reported; review R5-A, a sub-window of N1): a pair differing in ctime and a falling link count only
  * re-baselines that backing (so it keeps validating its intact bytes);
  * any other difference is FILE_PUB_CONFLICT. Fills *out on every path
  * after the state check; the return is FILE_OK only for

@@ -602,8 +602,8 @@ for a source check only at acquisition, where the copy's bytes are read from tha
 | A1 | 267 | `backing_poll_changed` | mapped (copy: none) | the fault epoch of the registration | `t_r2_check_fault_poll` (A1: never polls) |
 | A2 | 329 | `file_source_validate` | as called: mapped in file (prepare, Keep, validator); public for any | the held fd's stat equals the baseline (ctime included), and the poll is pristine | `t_change_in_place` (A2: fd stat ignored) |
 | A3 | 340–352 | `file_backing_validate` | mapped (copies have no piece backing) | the supplied backing is this acquisition: ctx, callbacks, bytes and len, fault id; then A2 | `t_r3_null_ctx_validator` (A3a ctx, A3b callbacks, A3c bytes/len, A3d fault id) |
-| A5 | 610–620 | `temp_prepare_core` | mapped (MF-E) | the closing poll and the lent source's full validation after the write | `t_r2_source_validation` (A5a: skipped); `t_r4_copy_after_foreign_save` (A5b: copy validated too). The poll alone (A5c) is equivalent, because A2 polls first; it goes to the backlog by ruling. |
-| A6 | 721–732 | `source_displaced` | mapped (round 5: third site) | the lent source is the displaced inode (identity equals the PRESENT expectation's) | `t_r5_copy_pair` (A6a: copy too); `t_r5_mapped_saveas_pair` (A6b: identity dropped) |
+| A5 | 610–620 | `temp_prepare_core` | mapped (MF-E) | the closing poll and the lent source's full validation after the write | `t_r2_source_validation` (A5a: skipped); `t_r4_copy_after_foreign_save` (A5b: copy validated too). The poll alone (A5c) is equivalent ONLY when a source is lent, because A2 polls first. With a NULL source on a mapped snapshot the closing poll is the only check, and A5c removes it (re-check 4; the advisor's O1 removes the parameter in v2-4xk). |
+| A6 | 721–732, 823–825 | `source_displaced`, and the rename pair's before-stat in `temp_publish_core` | mapped (round 5: third site) | the lent source is the displaced inode (identity equals the PRESENT expectation's). For a copy source it is not checked, so a foreign write into the destination during our rename goes unreported (R5-A, a sub-window of N1) | `t_r5_copy_pair` (A6a: copy too); `t_r5_mapped_saveas_pair` (A6b: identity dropped) |
 | A7 | 740–758 | `source_rebaseline` | mapped | the before/after fstat pair of the displaced source; before equals the baseline | `t_r2_validate_after_own_save` (A7a: never stores); `t_r3_source_conflict` (A7b any difference, A7c link count); `t_r3_rebaseline_needs_baseline` (A7d) |
 | A8 | 1908–1927 | `file_check` (source leg) | mapped (round 5: MF-F) | the held fd's stat against the baseline, TRUNCATED, the fault poll | `t_r5_copy_keep_sticks` (A8a: copy too); `t_r2_keep_hardlink` (A8b: ctime); `t_r2_check_fault_poll` (A8c: poll); `t_sigbus` (A8d: TRUNCATED) |
 | A9 | 1955–1960 | `file_resolve_keep` | mapped (copy keeps anything) | the mapped inode still validates in full (A2) | `t_change_in_place` (A9: skipped) |
@@ -631,8 +631,10 @@ for a source check only at acquisition, where the copy's bytes are read from tha
 | B13 | 1943–1949 | `file_resolve_keep` | both | the path observed (a failure refuses), and a non-regular path refused | `t_r5_check_unobservable` (B13b: failure adopted); `t_r5_keep_kind` (B13) |
 | B14 | 2034 | `file_watch_poll` | both | an event for our leaf, the directory itself, or an overflow runs `file_check` | `t_watch` (B14: never matches) |
 | B15 | 418–419 | `temp_unlink_own` | both | the temp name still names our fd before any unlink | `t_r3_unlink_identity` (B15) |
+| B16 | 1155 | `read_exact` | both | a premature EOF while reading the source is an error, not a short text | not pinned (re-check 4: missing row) |
+| B17 | 1205, 1213 | `acquire_work` | both | ISDIR at the requested name classified NOTREG | not pinned (re-check 4: missing row) |
 
-59 mutants in all (P, the rows of `build/r5/mutations-all.txt`): 58 killed by their named test, and A5c is equivalent.
+57 mutants in all (P; re-check 4 corrected the count: `mutations-all.txt` plus `mutations.txt` hold 59 rows, two of which are reruns): 56 killed by their named test, and A5c is equivalent.
 Two early "kills" were fixture artefacts: B13b failed on a directory a failed B12b run had left closed, and a FIFO left
 by a failed B13 run hung the suite. Both tests now clear their fixtures first, and those mutants were re-run with
 genuine kills.
@@ -657,3 +659,10 @@ Comment-free, non-blank lines (`build/r2/ncloc.py`):
 |---|---|---|
 | `file.c` | 1,934 | 1,943 |
 | `file.h` | 292 | 292 |
+
+
+## 15. Landing (1.33, advisor's owner read, 2026-11-25)
+- MF-A is open (v2-hy8). MF-C is a stated limit until v2-hy8, which closes it.
+- Re-check 4 corrections are folded in above: the two missing rows B16 and B17, A6 extended to the rename pair's
+  before-stat, the A5c condition, and the mutant count 57.
+- The owner read's findings O1–O6 are recorded in docs/decisions/wave0-plan-amendments.md, "L2-1 landed".
