@@ -17,7 +17,7 @@ ACCEPTED, do not reopen:
 
 F1 is decided in the render spec; see docs/briefs/wave2-render-spec.md.
 
-F2. View hold. The proposal calls hold_keep once per reusable cell on every publication. The alternative:
+F2. (SUPERSEDED by R-C in docs/briefs/wave2-render-errata.md: no hold API at all.) View hold. The proposal calls hold_keep once per reusable cell on every publication. The alternative:
     - lookup stamps the entry with the builder's serial, in O(1);
     - only when no free or evictable slot exists does one sweep over the cells of the live publications mark what is in
       use, after which unmarked settled entries are evictable.
