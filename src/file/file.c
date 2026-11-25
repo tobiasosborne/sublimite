@@ -604,18 +604,20 @@ static int temp_prepare_core(file_temp *t, const prepare_args *a, os_err *oserr)
     if (rc == FILE_OK) STEP(a->step, a->step_ctx, 3 /* TEMP_WRITTEN */);
     /* One closing poll after the last mapped load the write used, then
      * the retained source in full (a same-size in-place overwrite
-     * raises no fault: only its fd stat shows it). */
+     * raises no fault: only its fd stat shows it). Only when S reads a
+     * mapped backing: a copy's bytes are private, so its original's
+     * drift cannot reach what is written (review MF-E; file.h). */
     if (rc == FILE_OK) {
         const piece_backing *sb = piece_view_backing(view);
         if (sb != NULL) {
             uint64_t epoch = 0;
             if (os_fault_poll(sb->fault, &epoch) != OS_OK || epoch != 0)
                 rc = FILE_ERR_CHANGED;
+            os_err ve = OS_OK;
+            if (rc == FILE_OK && t->source != NULL &&
+                file_source_validate(t->source, &ve) != FILE_OK)
+                rc = FILE_ERR_CHANGED;
         }
-    }
-    if (rc == FILE_OK && t->source != NULL) {
-        os_err ve = OS_OK;
-        if (file_source_validate(t->source, &ve) != FILE_OK) rc = FILE_ERR_CHANGED;
     }
     if (rc == FILE_OK) rc = temp_metadata(t, a, oserr);
     if (rc == FILE_OK) {
@@ -747,10 +749,12 @@ static file_source_pair source_rebaseline(file_source *b, os_err before_err,
 }
 
 /* What a rename that reported an error actually did, by observation
- * (review N-B): the temp name still naming our fd proves nothing was
- * renamed (a rename removes its source name); the destination naming
- * our fd with the temp name gone proves it was; anything else is
- * unknown. The errno alone proves neither. */
+ * (review N-B): the temp name still naming our fd, with the destination
+ * still matching its expectation, proves nothing was renamed (a rename
+ * removes its source name; the expectation rules out a foreign rename
+ * that moved an installed destination back onto our temp name, R3-A);
+ * the destination naming our fd with the temp name gone proves it was;
+ * anything else is unknown and unlinks nothing. The errno proves neither. */
 typedef enum rename_effect { RENAME_NOT_DONE, RENAME_DONE, RENAME_UNKNOWN } rename_effect;
 
 static rename_effect observe_rename(const file_temp *t)
@@ -763,7 +767,8 @@ static rename_effect observe_rename(const file_temp *t)
         return RENAME_UNKNOWN;
     bool tmp_ours = at_tmp.presence == FILE_PRESENT && identity_eq(&at_tmp.stat.id, &mine.id);
     bool dest_ours = at_dest.presence == FILE_PRESENT && identity_eq(&at_dest.stat.id, &mine.id);
-    if (tmp_ours && !dest_ours) return RENAME_NOT_DONE;
+    if (tmp_ours && !dest_ours && file_expectation_diff(&t->expect, &at_dest) == FILE_CHG_NONE)
+        return RENAME_NOT_DONE;
     if (dest_ours && !tmp_ours) return RENAME_DONE;
     return RENAME_UNKNOWN;
 }
@@ -1006,9 +1011,12 @@ int file_temp_recover(file_temp *t, const char *path,
     int rc = FILE_ERR_IO;
     if (e != OS_OK) {
         if (oserr != NULL) *oserr = e;
-        /* A symlink (or a directory) at the name is what it is: a
-         * mismatch class, not an I/O failure to retry (review N-F). */
+        /* What the name is decides the class, never a retryable I/O error
+         * (review N-F, R3-C): a symlink or directory is not a regular file;
+         * an absent or unreadable name is not the installed candidate, and
+         * would refuse again on every restart. */
         if (e == OS_E_LOOP || e == OS_E_ISDIR) rc = FILE_ERR_NOTREG;
+        if (e == OS_E_NOENT || e == OS_E_NOTDIR || e == OS_E_ACCESS) rc = FILE_ERR_CHANGED;
     } else {
         rc = witness_check(&t->fd, &t->dir, t->base, prepared, &t->fd_stat, &(uint32_t){0}, oserr);
     }

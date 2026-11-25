@@ -111,7 +111,11 @@ reused temp name (MF2, M18).
 1. It refuses a PRESENT expectation that is not a regular file, before any open (MF9).
 2. It creates the temp `RDWR | CREATE | EXCL`. RDWR is new: verification reads the file back.
 3. It writes S and computes the witness.
-4. It does one closing poll and validates the retained source in full.
+4. When S reads a mapped backing, it does one closing poll and validates the retained source in full. A copy
+   buffer's bytes are private memory: its old inode backs nothing the save writes, so that inode's drift cannot
+   corrupt the output, and prepare does not validate it (round 4, review MF-E). The rule, also in file.h: source
+   validation protects bytes read from the source; destination expectation protects what is overwritten. Keep and the
+   destination's own expectation remain the checks for what may be overwritten.
 5. It applies metadata. The destination opens `READ | NONBLOCK | NOFOLLOW`. When that open is still the expected
    regular file, its metadata is copied (`os_file_copy_metadata`; the existing mode is kept). When it is another kind or
    another inode, the result is `FILE_ERR_CHANGED` without FORCE. When no copy happens, the mode comes from
@@ -137,8 +141,12 @@ further would break the copy itself: setting a user xattr needs owner write on t
 2. It takes the before-stat of a displaced source.
 3. It renames once, NOREPLACE for an absent expectation. EXIST and NOTSUP are PRE_RENAME: nothing was renamed, and the
    temp is cleaned up. Any other error is classified by observation, not by errno (round 3, review N-B):
-   - the temp name still names the held fd: nothing was renamed, because a rename removes its source name. That is
-     PRE_RENAME, and the temp is removed (still ours, definitely unpublished);
+   - the temp name still names the held fd and the destination still matches its expectation: nothing was renamed,
+     because a rename removes its source name. That is PRE_RENAME, and the temp is removed (still ours, definitely
+     unpublished). The expectation clause is round 4 (review R3-A). Without it, a rename that was performed, followed
+     by a foreign rename moving the destination back onto our exact temp name, looked "not renamed", and file then
+     unlinked that inode and left the destination absent. Under FORCE a stale expectation never matches, so the
+     result is unknown, the safe side;
    - the destination names the held fd and the temp name is gone: the rename was performed despite the report, so
      publish continues;
    - anything else is RENAME_UNCERTAIN, and custody goes to HELD with nothing unlinked.
@@ -162,8 +170,11 @@ gate.
 
 **file_temp_recover** opens a PREPARED's named candidate and its parent, non-blocking with no leaf follow. On a stable
 match to the whole witness, it transfers them into INSTALLED_UNSYNCED. Otherwise it releases everything and leaves the
-temp EMPTY. A symlink or directory at the name is FILE_ERR_NOTREG, a mismatch class (round 3, review N-F), never the
-I/O error that savectl would retry forever. `file_save_write`, the one-shot form, discards retained custody before it returns.
+temp EMPTY. What the name is decides the class, never a retryable I/O error that savectl would repeat on every
+start:
+- a symlink or directory is FILE_ERR_NOTREG (round 3, review N-F);
+- an absent name (NOENT, NOTDIR) or an unreadable one (ACCESS, for example an owner-unreadable 0060 file that MF-B
+  installed) is FILE_ERR_CHANGED, a mismatch, with the oserr kept for the diagnosis (round 4, review R3-C). `file_save_write`, the one-shot form, discards retained custody before it returns.
 
 **NOTSUP fallback (unchanged).** None. An absent target on a filesystem without atomic exclusion is refused, because
 observe-then-REPLACE is the v1 race (Q14). N1 (the recheck-then-REPLACE window for a PRESENT target) stays open by
@@ -445,6 +456,37 @@ Comment-free, non-blank lines (`build/r2/ncloc.py`):
 | `os.h` | 244 | 244 |
 | `os_posix.c` | 1,301 | 1,332 |
 
+## 11a. Round 4 report
+
+Input: `docs/reviews/wave1-L2-1-opus-recheck2.md` (MF-E, R3-A, R3-C), with the advisor's rulings. Red runs on the
+round 3 code are in `build/r4/red-round3-corrected.log`, green runs in `build/r4/green-round4.log`.
+
+| Item | Test | Red on round 3 | Root cause | Green |
+|---|---|---|---|---|
+| 1 MF-E | `t_r4_copy_after_foreign_save` | the first Save after a foreign atomic save and Keep was refused with CHANGED (`file_test.c:1095`) | Prepare validated the lent source for every buffer, comparing the copy backing's held fd stat, ctime included, with its acquisition. A foreign rename-over moves that inode's ctime, and nothing re-baselines a copy, so every later save of a copy buffer was refused. The check protected nothing: a copy's text is private memory. | ok: Save, Save with FORCE and Save As each write the edited text; a non-FORCE save over an un-kept foreign change still refuses (the destination expectation) |
+| 1 control | `t_r4_mapped_still_refuses` | green (as it must be) | — | ok: a mapped buffer still refuses Keep and Save As after the same foreign save (MF-A, v2-hy8) |
+| 2 R3-A | `t_r4_rename_back` | PRE_RENAME, and our installed inode at the temp name was unlinked, leaving the destination absent | "Not renamed" was inferred from the temp name alone; a foreign rename could put our installed inode back there. | ok: RENAME_UNCERTAIN, HELD, nothing unlinked, before or after discard |
+| 3 R3-C | `t_r4_recover_unreadable_absent` | FILE_ERR_IO (ACCESS), and the same for NOENT | The open's failure fell into the generic I/O path, which savectl retries on every start. | ok: FILE_ERR_CHANGED with oserr ACCESS, then NOENT; custody EMPTY and no fd leaked |
+
+The first red run used a version of `t_r4_copy_after_foreign_save` whose last case wrongly expected PREPARED. Its
+red, on the first Save, was re-taken with the corrected test on the round 3 code. The round 4 file.c was restored
+byte-for-byte (`cmp`) afterwards.
+
+Changed lines against round 3 (`diff`, + added / − removed):
+
+| File | Added | Removed |
+|---|---|---|
+| `src/file/file.c` | 20 | 12 |
+| `src/file/file.h` | 8 | 4 |
+| `tests/file_test.c` | 152 | 1 |
+
+Comment-free, non-blank lines (`build/r2/ncloc.py`):
+
+| File | Before round 4 | After |
+|---|---|---|
+| `file.c` | 1,932 | 1,934 |
+| `file.h` | 292 | 292 |
+
 ## 12. Outside scope, reported only
 
 - **MF-A and MF-C**: see §10 (v2-hy8).
@@ -458,9 +500,23 @@ Comment-free, non-blank lines (`build/r2/ncloc.py`):
 - **The reviewer's suggested separate "source drift" bit** in the outcome (N-C) is not added. Round 3 keeps CONFLICT
   for both a foreign destination and a FOREIGN pair, as the advisor scoped it. Savectl's CONFLICT_CANCEL therefore
   still conflates the two.
+- **The rename pair for a COPY source** (review MF-E, last bullet) is unchanged. A FOREIGN verdict is meaningless for
+  a copy, whose bytes are private, but it can still turn an installed save of a copy buffer into CONFLICT. No round 4
+  test reaches it: after Keep, the displaced inode is not the copy's source. Report only.
+- **R3-B, R3-D, the 15 surviving round 3 mutants and X12** go to the post-landing test bead, by ruling.
 - **Worklog and HANDOFF** were not written. Under Law 3 the worker does not touch session state; the coordinator does.
 
 ## 13. Lane results
+
+Round 4 stamp: BAT0 = Not charging, load1 0.32 at the check start and 0.89 at the tsan start (M), 2026-11-25
+06:47–06:50 CET. Logs are in `build/r4/lane-*.log`.
+- `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189`: exit 0, `check: ok`.
+  - check-layers: 6 isolated layer links;
+  - check-san: 33 binaries, `file_test: ok (60 tests)`, `os_test: ok`;
+  - check-law2: 9 release suites, `law2_file_test: ok`;
+  - contract: PASS 64.
+- `nice make -j2 check-tsan`: exit 0. 13 threaded suites passed, `file_test: ok (60 tests)`.
+- `nice make -j2 fuzz-smoke`: exit 0. 16 fuzzers replayed their seeds.
 
 Round 3 stamp: BAT0 = Not charging, load1 1.30 at the check start and 1.92 at the tsan start (M), 2026-11-25
 05:14–05:17 CET. Logs are in `build/r3/lane-*.log`.

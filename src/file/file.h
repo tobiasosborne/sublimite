@@ -343,8 +343,11 @@ typedef struct file_temp {
  * created 0600 & ~mask, so it is never wider than a new file's result
  * (P: (0600 & ~m) is a subset of (0666 & ~m)) and grants group and other
  * nothing an existing destination's mode lacks. source (nullable,
- * borrowed for the call) is the mapped original the snapshot reads; it
- * is validated after the write and custody retains it for publish. On
+ * borrowed for the call) is the original the snapshot reads; custody
+ * retains it for publish. It is validated after the write only when the
+ * snapshot reads a mapped backing: a copy's bytes are private. Source
+ * validation protects bytes read from the source; destination
+ * expectation protects what is overwritten. On
  * FILE_OK the temp is SYNCED and nothing has been renamed. A fault, a
  * changed source or a cancel discards the temp. Any thread, one at a
  * time per temp. snap is borrowed for the call. */
@@ -386,8 +389,9 @@ int file_temp_verify(const file_temp *t, file_expectation *installed,
  * followed) and its parent; on a stable fd/path match to the whole
  * witness, transfer the descriptors, destination name and witness to
  * the temp in INSTALLED_UNSYNCED. Finish with file_temp_retry_barrier.
- * On mismatch (FILE_ERR_CHANGED, FILE_ERR_NOTREG) or I/O failure release
- * every partial acquisition and leave the temp EMPTY. */
+ * On mismatch (FILE_ERR_CHANGED: absent, unreadable or different;
+ * FILE_ERR_NOTREG: a symlink or directory) or I/O failure release every
+ * partial acquisition and leave the temp EMPTY. */
 int file_temp_recover(file_temp *t, const char *path,
                       const file_witness *prepared, os_err *oserr);
 /* Release custody and reach DONE. A SYNCED temp is still ours and

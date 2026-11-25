@@ -81,7 +81,7 @@ os_err __wrap_os_fault_register(const os_map *v, os_fault_id *o)
  * and EIO is returned, so neither name proves anything (a true
  * uncertain outcome). */
 enum { RENAME_PASS = 0, RENAME_EIO, RENAME_EISDIR, RENAME_AWAY, RENAME_AWAY_BLOCK,
-       RENAME_FOREIGN };
+       RENAME_FOREIGN, RENAME_BACK };
 #define UNCERTAIN_AWAY "uncertain.away"
 static _Atomic int rename_inject;
 static _Atomic unsigned calls_rename;
@@ -111,6 +111,14 @@ os_err __wrap_os_rename_at(const os_dir *a, const char *b, const os_dir *c,
     case RENAME_FOREIGN:
         put_file(rename_foreign_path, "foreign", 7); /* after the recheck */
         break;
+    case RENAME_BACK: {
+        /* Review R3-A: renamed for real, then a foreign rename moves the
+         * destination back onto our exact temp name, and EIO is reported. */
+        os_err e = __real_os_rename_at(a, b, c, d, m);
+        if (e != OS_OK) return e;
+        (void)__real_os_rename_at(c, d, a, b, OS_RENAME_REPLACE);
+        return OS_E_IO;
+    }
     default:
         break;
     }
@@ -2121,6 +2129,145 @@ static void t_r3_creation_mask(void)
     CHECK(run_child("mask_fallback", "077", 022) == 0);
 }
 
+/* ---- round 4 (re-check docs/reviews/wave1-L2-1-opus-recheck2.md) ------ */
+
+/* MF-E: a copy buffer's bytes are private, so a foreign change to its
+ * original inode never refuses a save; Keep and the destination
+ * expectation still decide what may be overwritten. */
+static void r4_foreign_atomic_save(const char *path, const char *text)
+{
+    char tmp[4096];
+    CHECK(snprintf(tmp, sizeof tmp, "%s.foreign", path) < (int)sizeof tmp);
+    put_file(tmp, text, strlen(text));
+    CHECK(rename(tmp, path) == 0);
+}
+static void t_r4_copy_after_foreign_save(void)
+{
+    const char *path = ROOT "/r4/copy.txt", *as = ROOT "/r4/copy-as.txt";
+    put_file(path, "original", 8);
+    (void)unlink(as);
+    open_file(&f1, path, 0);
+    CHECK(file_open_mode(&f1) == FILE_MODE_COPY);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 0, 0, (const uint8_t *)"edited ", 7) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    /* Save, after a foreign atomic save and Keep. */
+    r4_foreign_atomic_save(path, "foreign one");
+    CHECK(file_check(&f1, NULL));
+    CHECK(file_resolve_keep(&f1) == FILE_OK);
+    save_async(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(file_eq(path, "edited original", 15));
+    file_save_abandon(&f1);
+    /* Save with FORCE, over a second foreign save nobody kept. */
+    r4_foreign_atomic_save(path, "foreign two");
+    save_async(&f1, s, file_path(&f1), file_baseline(&f1), FILE_SAVE_FORCE);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(file_eq(path, "edited original", 15));
+    file_save_abandon(&f1);
+    /* Save As to a fresh name. */
+    r4_foreign_atomic_save(path, "foreign three");
+    file_expectation absent;
+    os_err oe;
+    CHECK(file_expectation_observe_path(as, &absent, &oe) == FILE_OK && absent.presence == FILE_ABSENT);
+    save_async(&f1, s, as, &absent, 0);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(file_eq(as, "edited original", 15));
+    file_save_abandon(&f1);
+    /* The destination expectation still protects what is overwritten. */
+    r4_foreign_atomic_save(path, "foreign four");
+    save_prepare(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE && last_msg.status == FILE_ERR_CHANGED);
+    CHECK(file_eq(path, "foreign four", 12));
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+/* The control: a mapped buffer reads its bytes from the source, so after
+ * the same foreign atomic save it still refuses (Keep, then Save As). */
+static void t_r4_mapped_still_refuses(void)
+{
+    const char *path = ROOT "/r4/mapped.txt", *as = ROOT "/r4/mapped-as.txt";
+    put_file(path, "mapped original", 15);
+    (void)unlink(as);
+    open_file(&f1, path, 1);
+    CHECK(file_open_mode(&f1) == FILE_MODE_MMAP);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 0, 0, (const uint8_t *)"edited ", 7) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    r4_foreign_atomic_save(path, "foreign");
+    CHECK(file_resolve_keep(&f1) == FILE_ERR_CHANGED);
+    file_expectation absent;
+    os_err oe;
+    CHECK(file_expectation_observe_path(as, &absent, &oe) == FILE_OK);
+    save_prepare(&f1, s, as, &absent, 0);
+    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE && last_msg.status == FILE_ERR_CHANGED);
+    CHECK(!exists(as));
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* R3-A: "not renamed" needs the destination to still match its
+ * expectation; a destination moved back onto our temp name by a foreign
+ * rename is unknown, and nothing is unlinked. */
+static void t_r4_rename_back(void)
+{
+    const char *dir = ROOT "/r4/back";
+    const char *path = ROOT "/r4/back/b.txt";
+    put_file(path, "old!", 4);
+    unlink_temps(dir);
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("ours");
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    char tp[4096];
+    CHECK(snprintf(tp, sizeof tp, "%s/%s", dir, tmp.tmp) < (int)sizeof tp);
+    atomic_store(&rename_inject, RENAME_BACK);
+    file_save_outcome out;
+    CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
+    CHECK(out.pub == FILE_PUB_RENAME_UNCERTAIN && tmp.state == FILE_TEMP_HELD);
+    CHECK(file_eq(tp, "ours", 4)); /* nothing unlinked */
+    CHECK(!exists(path));
+    file_temp_discard(&tmp);
+    CHECK(file_eq(tp, "ours", 4));
+    CHECK(unlink(tp) == 0);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* R3-C: a restart that meets an unreadable or absent installed name is a
+ * mismatch, not an I/O error repeated on every start. */
+static void t_r4_recover_unreadable_absent(void)
+{
+    const char *path = ROOT "/r4/recover.txt";
+    file_temp tmp;
+    piece_tree *t;
+    piece_snapshot *s;
+    r3_install(path, &tmp, &t, &s);
+    file_witness w = tmp.witness;
+    file_temp_discard(&tmp);
+    int fds0 = count_fds();
+    file_temp rec;
+    memset(&rec, 0, sizeof rec);
+    os_err oe = OS_OK;
+    CHECK(chmod(path, 0060) == 0);
+    CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_CHANGED && oe == OS_E_ACCESS);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    CHECK(chmod(path, 0600) == 0 && unlink(path) == 0);
+    oe = OS_OK;
+    CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_CHANGED && oe == OS_E_NOENT);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
 /* ---- children (file_test --child NAME ARG) ------------------------------- */
 static uint32_t child_result_perm;
 static const char *child_dir;
@@ -2355,6 +2502,10 @@ int main(int argc, char **argv)
     RUN(t_r3_installed_touched);
     RUN(t_r3_null_ctx_validator);
     RUN(t_r3_creation_mask);
+    RUN(t_r4_copy_after_foreign_save);
+    RUN(t_r4_mapped_still_refuses);
+    RUN(t_r4_rename_back);
+    RUN(t_r4_recover_unreadable_absent);
     RUN(t_durability);
     FIRED();
     piece_reserve_destroy(reserve);
