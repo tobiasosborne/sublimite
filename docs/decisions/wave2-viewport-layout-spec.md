@@ -297,4 +297,23 @@ so.
 (Advisor, 2026-11-25, at the font signature.) The layout_paint callback shapes in this text are NO LONGER provisional.
 If the first implementer finds a mismatch with font_async_lookup, that is an erratum to bring to the advisor, not a
 local convention.
+E9 (word-motion stopping rule; viewport round-3 re-review item 1). A cluster's class is the class of its first scalar,
+and the boundary before it is known as soon as that scalar has been seen. The walker therefore decides at a cluster's
+START and never steps into a cluster it rejects. The S2 word rows' bound is: "bytes of accepted clusters + one scalar of
+lookahead + distance to the proof (backward only)".
+E10 (endpoint normalisation; item 5). A caret inside a scalar is reachable from user data (stray bytes 82 AC in a file,
+then E2 pasted in front of them: the caret after the paste sits inside a now-valid U+20AC), so it never reaches an
+ASSERT.
+- The precondition is any byte offset in [0, length], and the walker normalises.
+- If the byte at an endpoint is a UTF-8 continuation byte, look back at most three bytes with the strict decoder. If a
+  valid scalar spans the endpoint, RIGHT and the forward word walks start from that scalar's end, and LEFT and the
+  backward walks from its start.
+- An endpoint inside a cluster but on a scalar boundary needs nothing: forward segmentation from it ends at the true
+  cluster end, and the backward walk already starts from a proof.
+- The header states this, in place of "treated as a cluster boundary".
+(Item 4, rank evidence after VP_WAIT; no new erratum number, it applies Q10's late-rank rule to the port.) The motion
+cursor holds offsets, never a snapshot, and its evidence may come from ANY snapshot of the intent's text serial. After
+VP_WAIT the driver calls the step again only when it holds a snapshot of that same text serial with newer line
+knowledge, and answers the pending request from it. Nothing in the cursor refers to the earlier snapshot, and no window
+borrow outlives the step that consumed it.
 
