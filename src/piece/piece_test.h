@@ -21,9 +21,8 @@ typedef struct piece_test_stats {
     size_t slots_claimed, live_slots, available_slots, slots_per_extent, extents, free_extents;
     /* Physical sizes in native pages, rounded per base mapping. */
     size_t page, chunk_pages, dir_pages, core_pages, tree_pages, reserve_pages;
-    /* ADD chunks and directory nodes this core holds; the reserve's spare
-     * private boundary chunk (0 or 1) and spare directory nodes. */
-    size_t add_chunks, add_dirs, spare_chunks, spare_dirs;
+    /* ADD chunks and directory nodes this core holds. */
+    size_t add_chunks, add_dirs;
     /* Since piece_test_reset_reads: bytes read from the mapped ORIGINAL
      * (edits, describe with counts, queries, resolve; not the sanitizer-only
      * provenance recount), bytes read from private stores, query node

@@ -78,11 +78,9 @@ static undo_err replace_cmd(undo_log *u, uint64_t off, uint64_t del, const uint8
     undo_err e = undo_begin(u, before, join);
     if (e != UNDO_OK) return e;
     e = undo_replace(u, off, del, bytes, len);
-    if (e != UNDO_OK) {
-        undo_abort(u);
-        return e;
-    }
-    return undo_commit(u, after);
+    if (e == UNDO_OK) e = undo_commit(u, after);
+    if (e != UNDO_OK) undo_abort(u); /* D1': the owner closes a failed command */
+    return e;
 }
 
 static undo_err insert_cmd(undo_log *u, uint64_t off, const uint8_t *bytes, size_t len,
@@ -131,9 +129,12 @@ static undo_err replay_commit(undo_log *u, undo_replay_direction direction, uint
 {
     const undo_state *target;
     undo_err e = undo_replay_prepare(u, direction, deadline, &target);
-    if (e != UNDO_OK) return e;
-    ASSERT(target && (!want || memcmp(target, want, sizeof *want) == 0));
-    return undo_commit(u, target);
+    if (e == UNDO_OK) {
+        ASSERT(target && (!want || memcmp(target, want, sizeof *want) == 0));
+        e = undo_commit(u, target);
+    }
+    if (e != UNDO_OK && e != UNDO_MORE) undo_abort(u); /* D1': the owner closes a failed replay */
+    return e;
 }
 
 static void history_eq(undo_log *u, undo_history h, undo_stats s)
@@ -219,13 +220,13 @@ static void owner_replay(void)
     apply_splices(f.log, &image, s.records);
     piece_snapshot *candidate;
     ASSERT(piece_snapshot_take(f.tree, &candidate) == PIECE_OK);
+    text_eq(piece_snapshot_view(candidate), image.bytes);
+    piece_snapshot_release(candidate); /* provisional: released before the abort */
     undo_abort(f.log);
     text_eq(v, before.bytes);
-    text_eq(piece_snapshot_view(candidate), image.bytes);
     ASSERT(piece_add_length(f.tree) == sizeof add - 1);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
     history_eq(f.log, h, s);
-    piece_snapshot_release(candidate);
 
     ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
     image = before;
@@ -318,6 +319,8 @@ static void replay_admission(void)
     undo_err e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target);
     ph_refuse(false);
     ASSERT(e == UNDO_ERR_NOMEM && !target && ph_calls() > calls);
+    text_eq(v, ""); /* the resumed failure left the checkpoint open */
+    undo_abort(f.log);
     text_eq(v, "x");
     history_eq(f.log, h, s);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
@@ -329,6 +332,8 @@ static void replay_admission(void)
     e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target);
     piece_test_set_height_limit(PIECE_MAX_HEIGHT);
     ASSERT(e == UNDO_ERR_RANGE && !target);
+    text_eq(v, "");
+    undo_abort(f.log);
     text_eq(v, "x");
     history_eq(f.log, h, s);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
@@ -416,6 +421,8 @@ static void one_span_mapped(void)
     ASSERT(piece_length(v) == sizeof sample - len);
     trust = false;
     ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_CONFLICT && !target);
+    ASSERT(piece_length(v) == sizeof sample - len); /* open until the owner aborts */
+    undo_abort(f.log);
     ASSERT(piece_length(v) == sizeof sample - len + 1 && piece_byte_at(v, off) == 'x');
     trust = true;
     expect_replay = &original;
@@ -484,9 +491,18 @@ static void mapped_prepared_validator_refusal(void)
     text_eq(v, "a\nb");
     history_eq(f.log, h, s); /* counters stay at the entry boundary while prepared */
 
+    piece_snapshot *candidate;
+    ASSERT(piece_snapshot_take(f.tree, &candidate) == PIECE_OK);
     trust = false;
     ASSERT(undo_commit(f.log, target) == UNDO_ERR_CONFLICT);
     trust = true;
+    /* D1': closing CONFLICT leaves the checkpoint open. The owner releases
+     * its provisional candidate, then aborts; no log call comes between. */
+    text_eq(v, "a\nb");
+    ASSERT(piece_add_length(f.tree) == add);
+    text_eq(piece_snapshot_view(candidate), "a\nb");
+    piece_snapshot_release(candidate);
+    undo_abort(f.log);
     text_eq(v, "x\nby"); /* the whole group rolled back */
     ASSERT(piece_add_length(f.tree) == add);
     ASSERT(undo_replay_snapshot(f.log) == NULL); /* replay state reset to idle */
@@ -528,6 +544,8 @@ static void mapped_fault_poll_conflicts(void)
     ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_CONFLICT);
     ph_poll_set(PH_POLL_REAL);
     ASSERT(!target);
+    text_eq(v, "x\nb"); /* open until the owner aborts */
+    undo_abort(f.log);
     text_eq(v, "x\nby");
     ASSERT(piece_add_length(f.tree) == add && undo_replay_snapshot(f.log) == NULL);
     history_eq(f.log, h, s);
@@ -542,6 +560,8 @@ static void mapped_fault_poll_conflicts(void)
     late_replay = PH_POLL_REAL;
     ph_poll_set(PH_POLL_REAL);
     ASSERT(!target);
+    text_eq(v, "a\nb"); /* the resumed splice landed; open until the owner aborts */
+    undo_abort(f.log);
     text_eq(v, "x\nby");
     ASSERT(piece_add_length(f.tree) == add && undo_replay_snapshot(f.log) == NULL);
     history_eq(f.log, h, s);
@@ -550,9 +570,14 @@ static void mapped_fault_poll_conflicts(void)
     /* Closing poll: prepare succeeds, the poll faults before commit. */
     ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_OK && target);
     text_eq(v, "a\nb");
+    piece_snapshot *candidate;
+    ASSERT(piece_snapshot_take(f.tree, &candidate) == PIECE_OK);
     ph_poll_set(PH_POLL_FAULTED);
     ASSERT(undo_commit(f.log, target) == UNDO_ERR_CONFLICT);
     ph_poll_set(PH_POLL_REAL);
+    text_eq(v, "a\nb");
+    piece_snapshot_release(candidate);
+    undo_abort(f.log);
     text_eq(v, "x\nby");
     ASSERT(piece_add_length(f.tree) == add && undo_replay_snapshot(f.log) == NULL);
     history_eq(f.log, h, s);
@@ -697,6 +722,8 @@ static void typing_abort_reuse(void)
     piece_snapshot *inside;
     ASSERT(piece_snapshot_take(f.tree, &inside) == PIECE_OK);
     ASSERT(undo_get_stats(f.log).history_bytes == GROUP_RECORD_BYTES + 1);
+    text_eq(piece_snapshot_view(inside), "ax");
+    piece_snapshot_release(inside); /* provisional: released before the abort */
     undo_abort(f.log);
     text_eq(v, "a");
     ASSERT(piece_add_length(f.tree) == 1);
@@ -706,8 +733,6 @@ static void typing_abort_reuse(void)
     text_eq(v, "");
     ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, 0, NULL) == UNDO_OK);
     text_eq(v, "ab");
-    text_eq(piece_snapshot_view(inside), "ax");
-    piece_snapshot_release(inside);
     close_fixture(f);
 }
 
@@ -885,8 +910,9 @@ static void sliced_abort(void)
     fixture f = open_copy(NULL, 0);
     const piece_view *v = piece_tree_view(f.tree);
     /* (P) Start at ADD mark C-1. The two-byte literal then straddles C.
-     * A later slice failure rolls back the group. An independently retained
-     * inside snapshot survives, and a retry still uses the same literal. */
+     * A later slice failure leaves the group open; the owner reads and
+     * releases its inside snapshot, keeps the pre-group view, and aborts.
+     * A retry still uses the same literal. */
     static uint8_t pad[PIECE_CHUNK - 3];
     ASSERT(insert_cmd(f.log, 0, pad, sizeof pad, false, &idle, &idle) == UNDO_OK);
     ASSERT(replace_cmd(f.log, 0, sizeof pad, (const uint8_t *)"a\n", 2, false, &idle, &idle) == UNDO_OK);
@@ -919,9 +945,14 @@ static void sliced_abort(void)
     fail_replay = true;
     size_t calls = ph_calls();
     ph_refuse(true); /* Abort also succeeds with total base refusal. */
-    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_NOMEM);
+    undo_err e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target);
+    text_eq(v, "b");
+    text_eq(piece_snapshot_view(inside), "b");
+    piece_snapshot_release(inside);
+    undo_abort(f.log);
     ph_refuse(false);
     fail_replay = false;
+    ASSERT(e == UNDO_ERR_NOMEM);
     ASSERT(ph_calls() == calls);
     ASSERT(!target);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
@@ -931,7 +962,6 @@ static void sliced_abort(void)
     ASSERT(after.group_serial == h.group_serial && after.evicted_groups == h.evicted_groups);
     ASSERT(undo_get_stats(f.log).history_bytes == s.history_bytes);
     text_eq(v, "bc");
-    text_eq(piece_snapshot_view(inside), "b");
     text_eq(piece_snapshot_view(pre), "bc");
     piece_snapshot_release(pre);
     ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &first) == UNDO_OK);
@@ -945,13 +975,14 @@ static void sliced_abort(void)
     fail_replay = true;
     ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_NOMEM && !target);
     fail_replay = false;
+    text_eq(v, "b");
+    undo_abort(f.log);
     text_eq(v, "a\n");
     ASSERT(undo_get_history(f.log).redo_groups == 1);
     ASSERT(replay_commit(f.log, UNDO_REPLAY_REDO, OS_DEADLINE_NEVER, &last) == UNDO_OK);
     ASSERT(piece_add_length(f.tree) == add);
     text_eq(v, "bc");
     ph_spans_free(&restore);
-    piece_snapshot_release(inside);
     close_fixture(f);
 }
 
@@ -1107,7 +1138,8 @@ static void later_group_refusal(void)
     fixture f = open_copy(NULL, 0);
     const piece_view *v = piece_tree_view(f.tree);
     /* (P) Two records in the older group and one in the newest. The
-     * second mutation of the older group fails after rewind begins. */
+     * second mutation of the older group fails after rewind begins: even
+     * an uninterrupted first call leaves the checkpoint open (D1', one rule). */
     ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
     ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"b", 1) == UNDO_OK);
     ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"a", 1) == UNDO_OK);
@@ -1119,6 +1151,8 @@ static void later_group_refusal(void)
     const undo_state *target;
     ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target) == UNDO_ERR_NOMEM);
     ASSERT(fail_replay_step == 0 && !target);
+    text_eq(v, "b");
+    undo_abort(f.log);
     text_eq(v, "ab");
     ASSERT(piece_add_length(f.tree) == add);
     undo_history h = undo_get_history(f.log);
@@ -1126,6 +1160,100 @@ static void later_group_refusal(void)
     ASSERT(replay_commit(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, NULL) == UNDO_OK);
     text_eq(v, "");
     close_fixture(f);
+}
+
+/* D1' (advisor 2026-11-24), the rule in undo.h: no undo call closes a
+ * checkpoint by itself. Each failing call leaves its checkpoint open or
+ * opened none; the owner's undo_abort then restores the state before the
+ * command or group, and is a no-op when nothing was opened. */
+static void owner_abort_rule(void)
+{
+    fixture f = open_copy((const uint8_t *)"ab", 2);
+    const piece_view *v = piece_tree_view(f.tree);
+    undo_abort(f.log); /* nothing opened: a no-op */
+    undo_abort(f.log);
+    ASSERT(undo_get_history(f.log).undo_groups == 0);
+    text_eq(v, "ab");
+
+    /* undo_begin refused (no free slot for the restore header, base
+     * refusing): nothing opened, abort is a no-op. */
+    ASSERT(insert_cmd(f.log, 2, (const uint8_t *)"c", 1, false, &first, &last) == UNDO_OK);
+    undo_history h = undo_get_history(f.log);
+    undo_stats s = undo_get_stats(f.log);
+    (void)piece_reclaim(f.tree, SIZE_MAX);
+    size_t held = piece_test_measure(f.tree).available_slots;
+    for (size_t i = 0; i < held; i++) piece_test_hold_slot(f.tree);
+    ph_refuse(true);
+    undo_err e = undo_begin(f.log, &idle, false);
+    ph_refuse(false);
+    for (size_t i = 0; i < held; i++) piece_test_release_slot(f.tree);
+    ASSERT(e == UNDO_ERR_NOMEM);
+    undo_abort(f.log);
+    text_eq(v, "abc");
+    history_eq(f.log, h, s);
+
+    /* undo_replace refused: open; abort restores the text before begin. */
+    ASSERT(undo_begin(f.log, &idle, false) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 1, (const uint8_t *)"X", 1) == UNDO_OK);
+    fail_at_add_mark = piece_add_length(f.tree);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"Y", 1) == UNDO_ERR_NOMEM);
+    fail_at_add_mark = 0;
+    text_eq(v, "Xbc");
+    undo_abort(f.log);
+    text_eq(v, "abc");
+    history_eq(f.log, h, s);
+
+    /* Initial prepare, a failure after the group's first mutation: open;
+     * abort restores the text before the group. */
+    ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 3, 0, (const uint8_t *)"d", 1) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 4, 0, (const uint8_t *)"!", 1) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"e", 1) == UNDO_OK);
+    ASSERT(undo_commit(f.log, &last) == UNDO_OK);
+    text_eq(v, "eabcd!");
+    h = undo_get_history(f.log);
+    s = undo_get_stats(f.log);
+    const undo_state *target = &idle;
+    fail_replay_step = 2;
+    e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target);
+    ASSERT(e == UNDO_ERR_NOMEM && !target && fail_replay_step == 0);
+    text_eq(v, "abcd!");
+    undo_abort(f.log);
+    text_eq(v, "eabcd!");
+    history_eq(f.log, h, s);
+
+    /* Resumed prepare: open; abort restores the text before the group. */
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE && !target);
+    text_eq(v, "abcd!");
+    target = &idle;
+    fail_replay_step = 1;
+    e = undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, OS_DEADLINE_NEVER, &target);
+    ASSERT(e == UNDO_ERR_NOMEM && !target);
+    text_eq(v, "abcd!");
+    undo_abort(f.log);
+    text_eq(v, "eabcd!");
+    history_eq(f.log, h, s);
+
+    /* Explicit cancellation right after MORE: undo releases its own guard
+     * before piece aborts (abort, clear and destroy). */
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE);
+    undo_abort(f.log);
+    text_eq(v, "eabcd!");
+    history_eq(f.log, h, s);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_REDO, 0, &target) == UNDO_OK && !target);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE);
+    undo_clear(f.log);
+    text_eq(v, "eabcd!");
+    ASSERT(undo_get_history(f.log).undo_groups == 0);
+    ASSERT(undo_begin(f.log, &first, false) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"1", 1) == UNDO_OK);
+    ASSERT(undo_replace(f.log, 0, 0, (const uint8_t *)"2", 1) == UNDO_OK);
+    ASSERT(undo_commit(f.log, &last) == UNDO_OK);
+    ASSERT(undo_replay_prepare(f.log, UNDO_REPLAY_UNDO, 0, &target) == UNDO_MORE);
+    undo_destroy(f.log);
+    text_eq(v, "21eabcd!");
+    piece_close(f.tree);
+    piece_reserve_destroy(f.reserve);
 }
 
 static void check_rank_eof(const piece_view *v)
@@ -1159,6 +1287,9 @@ static void late_fault_rollback(void)
     ASSERT(undo_commit(f.log, &last) == UNDO_ERR_CONFLICT);
     late_forward = PH_POLL_REAL;
     ph_poll_set(PH_POLL_REAL);
+    text_eq(v, "x\nb"); /* open until the owner aborts */
+    ASSERT(piece_add_length(f.tree) == 2);
+    undo_abort(f.log);
     text_eq(v, "a\nb");
     check_rank_eof(v);
     ASSERT(piece_add_length(f.tree) == 0 && undo_get_history(f.log).group_serial == 0);
@@ -1178,6 +1309,8 @@ static void late_fault_rollback(void)
     late_replay = PH_POLL_REAL;
     ph_poll_set(PH_POLL_REAL);
     ASSERT(!target);
+    text_eq(v, "a\nb"); /* the resumed splice landed; open until the owner aborts */
+    undo_abort(f.log);
     ASSERT(undo_replay_snapshot(f.log) == NULL);
     ASSERT(piece_add_length(f.tree) == add);
     undo_history h = undo_get_history(f.log);
@@ -1262,6 +1395,7 @@ int main(int argc, char **argv)
         typing_record();
         sliced_abort();
         later_group_refusal();
+        owner_abort_rule();
     }
     midpoint_reads();
     threshold();

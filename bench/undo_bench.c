@@ -44,8 +44,10 @@ static void report(const char *label, uint64_t times[SAMPLES])
 static bool replay(undo_log *u, undo_replay_direction direction)
 {
     const undo_state *target;
-    return undo_replay_prepare(u, direction, OS_DEADLINE_NEVER, &target) == UNDO_OK &&
-           target && undo_commit(u, target) == UNDO_OK;
+    undo_err e = undo_replay_prepare(u, direction, OS_DEADLINE_NEVER, &target);
+    if (e == UNDO_OK && target) e = undo_commit(u, target);
+    if (e != UNDO_OK) undo_abort(u); /* owner abort (undo.h); a no-op if nothing opened */
+    return e == UNDO_OK && target;
 }
 
 int main(void)
@@ -69,11 +71,10 @@ int main(void)
              * Replenishment is outside the measured UI operation. */
             uint64_t start = os_now_ns();
             if (undo_begin(u, &state, false) != UNDO_OK) break;
-            if (undo_replace(u, i, 0, &byte, 1) != UNDO_OK) {
+            if (undo_replace(u, i, 0, &byte, 1) != UNDO_OK || undo_commit(u, &state) != UNDO_OK) {
                 undo_abort(u);
                 break;
             }
-            if (undo_commit(u, &state) != UNDO_OK) break;
             insert[i] = os_now_ns() - start;
             if (piece_replenish(t) != PIECE_OK) break;
             start = os_now_ns();

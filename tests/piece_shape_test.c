@@ -170,20 +170,19 @@ static void version_headers(void)
     REQUIRE(s.add_chunks == 1u && s.chunk_pages == 17u && add == 69632u);
     /* ADD directory: chunk 0 is its own root, no radix node. */
     const size_t directory = 0;
-    REQUIRE(s.add_dirs == 0 && s.spare_dirs == 0);
+    REQUIRE(s.add_dirs == 0);
     /* Fixed descriptors, one base mapping each, each under a page: the
      * core, the tree, the process reserve. */
     const size_t core = 4096u, tree = 4096u, reserve_descriptor = 4096u;
     REQUIRE(s.core_pages == 1u && s.tree_pages == 1u && s.reserve_pages == 1u);
     /* Reserve target after replenish: W(3) = 1 + (4 x 3 + 3) + (2 x 4 + 3)
      * + 1 = 28 slots; the core's pages are full (25,950 mod 10 = 0), so the
-     * reserve keeps ceil(28 / 10) = 3 whole extents, plus one spare private
-     * boundary chunk (17 pages) and spare directory nodes for a level-0
-     * directory (none). */
-    const size_t reserve = 3u * 4096u + 17u * 4096u;
-    REQUIRE(s.free_extents == 3u && s.spare_chunks == 1u && reserve == 81920u);
+     * reserve keeps ceil(28 / 10) = 3 whole extents and nothing else (D1':
+     * no spare boundary). */
+    const size_t reserve = 3u * 4096u;
+    REQUIRE(s.free_extents == 3u && reserve == 12288u);
     const size_t total = nodes + add + directory + core + tree + reserve_descriptor + reserve;
-    REQUIRE(total == 10792960u);
+    REQUIRE(total == 10723328u);
     /* (G) The signed outer bound, two potential extra pieces per insert:
      * 65,536 + 4,096 + 96 x 20,000 + 1.25 x 15,000 + 1,920 x 5,000. */
     const size_t outer = 65536u + 4096u + 96u * (PREPENDS + 2u * VERSIONS) +
@@ -243,28 +242,6 @@ static void extents_follow_owners(void)
     piece_reserve_destroy(r);
 }
 
-typedef struct rollback_reader {
-    piece_snapshot *snapshot;
-    uint64_t appended_at;
-    atomic_bool ready, stop, bad;
-} rollback_reader;
-
-static void read_rollback_snapshot(void *ctx)
-{
-    rollback_reader *p = ctx;
-    const piece_view *v = piece_snapshot_view(p->snapshot);
-    bool done;
-    do {
-        done = atomic_load_explicit(&p->stop, memory_order_acquire);
-        uint64_t count;
-        if (!piece_lines_before(v, piece_length(v), &count) || count != 2 ||
-            piece_byte_at(v, p->appended_at) != '\n')
-            atomic_store_explicit(&p->bad, true, memory_order_relaxed);
-        atomic_store_explicit(&p->ready, true, memory_order_release);
-    } while (!done);
-    piece_snapshot_release(p->snapshot);
-}
-
 static void add_directory_rollback(void)
 {
     /* (P) The 65th chunk requires a second radix level (64 pointers
@@ -292,41 +269,35 @@ static void add_directory_rollback(void)
     const uint8_t lf = '\n';
     REQUIRE(piece_replace(t, n, 0, &lf, 1) == PIECE_OK);
 
-    /* The chunk and its two directory nodes were separately prepaid. */
+    /* The inside header is funded by the replenished slots: no base call.
+     * D1': it is provisional, read and released before the abort. */
     calls = ph_calls();
     ph_refuse(true);
     piece_snapshot *inside;
     err = piece_snapshot_take(t, &inside);
     ph_refuse(false);
     REQUIRE(err == PIECE_OK && ph_calls() == calls);
-    rollback_reader reader = { .snapshot = inside, .appended_at = n };
-    atomic_init(&reader.ready, false);
-    atomic_init(&reader.stop, false);
-    atomic_init(&reader.bad, false);
-    os_thread worker;
-    REQUIRE(os_thread_start(&worker, read_rollback_snapshot, &reader) == OS_OK);
-    while (!atomic_load_explicit(&reader.ready, memory_order_acquire)) (void)sched_yield();
+    const piece_view *in = piece_snapshot_view(inside);
+    uint64_t count = 0;
+    REQUIRE(piece_lines_before(in, piece_length(in), &count) && count == 2 && piece_byte_at(in, n) == '\n');
+    piece_snapshot_release(inside);
 
-    /* From here to the join nothing returns early: the reader thread uses
-     * `reader` on this frame until it is stopped and joined. */
+    /* Abort restores the unaligned mark's tail and newline total without a
+     * directory walk; regrowth reuses the restored tail in place. */
     calls = ph_calls();
     ph_refuse(true);
     piece_checkpoint_abort(t);
     const uint8_t letter = 'x';
     err = piece_replace(t, n, 0, &letter, 1);
     ph_refuse(false);
-    bool admitted = err == PIECE_OK && ph_calls() == calls;
+    REQUIRE(err == PIECE_OK && ph_calls() == calls);
     uint64_t rank = 0, saved_rank = 0;
-    bool live_ok = piece_byte_at(v, n) == letter && piece_lines_before(v, n + 1u, &rank) && rank == 1;
+    REQUIRE(piece_byte_at(v, n) == letter && piece_lines_before(v, n + 1u, &rank) && rank == 1);
     const piece_view *saved = piece_snapshot_view(before);
-    bool saved_ok = piece_length(saved) == n && piece_lines_before(saved, n, &saved_rank) && saved_rank == 1;
+    REQUIRE(piece_length(saved) == n && piece_lines_before(saved, n, &saved_rank) && saved_rank == 1);
     piece_snapshot_release(before);
     piece_close(t);
-    atomic_store_explicit(&reader.stop, true, memory_order_release);
-    bool joined = os_thread_join(&worker) == OS_OK;
     piece_reserve_destroy(r);
-    REQUIRE(joined && admitted && live_ok && saved_ok);
-    REQUIRE(!atomic_load_explicit(&reader.bad, memory_order_relaxed));
 }
 
 static void large_replay(void)
@@ -516,13 +487,16 @@ static void resolve_rollback(void)
     for (size_t i = 0; i < held; i++) piece_test_hold_slot(st.t);
 
     bool more = true;
+    uint64_t revision = piece_test_measure(st.t).revision;
     ph_refuse(true);
     piece_err status = piece_lines_resolve(st.t, 1, &more);
+    /* D1': an inside take cannot hit the ordinary pin; with no free slot
+     * the first inside header is refused and leaves *out NULL. */
+    piece_snapshot *cached = old;
+    piece_err take = piece_snapshot_take(st.t, &cached);
     ph_refuse(false);
-    REQUIRE(status == PIECE_ERR_NOMEM);
-    piece_snapshot *cached;
-    REQUIRE(piece_snapshot_take(st.t, &cached) == PIECE_OK && cached == old);
-    piece_snapshot_release(cached);
+    REQUIRE(status == PIECE_ERR_NOMEM && piece_test_measure(st.t).revision == revision);
+    REQUIRE(take == PIECE_ERR_NOMEM && cached == NULL);
     uint64_t rank;
     REQUIRE(!piece_lines_before(v, piece_length(v), &rank) && rank == 0);
 
@@ -698,9 +672,9 @@ static void exact_claims(void)
 static void hundred_tabs(void)
 {
     /* Spec "Empty-tab cost": each empty core owns one extent (its root);
-     * the shared working supply for W(0) = 10 is one more extent and one
-     * spare private boundary chunk: 100 x 4,096 + 4,096 + 69,632 =
-     * 483,328 B of node/header and spare-boundary mappings (P). */
+     * the shared working supply for W(0) = 10 is one more extent:
+     * 101 extent mappings x 4,096 B = 413,696 B (P; D1' deleted the spare
+     * private boundary chunk). */
     enum { TABS = 100 };
     piece_reserve *r;
     piece_tree *tabs[TABS];
@@ -714,17 +688,17 @@ static void hundred_tabs(void)
     piece_test_stats s = piece_test_measure(tabs[TABS - 1]);
     /* (P) The active core's own page has 9 free slots; W(0) - 9 = 1 more
      * slot needs one whole reserve extent. */
-    REQUIRE(s.page == 4096u && s.free_extents == 1 && s.spare_chunks == 1 && s.chunk_pages == 17u);
+    REQUIRE(s.page == 4096u && s.free_extents == 1);
     size_t extents = 0;
     for (unsigned i = 0; i < TABS; i++) extents += piece_test_measure(tabs[i]).extents;
-    size_t mapped = (extents + s.free_extents + s.spare_chunks * s.chunk_pages) * s.page;
-    REQUIRE(extents == TABS && mapped == 483328u);
+    size_t mapped = (extents + s.free_extents) * s.page;
+    REQUIRE(extents == TABS && mapped == 413696u);
     /* Closing returns every extent; the reserve keeps the funded target. */
     for (unsigned i = 0; i + 1 < TABS; i++) piece_close(tabs[i]);
     REQUIRE(piece_test_measure(tabs[TABS - 1]).free_extents == 1);
     piece_close(tabs[TABS - 1]);
     piece_reserve_destroy(r);
-    printf("hundred tabs (P): %zu extents + 1 reserve extent + 1 boundary chunk = %zu B\n",
+    printf("hundred tabs (P): %zu extents + 1 reserve extent = %zu B\n",
            extents, mapped);
 }
 

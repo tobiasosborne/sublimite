@@ -339,17 +339,19 @@ typedef struct ph_state {
     ph_mapping *map;
     piece_snapshot *s[PH_SNAPS];
     pm_snap *ms[PH_SNAPS];
-    bool snap_inside[PH_SNAPS]; /* taken while the checkpoint is open */
-    bool snap_foreign[PH_SNAPS]; /* taken inside an aborted checkpoint: no span source */
+    bool snap_inside[PH_SNAPS]; /* provisional: taken while the checkpoint is open */
     ph_spans list[PH_LISTS];
     bool list_inside[PH_LISTS]; /* obtained while the checkpoint is open */
-    bool list_foreign[PH_LISTS]; /* names ADD the tree no longer holds */
     int mapped_sides; /* trees opened over the mapped backing, IUT and reference */
     ph_cp cp;
     piece_snapshot *last; /* the previous take, and whether the text moved since */
     pm_snap *mlast;
     bool moved;
     uint64_t last_revision; /* the live revision at the previous take */
+    /* Lifetimes (piece.h Snapshots): 0 ordinary, else the serial of the
+     * checkpoint the previous take is provisional for. A hit needs the
+     * lifetime of the requested take. */
+    unsigned cp_serial, last_life;
     bool height_limited; /* a test hook lowered the limit: RANGE is allowed */
     uint64_t seed;
     unsigned steps;
@@ -400,9 +402,23 @@ static inline bool ph_open(ph_state *st, const uint8_t *bytes, size_t n, unsigne
     return true;
 }
 
+/* The owner releases every provisional snapshot before an abort (D1'). */
+static inline void ph_release_inside(ph_state *st)
+{
+    for (unsigned i = 0; i < PH_SNAPS; i++) {
+        if (!st->s[i] || !st->snap_inside[i]) continue;
+        piece_snapshot_release(st->s[i]);
+        pm_snapshot_release(st->ms[i]);
+        st->s[i] = NULL;
+        st->ms[i] = NULL;
+        st->snap_inside[i] = false;
+    }
+}
+
 static inline void ph_close(ph_state *st)
 {
     if (st->cp == PH_CP_OPEN) {
+        ph_release_inside(st);
         if (st->t) piece_checkpoint_abort(st->t);
         pm_checkpoint_abort(st->m);
     }
@@ -426,8 +442,9 @@ static inline void ph_close(ph_state *st)
     memset(st, 0, sizeof *st);
 }
 
-/* Results seen by the IUT calls that can fail, for the suite's summary. */
-static unsigned long ph_seen_ok, ph_seen_nomem, ph_seen_range;
+/* Results seen by the IUT calls that can fail, for the suite's summary;
+ * span reads that copied bytes and that reported RANGE. */
+static unsigned long ph_seen_ok, ph_seen_nomem, ph_seen_range, ph_reads_copied, ph_reads_range;
 
 /* An error is allowed only for the reason the contract gives. */
 static inline void ph_expect_err(const ph_state *st, piece_err e, bool refused, const char *op)
@@ -490,16 +507,17 @@ static inline void ph_op_capture(ph_state *st, uint64_t off, uint64_t len, unsig
     piece_err e = piece_capture(st->t, off, len, &got);
     ph_refuse(false);
     ph_expect_err(st, e, refuse, "capture");
-    /* The text is unchanged: live iterators and the cache survive (piece.h). */
+    /* The text is unchanged: live iterators survive (piece.h). A successful
+     * capture grows the readable ADD prefix, so it ends the cached take. */
     PH_CHECK(ph_revision(st) == revision, "capture moved the live revision");
     if (e != PIECE_OK) return;
+    ph_moved(st);
     PH_CHECK(pm_capture(st->m, off, len, &want) == PIECE_OK, "model capture");
     PH_CHECK(ph_span_eq(got, want) && got.src == (PIECE_SPAN_ADD | a), "capture span {%llx, %llu}",
              PH_U(got.src), PH_U(got.len));
     ph_spans_clear(&st->list[li]);
     ph_spans_push(&st->list[li], got, (piece_span_nl){PIECE_NL_UNKNOWN, PIECE_NL_UNKNOWN});
     st->list_inside[li] = st->cp == PH_CP_OPEN;
-    st->list_foreign[li] = false;
 }
 
 /* Describes [off, off + len) of the live view (src < 0) or of a snapshot. */
@@ -515,7 +533,6 @@ static inline void ph_op_describe(ph_state *st, int src, uint64_t off, uint64_t 
     ph_spans_check(&st->list[li], &ref, "describe");
     ph_spans_free(&ref);
     st->list_inside[li] = st->cp == PH_CP_OPEN;
-    st->list_foreign[li] = src >= 0 && st->snap_foreign[src];
 }
 
 static inline void ph_op_take(ph_state *st, unsigned slot, bool refuse)
@@ -527,7 +544,8 @@ static inline void ph_op_take(ph_state *st, unsigned slot, bool refuse)
         st->ms[slot] = NULL;
     }
     /* A resolve that replaced the root ended the cache without an edit. */
-    bool hit = st->last && !st->moved && ph_revision(st) == st->last_revision;
+    unsigned life = st->cp == PH_CP_OPEN ? st->cp_serial : 0u;
+    bool hit = st->last && !st->moved && ph_revision(st) == st->last_revision && st->last_life == life;
     size_t c0 = ph_calls();
     piece_snapshot *s;
     ph_refuse(refuse);
@@ -552,11 +570,11 @@ static inline void ph_op_take(ph_state *st, unsigned slot, bool refuse)
     st->s[slot] = s;
     st->ms[slot] = ms;
     st->snap_inside[slot] = st->cp == PH_CP_OPEN;
-    st->snap_foreign[slot] = false;
     st->last = s;
     st->mlast = ms;
     st->moved = false;
     st->last_revision = ph_revision(st);
+    st->last_life = life;
 }
 
 static inline void ph_op_release(ph_state *st, unsigned slot)
@@ -578,7 +596,6 @@ static inline void ph_op_retain(ph_state *st, unsigned from, unsigned to)
     st->s[to] = piece_snapshot_retain(st->s[from]);
     st->ms[to] = pm_snapshot_retain(st->ms[from]);
     st->snap_inside[to] = st->snap_inside[from];
-    st->snap_foreign[to] = st->snap_foreign[from];
     PH_CHECK(st->s[to] == st->s[from] && ph_calls() == c0, "retain");
 }
 
@@ -592,13 +609,17 @@ static inline void ph_op_begin(ph_state *st, bool refuse)
     if (e != PIECE_OK) return;
     PH_CHECK(pm_checkpoint_begin(st->m) == PIECE_OK, "model begin");
     st->cp = PH_CP_OPEN;
+    st->cp_serial++;
     for (unsigned i = 0; i < PH_LISTS; i++) st->list_inside[i] = false;
 }
 
-/* Commit and abort run under refusal: they must allocate nothing. */
+/* Commit and abort run under refusal: they must allocate nothing. Abort
+ * follows the owner's release of its provisional snapshots; commit makes
+ * them ordinary. */
 static inline void ph_op_end(ph_state *st, bool abort)
 {
     if (st->cp != PH_CP_OPEN) return;
+    if (abort) ph_release_inside(st);
     size_t c0 = ph_calls();
     ph_refuse(true);
     if (abort) piece_checkpoint_abort(st->t);
@@ -612,11 +633,48 @@ static inline void ph_op_end(ph_state *st, bool abort)
         if (abort && st->list_inside[i]) ph_spans_clear(&st->list[i]); /* spans minted inside are invalid */
         st->list_inside[i] = false;
     }
-    for (unsigned i = 0; i < PH_SNAPS; i++) {
-        if (abort && st->snap_inside[i]) st->snap_foreign[i] = true;
-        st->snap_inside[i] = false;
-    }
+    for (unsigned i = 0; i < PH_SNAPS; i++) st->snap_inside[i] = false;
+    if (st->last_life == st->cp_serial) st->last_life = 0;
     if (abort) ph_moved(st);
+}
+
+/* The reader's validator for the harness: the backing is the held one. */
+static inline bool ph_read_trust(void *ctx, const piece_backing *b)
+{
+    return b != NULL && b == ctx;
+}
+
+/* Reads one slice of a list's span from snapshot slot through the reader
+ * and checks it against the model snapshot's stores: the range rule, the
+ * slice length and the bytes (piece.h piece_snapshot_read_span). */
+static inline void ph_op_read(ph_state *st, unsigned slot, unsigned li, uint32_t pick, size_t cap)
+{
+    if (!st->s[slot] || !st->list[li].n) return;
+    piece_span sp = st->list[li].s[pick % st->list[li].n];
+    uint64_t skip = pick % 3u == 0 ? 0 : (pick >> 8) % (sp.len + 2u);
+    const pm_view *mv = pm_snapshot_view(st->ms[slot]);
+    uint64_t a = sp.src & ~PIECE_SPAN_ADD;
+    uint64_t store = sp.src & PIECE_SPAN_ADD ? st->ms[slot]->add_len : pm_view_core(mv)->orig_len;
+    bool range = sp.len == 0 || a > store || sp.len > store - a || skip > sp.len || (skip < sp.len && cap == 0);
+    uint64_t want = range || skip == sp.len ? 0 : pm_min(pm_min(sp.len - skip, cap),
+                                                         PIECE_CHUNK - (a + skip) % PIECE_CHUNK);
+    static uint8_t buf[PIECE_CHUNK + 1u];
+    buf[want] = 0xa5;
+    const piece_view *v = piece_snapshot_view(st->s[slot]);
+    size_t w = SIZE_MAX, c0 = ph_calls();
+    piece_read_result got = piece_snapshot_read_span(st->s[slot], sp, skip, cap ? buf : NULL, cap, &w,
+                                                     ph_read_trust, (void *)piece_view_backing(v));
+    PH_CHECK(ph_calls() == c0, "read reserved storage");
+    PH_CHECK(got == (range ? PIECE_READ_RANGE : PIECE_READ_OK) && w == want,
+             "read {%llx, %llu} skip %llu cap %zu: %d, %zu bytes, want %d, %llu", PH_U(sp.src), PH_U(sp.len),
+             PH_U(skip), cap, (int)got, w, range ? (int)PIECE_READ_RANGE : (int)PIECE_READ_OK, PH_U(want));
+    if (got == PIECE_READ_RANGE) ph_reads_range++;
+    if (got != PIECE_READ_OK || w != want) return;
+    if (w) ph_reads_copied++;
+    uint64_t room;
+    const uint8_t *ref = pm_at(mv, sp.src + skip, &room);
+    PH_CHECK(room >= want && memcmp(buf, ref, (size_t)want) == 0 && (cap <= want || buf[want] == 0xa5),
+             "read bytes differ from the model's stores");
 }
 
 static inline void ph_op_maintain(ph_state *st, bool refuse, size_t budget)
@@ -664,7 +722,7 @@ static inline void ph_fill(uint8_t *b, size_t n, uint32_t seed)
 enum {
     PH_OP_INSERT, PH_OP_DELETE, PH_OP_REPLACE, PH_OP_LARGE, PH_OP_DESCRIBE, PH_OP_SPANS, PH_OP_CAPTURE,
     PH_OP_TAKE, PH_OP_RELEASE, PH_OP_RETAIN, PH_OP_BEGIN, PH_OP_COMMIT, PH_OP_ABORT, PH_OP_MAINTAIN,
-    PH_OP_CHECK, PH_OP_COUNT
+    PH_OP_CHECK, PH_OP_READ, PH_OP_COUNT
 };
 
 /* One operation from in; returns false when the input is exhausted. */
@@ -709,7 +767,7 @@ static inline bool ph_step(ph_state *st, ph_in *in, uint8_t *scratch)
         break;
     }
     case PH_OP_SPANS:
-        if (!st->list_foreign[li] && st->list[li].len <= PIECE_MAX_LENGTH - len)
+        if (st->list[li].len <= PIECE_MAX_LENGTH - len)
             ph_op_replace_spans(st, off, rest ? (b >> 1) % (rest + 1u) : 0, &st->list[li], b & 1u, refuse);
         break;
     case PH_OP_CAPTURE:
@@ -738,6 +796,9 @@ static inline bool ph_step(ph_state *st, ph_in *in, uint8_t *scratch)
         break;
     case PH_OP_CHECK:
         ph_check_snaps(st, "snapshots");
+        break;
+    case PH_OP_READ: /* windows of 0 to 4,096 B, and one in eight unbounded by the window */
+        ph_op_read(st, slot, li, a, (b & 7u) == 0 ? PIECE_CHUNK + 1u : (size_t)(b % 4097u));
         break;
     default:
         ASSERT(op < PH_OP_COUNT);

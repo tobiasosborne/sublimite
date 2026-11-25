@@ -349,8 +349,8 @@ returns PIECE_ERR_NOMEM only when base refused the exact remainder after every l
 thread is releasing storage, a call may be refused that an immediate retry would not be; nothing latches, the next call
 tries afresh.
 Procedure (at most two plan computations and one base request per call):
-1. Fast path: the scalar claim AND the companion storage the command needs (ADD chunks, the boundary chunk) are both
-   present locally: proceed, no plan, no base call.
+1. Fast path: the scalar claim AND the companion storage the command needs (ADD chunks) are both
+   present locally: proceed, no plan, no base call. (D1', 2026-11-24: the private boundary chunk is deleted.)
 2. Otherwise compute the exact plan; if its remainder is zero, proceed (no drain).
 3. Otherwise use every local source once: drain this tree's retirement queue, take what the reserve and its inbox offer,
    then compute the exact plan again, once (the drain can remove the sharing that made copies necessary); if the
@@ -359,18 +359,21 @@ Procedure (at most two plan computations and one base request per call):
    granted -> proceed; refused -> PIECE_ERR_NOMEM, nothing changed. Amended (advisor, 2026-11-24, on Astra's
    admission read, step 4): "once" is about the plan, not the number of calls. (a) The base requests of one call are
    a fixed list taken from the single exact plan of step 3: the missing extents, then the companion objects (ADD
-   chunks and their directory nodes, or the private boundary's chunk and directory nodes). No plan is recomputed
+   chunks and their directory nodes). No plan is recomputed
    after any request, no request is repeated, the order is fixed. (b) All requests come before publication; any
    refusal returns every object this call took back to base (not into the tree's reserve), and the call returns
    PIECE_ERR_NOMEM with the tree and base's available bytes as they were before the call, apart from what steps 3
-   and 4 returned to base on purpose (retired storage, surplus extents), which stays returned. (c) The list has a
-   stated maximum length per call, structural (Law 4): at most ceil(S / e) + 9 x max(k, 1) objects (P: S the
-   plan's slots; e the slots per extent, (page - sizeof(piece_extent)) / PIECE_SLOT, 10 at a 4,096 B page with
-   PIECE_SLOT = 400 B (piece.c, asserted in piece_shape_test); k the new ADD chunks. The enforced bound on ADD offsets
-   is ASSERT(mark < PIECE_SPAN_ADD - n) with PIECE_SPAN_ADD = 2^63, so chunk indices lie below 2^63 / 2^16 = 2^47
-   and the 64-way directory has at most ceil(47 / 6) = 8 levels; one new chunk costs 1 + 8 objects, and a take's
-   private boundary 1 chunk + at most 8 nodes; a call has ADD objects or boundary objects, never both). Derivation
-   in docs/decisions/v2-0fv.17.md §8.10. Erratum at landing (advisor, 2026-11-24): the first wording assumed ADD
+   and 4 returned to base on purpose (retired storage, surplus extents), which stays returned. (c) Replacement bound
+   (D1', advisor 2026-11-24; docs/decisions/wave1-piece-span-reader.md, D1' pass): from the final exact plan,
+   request missing extents first, then the new ADD chunks and their directory nodes, each once before publication.
+   The list contains at most ceil(S / e) + 9 x k objects (P), where S is the planned slot count, e the slots per
+   extent ((page - sizeof(piece_extent)) / PIECE_SLOT, 10 at a 4,096 B page with PIECE_SLOT = 400 B; piece.c,
+   asserted in piece_shape_test) and k the number of new ADD chunks. ADD offsets are below 2^63 (the enforced
+   ASSERT(mark < PIECE_SPAN_ADD - n), PIECE_SPAN_ADD = 2^63), so 2^16-byte chunk indices use at most 47 bits. A
+   64-way directory needs at most ceil(47 / 6) = 8 levels. Each new chunk can require one chunk and up to eight
+   directory nodes. For k = 0 only the extent term remains: a cache miss has S = 1 and k = 0 and may need one
+   missing extent. The private-boundary term of the earlier bound, 9 x max(k, 1), is deleted with the boundary.
+   Derivation in docs/decisions/v2-0fv.17.md §8.10. Erratum at landing (advisor, 2026-11-24): the first wording assumed ADD
    offsets below 2^47 from the address space, which nothing enforces. Rule from here: a bound in a header that
    names 2^47 or 2^48 is struck on sight unless an ASSERT in the code enforces it.
 Tests: I's and A(1)'s traces assert the contract (refused during the race, the identical retry succeeds, nothing

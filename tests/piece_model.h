@@ -660,6 +660,7 @@ static inline piece_err pm_capture(pm_tree *t, uint64_t off, uint64_t len, piece
     ASSERT(t != NULL && out != NULL);
     ASSERT(len >= 1 && off <= t->text.len && len <= t->text.len - off);
     if (!pm_add_reserve(t, len)) return PIECE_ERR_NOMEM;
+    pm_drop_cache(t); /* a cached take keeps its captured ADD length (erratum (i)) */
     uint64_t a = t->add_len;
     pm_iter it;
     pm_iter_init(&it, &t->view, off);

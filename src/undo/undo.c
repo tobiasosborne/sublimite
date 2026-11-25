@@ -93,8 +93,11 @@ struct undo_slab {
     size_t live;
 };
 
+/* FAILED and REPLAY_FAILED: a call failed with the checkpoint open; only
+ * the owner's undo_abort may follow (D1'). Each keeps the cleanup state of
+ * its kind: pending forward records, or the replay views. */
 typedef enum undo_phase {
-    UNDO_IDLE, UNDO_OPEN, UNDO_FAILED, UNDO_REPLAYING, UNDO_PREPARED
+    UNDO_IDLE, UNDO_OPEN, UNDO_FAILED, UNDO_REPLAYING, UNDO_PREPARED, UNDO_REPLAY_FAILED
 } undo_phase;
 
 typedef struct undo_replay {
@@ -290,9 +293,14 @@ static void retire(undo_log *u, undo_group *first, undo_group *last)
     u->retired_tail = last;
 }
 
+static bool failed(const undo_log *u)
+{
+    return u->phase == UNDO_FAILED || u->phase == UNDO_REPLAY_FAILED;
+}
+
 size_t undo_maintain(undo_log *u, size_t record_budget)
 {
-    ASSERT(u && u->phase != UNDO_FAILED);
+    ASSERT(u && !failed(u));
     if (u->phase != UNDO_IDLE) return 0;
     size_t count = 0;
     while (u->retired_head && count < record_budget) {
@@ -378,11 +386,12 @@ static void release_replay_views(undo_log *u)
 
 void undo_clear(undo_log *u)
 {
-    ASSERT(u && u->phase != UNDO_FAILED && u->phase != UNDO_PREPARED);
+    ASSERT(u && !failed(u) && u->phase != UNDO_PREPARED);
     switch (u->phase) {
     case UNDO_IDLE:
     case UNDO_FAILED:
     case UNDO_PREPARED:
+    case UNDO_REPLAY_FAILED:
         break;
     case UNDO_OPEN:
     case UNDO_REPLAYING:
@@ -414,14 +423,14 @@ void undo_set_cap(undo_log *u, size_t cap_bytes)
 
 undo_history undo_get_history(const undo_log *u)
 {
-    ASSERT(u && u->phase != UNDO_FAILED);
+    ASSERT(u && !failed(u));
     return (undo_history){u->applied_groups, u->groups - u->applied_groups,
                           u->evicted_groups, u->serial};
 }
 
 undo_stats undo_get_stats(const undo_log *u)
 {
-    ASSERT(u && u->phase != UNDO_FAILED);
+    ASSERT(u && !failed(u));
     return (undo_stats){u->records, u->bytes, u->span_payload, u->storage};
 }
 
@@ -459,18 +468,21 @@ static void discard_pending(undo_log *u)
 
 void undo_abort(undo_log *u)
 {
-    ASSERT(u && u->phase != UNDO_IDLE);
-    piece_checkpoint_abort(u->tree);
+    ASSERT(u);
     switch (u->phase) {
     case UNDO_IDLE:
-        break;
+        return; /* the failed call opened nothing */
     case UNDO_OPEN:
     case UNDO_FAILED:
+        piece_checkpoint_abort(u->tree);
         discard_pending(u);
         break;
     case UNDO_REPLAYING:
     case UNDO_PREPARED:
+    case UNDO_REPLAY_FAILED:
+        /* The guard is undo's own provisional pin: released before abort. */
         release_replay_views(u);
+        piece_checkpoint_abort(u->tree);
         break;
     }
     u->phase = UNDO_IDLE;
@@ -762,7 +774,7 @@ undo_err undo_commit(undo_log *u, const undo_state *after)
     ASSERT(u && after && (u->phase == UNDO_OPEN ||
                           (u->phase == UNDO_PREPARED && after == replay_target(&u->replay))));
     if (!trusted(u)) {
-        undo_abort(u);
+        u->phase = u->phase == UNDO_PREPARED ? UNDO_REPLAY_FAILED : UNDO_FAILED;
         return UNDO_ERR_CONFLICT;
     }
     piece_checkpoint_commit(u->tree);
@@ -900,7 +912,8 @@ undo_err undo_replay_prepare(undo_log *u, undo_replay_direction direction,
     }
 
 abort_group:
-    if (u->phase == UNDO_REPLAYING) undo_abort(u);
+    /* The checkpoint, if this group opened one, stays open for the owner. */
+    if (u->phase == UNDO_REPLAYING) u->phase = UNDO_REPLAY_FAILED;
     return e;
 }
 
@@ -958,6 +971,6 @@ piece_span undo_splice_span(const undo_prepared_splice *splice, size_t index)
 
 piece_snapshot *undo_replay_snapshot(const undo_log *u)
 {
-    ASSERT(u && u->phase != UNDO_FAILED);
+    ASSERT(u && !failed(u));
     return u->phase == UNDO_REPLAYING || u->phase == UNDO_PREPARED ? u->replay.view : NULL;
 }

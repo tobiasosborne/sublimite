@@ -46,15 +46,11 @@
  * description, ADD length, checkpoint, snapshot cache and every snapshot
  * are as they were.
  *
- * SIZES. A text is at most PIECE_MAX_LENGTH = 2^60 bytes, an invariant
- * every open and edit ASSERTs of its result. Why it holds (P): every
- * descriptor lies inside one PIECE_CHUNK-aligned chunk of its store, so a
- * text of length L needs at least L / 65,536 descriptors of at least 16 B
- * (the signed leaf entry); with 4-level paging the 2^47-byte address space
- * keeps L below 2^47 / 16 x 2^16 = 2^59. 5-level paging would allow about
- * 2^56 / 16 x 2^16 = 2^68, so there the ASSERT is what holds it. Every
- * newline sum is then at most 2^60 too (Lines: one newline per byte). ADD's bytes are all stored, so
- * its length stays below the address space, far under bit 63.
+ * SIZES. A text is at most PIECE_MAX_LENGTH = 2^60 bytes. The ASSERT on
+ * PIECE_MAX_LENGTH that every open and edit makes of its result is what
+ * holds it. Every newline sum is then at most 2^60 too (Lines: one newline
+ * per byte). ADD's length stays below 2^63 by the ASSERT in
+ * piece_add_prepare.
  *
  * STORAGE. Tree nodes, snapshot headers and checkpoint restore points occupy
  * interchangeable 400 B slots (P, spec "Choosing the slot") in whole page
@@ -68,17 +64,16 @@
  * slots and the reserve's whole free extents, then, once, from its tree's
  * retirement queue and the reserve's inbox, then from base for exactly the
  * remainder, after returning whole free extents beyond the exact slot need
- * (erratum, A26 step 4 as amended): a fixed list of base requests taken from
- * that single plan, the missing extents and then the companion objects (ADD
- * chunks and their directory nodes, or the private boundary's chunk and
- * directory nodes), each once and in that order, all before anything is
- * published, at most ceil(S / e) + 9 x max(k, 1) of them (P: S the planned
- * slots; e the slots per extent, (page - sizeof(piece_extent)) / 400 B,
- * which is 10 at a 4,096 B page; k the new ADD chunks. ADD offsets are below
- * 2^63 by the ASSERT in piece_add_prepare, so chunk indices are below
- * 2^63 / 2^16 = 2^47 and the 64-way ADD directory has at most
- * ceil(47 / 6) = 8 levels: a new chunk costs 1 + 8 objects, and so does a
- * take's private boundary). A refusal returns every object the call took to base
+ * (erratum, A26 step 4 as amended, and D1'): from the final exact plan,
+ * request missing extents first, then the new ADD chunks and their directory
+ * nodes, each once before publication. The list contains at most
+ * ceil(S / e) + 9 x k objects (P: S the planned slot count; e the slots per
+ * extent, (page - sizeof(piece_extent)) / 400 B, which is 10 at a 4,096 B
+ * page; k the new ADD chunks. ADD offsets are below 2^63 by the ASSERT in
+ * piece_add_prepare, so 2^16-byte chunk indices use at most 47 bits and a
+ * 64-way directory needs at most ceil(47 / 6) = 8 levels: each new chunk can
+ * require one chunk and up to eight directory nodes; for k = 0 only the
+ * extent term remains). A refusal returns every object the call took to base
  * and the call returns PIECE_ERR_NOMEM with the tree, and base apart from
  * what those steps returned on purpose, as before. Exactness is promised at
  * quiescence: with no release by
@@ -126,8 +121,8 @@ typedef struct piece_view piece_view;
 #define PIECE_CHUNK 65536u
 
 /* A run of the description: len >= 1 bytes from coordinate src on. Bit 63 of
- * src selects ADD; the other bits are the offset in that store (below 2^47,
- * SIZES). 16 B (P), the inverse payload unit of the spec. */
+ * src selects ADD; the other bits are the offset in that store (below 2^63,
+ * the ASSERT in piece_add_prepare). 16 B (P), the inverse payload unit of the spec. */
 typedef struct piece_span {
     uint64_t src;
     uint64_t len;
@@ -157,8 +152,8 @@ typedef struct piece_span {
  * records with this provenance. A caller that clips a span describes it
  * again with end. ORIGINAL must be in the same validated source generation.
  * ADD provenance follows byte lineage and ends when an abort lowers ADD below
- * the span's end, also when described after the abort from a snapshot that
- * survived it. A true count stays true while the backing is trusted: it
+ * the span's end (no snapshot that could describe such a span survives the
+ * abort: D1', Snapshots). A true count stays true while the backing is trusted: it
  * belongs to its coordinates. */
 typedef struct piece_span_nl {
     uint32_t head;
@@ -196,16 +191,16 @@ typedef struct piece_backing {
     void (*release)(void *ctx);
 } piece_backing;
 
-/* The owner checks the live identity of this mapped backing. The check
- * returns true on a verified match. It must leave the tree and its
- * owners untouched and complete without waiting. The owner keeps ctx
- * alive for the borrowing log or request, including retired work. */
+/* The owner checks the live identity of this mapped backing. True means
+ * verified match. The check runs on the calling thread, leaves piece and
+ * its owners untouched, and completes without waiting. The owner keeps
+ * ctx alive through the last use by the borrowing operation. */
 typedef bool (*piece_validate_fn)(void *ctx, const piece_backing *backing);
 
 /* ---- Reserve and trees -------------------------------------------------- */
 
 /* The UI-owned process reserve: whole free page extents that any core may
- * draw, and the spare private ADD boundary chunk (spec "Extent ownership").
+ * draw (spec "Extent ownership").
  * Create allocates its descriptor from base: PIECE_ERR_NOMEM.
  * ASSERT: out != NULL. */
 piece_err piece_reserve_create(piece_reserve **out);
@@ -383,19 +378,25 @@ piece_err piece_capture(piece_tree *t, uint64_t off, uint64_t len,
 /* ---- Snapshots ---------------------------------------------------------- */
 
 /* Takes an owned, immutable snapshot of the current text and stores it in
- * *out. With no successful non-empty replace and no abort since the previous
- * take, this is a cache hit: *out is that same snapshot with one more owner, and
- * the take claims nothing and returns PIECE_OK. Otherwise it claims one slot
- * for the header (P); inside a checkpoint, the first take that can observe
- * text appended past an unaligned ADD mark also installs one private ADD
- * boundary chunk (spec "Private ADD boundary"). O(1); the tree shares its
- * nodes with the snapshot and copies none. PIECE_ERR_NOMEM, with *out NULL.
- * ASSERT: out != NULL. */
+ * *out. A take pins the current text, ORIGINAL and the readable ADD prefix
+ * [0, piece_add_length(t)) at the instant of the take. A take while a
+ * checkpoint is open is provisional for that checkpoint. Retains share
+ * that lifetime. Release every such ownership before aborting it.
+ * Commit makes all its surviving snapshots ordinary. Snapshots taken
+ * before begin, including the restore view, remain ordinary.
+ *
+ * A cache hit requires the same revision, ADD length, lineage and
+ * lifetime (ordinary or provisional for this open checkpoint). A hit
+ * retains the header and claims nothing. A miss claims one header slot.
+ * On refusal return PIECE_ERR_NOMEM with *out NULL. A successful capture
+ * invalidates the cached take and preserves the live iterator revision.
+ * A refused capture preserves both. O(1); the tree shares its nodes with
+ * the snapshot and copies none. ASSERT: out != NULL. */
 piece_err piece_snapshot_take(piece_tree *t, piece_snapshot **out);
 /* Adds an owner and returns s. Any thread, O(1), claims nothing.
  * ASSERT: s is owned, and it has fewer than 2^64 - 1 owners, a bound no
- * program reaches: every owner occupies storage of its own, so 2^64 of them
- * cannot exist in a 2^47- or 2^56-byte address space (P). The same bound
+ * program reaches: 2^64 owners cannot exist, because each owner holds at
+ * least one byte of an address space smaller than 2^64 bytes (P). The same bound
  * holds a core's owners, its tree and one per live snapshot header. */
 piece_snapshot *piece_snapshot_retain(piece_snapshot *s);
 /* Drops one owner, exactly once per owner. Any thread, O(1). The last
@@ -405,25 +406,69 @@ void piece_snapshot_release(piece_snapshot *s);
 /* The snapshot's view, valid while s is owned. O(1). */
 const piece_view *piece_snapshot_view(const piece_snapshot *s);
 
+typedef enum piece_read_result {
+    PIECE_READ_OK, PIECE_READ_RANGE, PIECE_READ_CONFLICT
+} piece_read_result;
+
+/* Copy the next slice of span starting at byte skip within the span.
+ * s is an owned snapshot. The caller binds span to its tree, ORIGINAL
+ * generation or ADD checkpoint lineage. Store coordinates have the
+ * piece_span encoding. Any byte of the selected store prefix can be
+ * read, including bytes absent from the snapshot's text.
+ *
+ * Check the WHOLE span before copying. Let a = src & ~PIECE_SPAN_ADD,
+ * L = ORIGINAL length or s's captured ADD length according to the tag.
+ * RANGE if len == 0, a > L, len > L - a, or skip > len, in that order
+ * before forming a + skip. At skip == len return OK with *written = 0.
+ * Before the end, zero capacity returns RANGE. Otherwise copy exactly
+ * min(len - skip, capacity, PIECE_CHUNK - ((a + skip) % PIECE_CHUNK))
+ * bytes into dst. On OK, *written is that count. Advance skip by it.
+ *
+ * A nonempty mapped ORIGINAL slice requires validate. On the held
+ * backing, after copying, check live identity and close with a fault
+ * poll after all dependent loads. OK requires validate(ctx, backing)
+ * true and os_fault_poll(backing->fault, ...) == OS_OK with epoch zero.
+ * Missing validation, a rejected identity or a bad poll gives CONFLICT.
+ * ADD, private ORIGINAL and the end position require neither check.
+ * On either error *written = 0. RANGE leaves dst untouched. On CONFLICT
+ * the attempted slice may have been overwritten and must be discarded.
+ * The caller must also close validation for the enclosing operation
+ * before publishing any result that depends on mapped reads.
+ *
+ * Any thread holding s may call, with a validator suitable for that
+ * thread and allocation-free on the typing path. written is a live
+ * output pointer. If capacity is positive,
+ * dst designates that much writable storage. Outputs are disjoint from
+ * each other and from the stores. NULL dst is allowed at zero capacity.
+ * No allocations, tree walk or shared-state mutation by the reader. */
+piece_read_result piece_snapshot_read_span(const piece_snapshot *s,
+                                           piece_span span, uint64_t skip,
+                                           uint8_t *dst, size_t capacity,
+                                           size_t *written,
+                                           piece_validate_fn validate, void *ctx);
+
 /* ---- Checkpoint --------------------------------------------------------- */
 
-/* One atomic group of edits per tree, at most one open (spec "Private ADD
- * boundary"; PLAN §4.2). Begin records a restore point: the current text,
- * description and ADD length. Snapshots and spans obtained before begin stay
- * valid across commit and abort.
+/* One atomic group of edits per tree, at most one open (PLAN §4.2).
+ * Snapshots and spans obtained before begin stay valid across commit and
+ * abort.
+ *
+ * Begin records the restore view and ADD mark before opening the
+ * checkpoint. Commit keeps the current text and ADD, promotes all its
+ * provisional snapshots and closes the checkpoint.
  * Begin claims one slot on a snapshot-cache miss, none on a hit; O(1): the
  * ADD directory is shared, not copied (A7). PIECE_ERR_NOMEM.
  * ASSERT: no checkpoint is open. */
 piece_err piece_checkpoint_begin(piece_tree *t);
-/* Keeps the text and closes the checkpoint. Allocates nothing; cannot fail.
- * ASSERT: a checkpoint is open. */
+/* Allocates nothing; cannot fail; O(1). ASSERT: a checkpoint is open. */
 void piece_checkpoint_commit(piece_tree *t);
-/* Restores the text, description and ADD length recorded at begin and closes
- * the checkpoint. Allocates nothing and cannot fail, even if every base
- * request since begin was refused. Snapshots taken inside keep their own
- * text; ADD spans obtained inside that end above the restored ADD length
- * become invalid. Invalidates the snapshot cache and ends the live view's
- * revision. O(1). ASSERT: a checkpoint is open. */
+/* Abort restores the saved text, description, ADD mark and partial-tail
+ * newline total, invalidates the cache, ends the live revision and closes
+ * the checkpoint. Regrowth may reuse the restored tail in place.
+ * ADD spans ending above the restored mark lose their lineage.
+ * O(1), allocation-free; it cannot fail, even if every base request since
+ * begin was refused. ASSERT: a checkpoint is open and its count of
+ * live provisional snapshots is zero before restoring any state. */
 void piece_checkpoint_abort(piece_tree *t);
 
 /* ---- Maintenance (UI, outside the input-to-submit window) --------------- */
@@ -433,8 +478,8 @@ void piece_checkpoint_abort(piece_tree *t);
  * before base: W(h) free slots in t's core and the reserve's whole extents
  * together, W(h) = 1 + (4h + 3) + (2 min(PIECE_MAX_HEIGHT, h + 1) + 3) + 1
  * (P: checkpoint begin, a deletion, a one-chunk insertion, a take;
- * W(0) = 10, W(31) = 194), and one spare private ADD boundary chunk in the
- * reserve. Then returns whole free extents above that target to base. Call
+ * W(0) = 10, W(31) = 194). Then returns whole free extents above that
+ * target to base. Call
  * after every submitted command, after open, and on switching the active
  * tree. PIECE_ERR_NOMEM when base refused: nothing else changed, and no
  * command is refused because of it, since every command admits itself. */
@@ -443,7 +488,7 @@ piece_err piece_replenish(piece_tree *t);
  * leaves its exclusive storage queued on t. Performs at most budget steps,
  * each dropping one reference to a slot or chunk, and returns whole empty
  * extents to the reserve; true while queued work remains. budget 0 only
- * asks. Allocates nothing. For edits, takes and their companion storage it
+ * asks. Allocates nothing. For edits, takes and their ADD storage it
  * is latency only: their admission drains the queue itself before it
  * reports PIECE_ERR_NOMEM, and close drains the rest. piece_lines_resolve
  * never drains it (A24): the post-submit order is piece_reclaim,

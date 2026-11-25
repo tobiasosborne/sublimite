@@ -6,7 +6,14 @@
 typedef struct undo_log undo_log;
 
 /* Errors caused by admission, shape or source validity. MORE is a replay
- * yield. Call-sequence and argument preconditions use ASSERT (A15). */
+ * yield. Call-sequence and argument preconditions use ASSERT (A15).
+ *
+ * Owner abort (D1', advisor 2026-11-24). No undo call ever closes a
+ * checkpoint by itself: after any result other than OK or MORE from
+ * undo_begin, undo_replace, undo_replay_prepare (initial or resumed) or
+ * undo_commit, the owner releases its provisional pins and calls undo_abort;
+ * undo_abort is valid after any failed call and does nothing if that call
+ * opened no checkpoint. Until then no other call on the log is legal. */
 typedef enum undo_err {
     UNDO_OK = 0,
     UNDO_ERR_NOMEM,       /* base refused history/checkpoint/piece storage */
@@ -74,12 +81,16 @@ undo_err undo_create(undo_log **out, piece_tree *tree, size_t cap_bytes,
                      piece_validate_fn validate, void *ctx);
 
 /* Destroys the log and releases every history extent. O(records). Cannot
- * fail. ASSERT: live log, tree still open, no prepared replay. */
+ * fail. If this call aborts an open command or applying replay, release all
+ * caller-owned provisional snapshots first. ASSERT: live log, tree still
+ * open, no failed call or prepared replay. */
 void undo_destroy(undo_log *u);
 
 /* Clears undo and redo, aborting an open command or applying replay.
- * O(records). Cannot fail. ASSERT: live log, no failed command or prepared
- * replay. Committed ADD is still owned by the tree. */
+ * If this call aborts an open command or applying replay, release all
+ * caller-owned provisional snapshots first. O(records). Cannot fail.
+ * ASSERT: live log, no failed call or prepared replay. Committed ADD is
+ * still owned by the tree. */
 void undo_clear(undo_log *u);
 
 /* Changes the published byte cap, evicts whole oldest groups and performs
@@ -110,9 +121,9 @@ undo_err undo_begin(undo_log *u, const undo_state *before, bool join);
 /* Describes or captures the removed range and replaces it with bytes in the
  * unpublished tree. Records remain pending. O(piece description and mutation
  * costs, plus literal length or external span count when required). NOMEM if
- * admission fails, RANGE at the piece height limit. After an error the only
- * legal call on the log is undo_abort. ASSERT: open command without a prior
- * error, valid range and replacement size, and bytes per piece_replace. */
+ * admission fails, RANGE at the piece height limit (owner abort). ASSERT:
+ * open command without a prior error, valid range and replacement size, and
+ * bytes per piece_replace. */
 undo_err undo_replace(undo_log *u, uint64_t off, uint64_t del,
                       const uint8_t *bytes, size_t len);
 
@@ -120,22 +131,25 @@ undo_err undo_replace(undo_log *u, uint64_t off, uint64_t del,
  * checkpoint and publishes history on success. A forward command supplies
  * its final cursor state. Cap eviction and redo detachment apply to nonempty
  * edits. Replay supplies the saved target and moves only the applied position.
- * O(1) on success, including bounded eviction. CONFLICT aborts the checkpoint.
+ * O(1) on success, including bounded eviction. On closing CONFLICT, return
+ * UNDO_ERR_CONFLICT with the checkpoint open and the provisional text, ADD
+ * length, pending work and published history unchanged (owner abort).
  * ASSERT: open forward command without a prior edit error, after != NULL,
  * or prepared replay with after pointing to its borrowed target. */
 undo_err undo_commit(undo_log *u, const undo_state *after);
 
 /* Aborts the tree checkpoint and drops pending history, preserving the
- * published cursor, redo and cap. O(staged records and extents).
- * Allocates nothing and cannot fail. ASSERT: open or failed forward command,
- * or applying or prepared replay. */
+ * published cursor, redo and cap. Undo releases its own replay views first.
+ * On an idle log it does nothing (owner abort). O(staged records and
+ * extents). Allocates nothing and cannot fail. ASSERT: live log. */
 void undo_abort(undo_log *u);
 
 /* Applies or resumes one group. On OK, *target borrows its saved cursor
  * state if a group is prepared. Empty history yields OK and NULL. An
  * absolute os_now_ns() deadline (or OS_DEADLINE_NEVER) is checked after at
  * least one available mutation. MORE keeps the checkpoint open. NOMEM,
- * RANGE or CONFLICT aborts the group. MORE and errors clear *target.
+ * RANGE or CONFLICT keeps any checkpoint the group opened (owner abort).
+ * MORE and errors clear *target.
  *
  * ASSERT: live log, valid direction, target != NULL, and log idle or resuming
  * a yield in the same direction and revision. While the checkpoint is open,

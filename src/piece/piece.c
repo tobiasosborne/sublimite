@@ -64,15 +64,13 @@ typedef struct piece_leaf_entry {
 } piece_leaf_entry;
 
 /* The 16 B prefix (x86-64: offset 0 refs, 4 count, 6 height, 7 padding,
- * 8 state) is signed with the 400 B slot. refs saturates (PIECE_REFS_STUCK). */
+ * 8 the retirement link) is signed with the 400 B slot. refs saturates
+ * (PIECE_REFS_STUCK). */
 struct piece_node {
     uint32_t refs;
     uint16_t count;
     uint8_t height;
-    union {
-        uint64_t add_high;
-        piece_node *retired;
-    } state;
+    piece_node *retired;
     union {
         piece_leaf_entry leaf[PIECE_LEAF];
         piece_entry branch[PIECE_BRANCH];
@@ -107,9 +105,6 @@ struct piece_reserve {
     atomic_size_t cores;
     piece_extent *free;
     size_t free_extents, slots_per_extent, page, target_extents;
-    piece_chunk *boundary;
-    piece_add *dirs;
-    size_t free_dirs;
 };
 
 struct piece_view {
@@ -119,10 +114,27 @@ struct piece_view {
     uint64_t length, revision;
 };
 
+/* Provisional lifetimes (piece.h Snapshots, D1'). A take while a
+ * checkpoint is open names that checkpoint's restore header as its cell;
+ * the cell's `inside` counts the live headers naming it, and each one's last
+ * release drops its count. While the checkpoint is open those headers are
+ * exactly its provisional snapshots, so abort checks inside == 0. After
+ * commit they are ordinary and their releases count against a cell no open
+ * checkpoint names: a header is the restore view of a checkpoint with inside
+ * takes at most once (an inside take replaces the cache, and the cache never
+ * returns to an older header). A cell's slot outlives its own release until
+ * its count is zero, so the identity a release compares never names a reused
+ * slot: the retiring UI sets PIECE_CELL_RETIRED, and the release that finds
+ * it with the last count requeues the cell for its slot. */
+#define PIECE_CELL_RETIRED (UINT64_C(1) << 63)
+
 struct piece_snapshot {
     piece_view view;
     _Atomic(piece_owners) owners;
     piece_snapshot *retired;
+    uint64_t add_length; /* the readable ADD prefix pinned at take (erratum (i)) */
+    piece_snapshot *cell; /* the checkpoint's restore header, or NULL: taken outside */
+    _Atomic(uint64_t) inside; /* as a cell: headers naming it, PIECE_CELL_RETIRED once retired */
 };
 
 struct piece_core {
@@ -154,36 +166,24 @@ struct piece_core {
 #endif
 };
 
-/* The checkpoint lifecycle (piece.h Checkpoint; spec "Private ADD
- * boundary"). SHARED: open, and the restore view still shares ADD's tail
- * chunk with the live tree. PRIVATE: an inside take could observe bytes past
- * an unaligned mark, so the restore view now owns a private copy of the
- * chunk's prefix; abort appends into that copy, never into bytes a
- * surviving inside snapshot reads. */
-typedef enum piece_cp {
-    PIECE_CP_NONE,
-    PIECE_CP_SHARED,
-    PIECE_CP_PRIVATE
-} piece_cp;
-
+/* checkpoint: the restore view, set exactly while a checkpoint is open; it
+ * holds the saved root and ADD directory. restore_tail, add_mark and
+ * mark_count let abort restore the tail chunk and its newline total without
+ * a directory walk (after a chunk crossing the tail differs from begin's). */
 struct piece_tree {
     piece_view view;
     piece_snapshot *cached;
-    piece_cp cp;
-    piece_snapshot *checkpoint; /* the restore view; set exactly when cp != NONE */
-    piece_add *restore_add;
+    piece_snapshot *checkpoint;
     piece_chunk *tail, *restore_tail;
     uint64_t add_length, add_mark, resolve_offset;
     uint32_t mark_count;
 };
 
 /* Storage a command needs beside slots, admitted with them as one
- * requirement (A24): ADD chunks and directory nodes for appended bytes, or
- * the private ADD boundary of an open checkpoint. */
+ * requirement (A24): ADD chunks and directory nodes for appended bytes. */
 typedef enum piece_extra {
     PIECE_EXTRA_NONE,
-    PIECE_EXTRA_ADD,
-    PIECE_EXTRA_BOUNDARY
+    PIECE_EXTRA_ADD
 } piece_extra;
 
 static bool piece_extra_local(const piece_tree *t, piece_extra extra, uint64_t add_bytes);
@@ -364,7 +364,6 @@ static piece_node *piece_node_new(piece_core *c, unsigned height)
     n->refs = 1;
     n->count = 0;
     n->height = (uint8_t)height;
-    n->state.add_high = 0;
     return n;
 }
 
@@ -372,8 +371,8 @@ static piece_node *piece_node_new(piece_core *c, unsigned height)
  * them is installed memory, not structure or address space: 2^32 references
  * need about 2^32 x 400 B = 1.7 TB of live slots (P), well inside a 2^47-byte
  * space, so an ASSERT would be wrong (A15). A 64-bit count does not fit the
- * signed 16 B prefix: count (5 bits), height (5 bits) and add_high (an ADD
- * offset below 2^56, 56 bits) leave 62 bits beside 64 (P). So the count
+ * signed 16 B prefix beside count (2 B), height (1 B) and the 8 B retirement
+ * link: 8 + 2 + 1 + 8 = 19 B > 16 B (P). So the count
  * sticks at UINT32_MAX: a stuck node is never freed while its core lives
  * (its slot returns with the core's extents at the last release), a leak
  * of one node when about 1.7 TB is in use, never an early free and never an
@@ -397,7 +396,7 @@ static bool piece_node_unref(piece_node *n)
 static void piece_node_queue(piece_core *c, piece_node *n)
 {
     if (piece_node_unref(n)) {
-        n->state.retired = c->nodes;
+        n->retired = c->nodes;
         c->nodes = n;
     }
 }
@@ -415,7 +414,6 @@ static piece_node *piece_node_copy(piece_core *c, const piece_node *n)
 {
     piece_node *copy = piece_node_new(c, n->height);
     copy->count = n->count;
-    copy->state.add_high = n->state.add_high;
     if (n->height) {
         memcpy(copy->entries.branch, n->entries.branch, n->count * sizeof n->entries.branch[0]);
         for (unsigned i = 0; i < n->count; i++) piece_node_get(copy->entries.branch[i].as.child);
@@ -480,7 +478,7 @@ static size_t piece_retire(piece_core *c, size_t budget)
             if (n->height && n->count)
                 piece_node_queue(c, n->entries.branch[--n->count].as.child);
             else {
-                c->nodes = n->state.retired;
+                c->nodes = n->retired;
                 piece_slot_put(c, n);
             }
         } else if (c->dirs) {
@@ -503,7 +501,10 @@ static size_t piece_retire(piece_core *c, size_t budget)
                 s->view.add = NULL;
             } else {
                 c->retired = s->retired;
-                piece_slot_put(c, s);
+                /* A cell still named by live headers keeps its slot; the
+                 * last of them requeues it (piece_cell_put). */
+                uint64_t named = atomic_fetch_or_explicit(&s->inside, PIECE_CELL_RETIRED, memory_order_acq_rel);
+                if (!(named & ~PIECE_CELL_RETIRED)) piece_slot_put(c, s);
             }
         }
         done++;
@@ -633,23 +634,10 @@ static bool piece_claim_unretired(piece_core *c, size_t slots)
     return piece_fund(c, slots, false);
 }
 
-/* spare: draw the reserve's prepaid boundary chunk or directory node first
- * (the private boundary exchange, spec "Private ADD boundary"). */
-static piece_add *piece_add_new(piece_core *c, unsigned level, bool spare)
+static piece_add *piece_add_new(piece_core *c, unsigned level)
 {
-    piece_reserve *r = c->reserve;
-    piece_add *a;
-    if (spare && !level && r->boundary) {
-        a = &r->boundary->head;
-        r->boundary = NULL;
-    } else if (spare && level && r->dirs) {
-        a = r->dirs;
-        r->dirs = a->retired;
-        r->free_dirs--;
-    } else {
-        a = piece_memory(level ? sizeof(piece_dir) : sizeof(piece_chunk));
-        if (!a) return NULL; /* the command's admission decides (piece_admit) */
-    }
+    piece_add *a = piece_memory(level ? sizeof(piece_dir) : sizeof(piece_chunk));
+    if (!a) return NULL; /* the command's admission decides (piece_admit) */
     *a = (piece_add){ .refs = 1, .level = level };
     if (!level) {
         piece_chunk *ch = (piece_chunk *)a;
@@ -659,6 +647,8 @@ static piece_add *piece_add_new(piece_core *c, unsigned level, bool spare)
 #ifdef PIECE_TEST_HOOKS
     if (level) c->add_dirs++;
     else c->add_chunks++;
+#else
+    (void)c;
 #endif
     return a;
 }
@@ -684,7 +674,7 @@ static piece_chunk *piece_chunk_at(piece_add *a, uint64_t index)
  * reuse the private part of its unpublished directory. A shared ancestor
  * forces copies below it. The caller owns the supplied chunk on failure. */
 static piece_add *piece_dir_put(piece_core *c, piece_add *old, unsigned level,
-                                uint64_t index, piece_add *chunk, bool spare, bool exclusive)
+                                uint64_t index, piece_add *chunk, bool exclusive)
 {
     if (!level) {
         piece_add_get(chunk);
@@ -696,7 +686,7 @@ static piece_add *piece_dir_put(piece_core *c, piece_add *old, unsigned level,
     piece_dir *src = (piece_dir *)old;
     piece_add *child = old && i < old->count ? src->child[i] : NULL;
     bool reuse = exclusive && old && old->refs == 1;
-    piece_add *new_child = piece_dir_put(c, child, level - 1, index, chunk, spare, reuse);
+    piece_add *new_child = piece_dir_put(c, child, level - 1, index, chunk, reuse);
     if (!new_child) return NULL;
 
     ASSERT(i <= (old ? old->count : 0));
@@ -709,7 +699,7 @@ static piece_add *piece_dir_put(piece_core *c, piece_add *old, unsigned level,
         return old;
     }
 
-    piece_dir *dst = (piece_dir *)piece_add_new(c, level, spare);
+    piece_dir *dst = (piece_dir *)piece_add_new(c, level);
     if (!dst) {
         piece_add_drop(c, new_child);
         return NULL;
@@ -727,15 +717,15 @@ static piece_add *piece_dir_put(piece_core *c, piece_add *old, unsigned level,
 
 static piece_add *piece_dir_append(piece_core *c, piece_add *a, uint64_t index)
 {
-    piece_add *chunk = piece_add_new(c, 0, false);
+    piece_add *chunk = piece_add_new(c, 0);
     if (!chunk) return NULL;
     piece_add *next = NULL;
     if (a && index >> (a->level * PIECE_DIR_BITS)) {
         /* The old root is a completely full first child. The new
          * hierarchical right edge is the only other child. */
-        piece_add *child = piece_dir_put(c, NULL, a->level, index, chunk, false, false);
+        piece_add *child = piece_dir_put(c, NULL, a->level, index, chunk, false);
         if (child) {
-            piece_dir *top = (piece_dir *)piece_add_new(c, a->level + 1, false);
+            piece_dir *top = (piece_dir *)piece_add_new(c, a->level + 1);
             if (top) {
                 top->child[0] = a;
                 top->child[1] = child;
@@ -745,7 +735,7 @@ static piece_add *piece_dir_append(piece_core *c, piece_add *a, uint64_t index)
             } else piece_add_drop(c, child);
         }
     } else {
-        next = piece_dir_put(c, a, a ? a->level : 0, index, chunk, false, true);
+        next = piece_dir_put(c, a, a ? a->level : 0, index, chunk, true);
     }
     piece_add_drop(c, chunk);
     return next;
@@ -798,61 +788,6 @@ static uint32_t piece_add_write(piece_add *a, uint64_t start, const uint8_t *byt
     return total;
 }
 
-static bool piece_private_boundary(piece_tree *t)
-{
-    uint64_t mark = t->add_mark;
-    size_t prefix = (size_t)(mark & PIECE_MASK);
-    piece_core *c = t->view.core;
-    const piece_chunk *old = t->restore_tail;
-    piece_chunk *copy = (piece_chunk *)piece_add_new(c, 0, true);
-    if (!copy) return false;
-    memcpy(copy->bytes, old->bytes, prefix);
-    memcpy(copy->prefix, old->prefix, (prefix / PIECE_PREFIX + 1) * sizeof copy->prefix[0]);
-    copy->total = t->mark_count;
-
-    piece_add *root = piece_dir_put(c, t->restore_add, t->restore_add->level,
-                                    mark / PIECE_CHUNK, &copy->head, true, false);
-    piece_add_drop(c, &copy->head);
-    if (!root) return false;
-    piece_add_drop(c, t->restore_add);
-    t->restore_add = root;
-    t->restore_tail = copy;
-    t->cp = PIECE_CP_PRIVATE;
-    return true;
-}
-
-/* The reserve's spare private boundary: one chunk and `levels` directory
- * nodes, what the boundary exchange copies (piece_private_boundary). The
- * missing ones come from base in a fixed order; a refusal returns the ones
- * this call took to base (A26 step 4). */
-static bool piece_spares_make(piece_reserve *r, unsigned levels)
-{
-    bool chunk = !r->boundary;
-    if (chunk && !(r->boundary = piece_memory(sizeof(piece_chunk)))) return false;
-    size_t taken = 0;
-    while (r->free_dirs < levels) {
-        piece_add *dir = piece_memory(sizeof(piece_dir));
-        if (!dir) {
-            for (; taken; taken--) {
-                piece_add *back = r->dirs;
-                r->dirs = back->retired;
-                r->free_dirs--;
-                piece_memory_free(back, sizeof(piece_dir));
-            }
-            if (chunk) {
-                piece_memory_free(r->boundary, sizeof(piece_chunk));
-                r->boundary = NULL;
-            }
-            return false;
-        }
-        dir->retired = r->dirs;
-        r->dirs = dir;
-        r->free_dirs++;
-        taken++;
-    }
-    return true;
-}
-
 static const uint8_t *piece_data(const piece_view *v, uint64_t src)
 {
     if (!(src & PIECE_SPAN_ADD)) return v->core->bytes + src;
@@ -896,10 +831,10 @@ static size_t piece_original_chunk(const piece_core *c, uint64_t start)
  * start: its 512 B block prefix plus at most 511 bytes read. A chunk total
  * is read only where it is final: at the end of a private ORIGINAL chunk
  * (immutable), or at the end of a full ADD chunk (no append reaches a full
- * chunk again; an abort rewrites only past an unaligned mark, and a view
- * that saw past it got the private boundary). Every other field read was
- * written before any byte the view can name, so any view on any thread may
- * call this while the UI appends. */
+ * chunk again; an abort rewrites only past an unaligned mark, and every view
+ * that saw past it was provisional and released before the abort, D1').
+ * Every other field read was written before any byte the view can name, so
+ * any view on any thread may call this while the UI appends. */
 static uint32_t piece_private_prefix(const piece_view *v, uint64_t start, size_t at)
 {
     uint64_t off = start & ~PIECE_SPAN_ADD;
@@ -946,18 +881,6 @@ static void piece_entry_set(piece_node *n, unsigned i, piece_entry e)
     if (n->height) n->entries.branch[i] = e;
     else n->entries.leaf[i] = (piece_leaf_entry){ e.as.src, (uint32_t)e.bytes,
                          e.nl == PIECE_UNKNOWN ? PIECE_NL_UNKNOWN : (uint32_t)e.nl };
-}
-
-static void piece_add_high(piece_node *n)
-{
-    uint64_t high = 0;
-    for (unsigned i = 0; i < n->count; i++) {
-        piece_entry e = piece_entry_at(n, i);
-        uint64_t end = n->height ? e.as.child->state.add_high :
-                       (e.as.src & PIECE_SPAN_ADD) ? (e.as.src & ~PIECE_SPAN_ADD) + e.bytes : 0;
-        if (end > high) high = end;
-    }
-    n->state.add_high = high;
 }
 
 static piece_entry piece_summary(piece_node *n)
@@ -1064,12 +987,6 @@ void piece_reserve_destroy(piece_reserve *r)
     ASSERT(r != NULL && atomic_load_explicit(&r->cores, memory_order_acquire) == 0);
     piece_reserve_inbox(r);
     piece_extent_trim(r, 0);
-    piece_memory_free(r->boundary, sizeof *r->boundary);
-    while (r->dirs) {
-        piece_add *next = r->dirs->retired;
-        piece_memory_free(r->dirs, sizeof(piece_dir));
-        r->dirs = next;
-    }
     piece_memory_free(r, sizeof *r);
 }
 
@@ -1148,14 +1065,36 @@ uint64_t piece_add_length(const piece_tree *t)
     return t->add_length;
 }
 
-/* A cache reference is an ordinary snapshot owner. Cached takes hit even
- * after capture, which can extend ADD without changing any visible byte. */
+/* A cache reference is an ordinary snapshot owner. */
 piece_snapshot *piece_snapshot_retain(piece_snapshot *s)
 {
     ASSERT(s);
     piece_owners old = atomic_fetch_add_explicit(&s->owners, 1, memory_order_relaxed);
     ASSERT(old && old != UINT64_MAX); /* owned; 2^64 owners cannot exist (piece_owners) */
     return s;
+}
+
+static void piece_inbox_push(piece_core *c, piece_snapshot *s)
+{
+    piece_snapshot *head = atomic_load_explicit(&c->inbox, memory_order_relaxed);
+    do { s->retired = head; }
+    while (!atomic_compare_exchange_weak_explicit(&c->inbox, &head, s,
+                                                  memory_order_release, memory_order_relaxed));
+}
+
+/* Drops one header's name of its cell, on the releasing thread. The last
+ * name of a cell the UI already retired requeues it for its slot. */
+static void piece_cell_put(piece_core *c, piece_snapshot *cell)
+{
+    uint64_t named = atomic_fetch_sub_explicit(&cell->inside, 1, memory_order_acq_rel);
+    if (named == (PIECE_CELL_RETIRED | 1u)) piece_inbox_push(c, cell);
+}
+
+/* Live headers naming the cell: while its checkpoint is open, exactly its
+ * live provisional snapshots. */
+static uint64_t piece_cell_live(const piece_snapshot *cell)
+{
+    return atomic_load_explicit(&cell->inside, memory_order_acquire) & ~PIECE_CELL_RETIRED;
 }
 
 void piece_snapshot_release(piece_snapshot *s)
@@ -1165,10 +1104,8 @@ void piece_snapshot_release(piece_snapshot *s)
     ASSERT(old);
     if (old != 1) return;
     piece_core *c = s->view.core;
-    piece_snapshot *head = atomic_load_explicit(&c->inbox, memory_order_relaxed);
-    do { s->retired = head; }
-    while (!atomic_compare_exchange_weak_explicit(&c->inbox, &head, s,
-                                                  memory_order_release, memory_order_relaxed));
+    if (s->cell) piece_cell_put(c, s->cell); /* at logical release, before physical retirement */
+    piece_inbox_push(c, s);
     piece_core_drop(c);
 }
 
@@ -1191,36 +1128,32 @@ piece_err piece_snapshot_take(piece_tree *t, piece_snapshot **out)
 {
     ASSERT(t && out);
     *out = NULL;
-    if (t->cached) {
+    /* A hit needs the lifetime of this take: provisional for the open
+     * checkpoint, or ordinary. Revision and ADD length match by
+     * construction: edits, captures and aborts end the cache. */
+    if (t->cached && (!t->checkpoint || t->cached->cell == t->checkpoint)) {
         *out = piece_snapshot_retain(t->cached);
         return PIECE_OK;
     }
     piece_core *c = t->view.core;
-    bool boundary = false;
-    switch (t->cp) {
-    case PIECE_CP_SHARED:
-        boundary = (t->add_mark & PIECE_MASK) && t->view.root->state.add_high > t->add_mark;
-        break;
-    case PIECE_CP_NONE:
-    case PIECE_CP_PRIVATE:
-        break;
-    }
-    /* One header, exact (A26): the fast path when the slot and any boundary
-     * storage are local, else steps 2-4. */
-    piece_extra extra = boundary ? PIECE_EXTRA_BOUNDARY : PIECE_EXTRA_NONE;
-    if (piece_local(c, 1) && piece_extra_local(t, extra, 0)) {
-        bool made = !boundary || piece_private_boundary(t); /* from the reserve's spares */
-        ASSERT(made);
+    /* One header, exact (A26): the fast path when the slot is local, else
+     * steps 2-4. */
+    if (piece_local(c, 1)) {
         piece_claim_note(c, 1);
     } else {
-        piece_err err = piece_admit_fixed(t, 1, extra, 0, NULL);
+        piece_err err = piece_admit_fixed(t, 1, PIECE_EXTRA_NONE, 0, NULL);
         if (err != PIECE_OK) return err;
     }
+    piece_uncache(t); /* an ordinary pin this provisional take cannot reuse */
 
     piece_snapshot *s = piece_slot_get(c);
     s->view = t->view;
     s->retired = NULL;
+    s->add_length = t->add_length;
+    s->cell = t->checkpoint;
     atomic_init(&s->owners, 2);
+    atomic_init(&s->inside, 0);
+    if (s->cell) atomic_fetch_add_explicit(&s->cell->inside, 1, memory_order_relaxed);
     piece_node_get(s->view.root);
     piece_add_get(s->view.add);
     piece_owners core_owners = atomic_fetch_add_explicit(&c->owners, 1, memory_order_relaxed);
@@ -1236,17 +1169,47 @@ const piece_view *piece_snapshot_view(const piece_snapshot *s)
     return &s->view;
 }
 
+piece_read_result piece_snapshot_read_span(const piece_snapshot *s, piece_span span, uint64_t skip,
+                                           uint8_t *dst, size_t capacity, size_t *written,
+                                           piece_validate_fn validate, void *ctx)
+{
+    ASSERT(s && written && (dst || !capacity));
+    *written = 0;
+    const piece_view *v = &s->view;
+    const piece_core *c = v->core;
+    bool add = (span.src & PIECE_SPAN_ADD) != 0;
+    uint64_t a = span.src & ~PIECE_SPAN_ADD;
+    uint64_t store = add ? s->add_length : c->length;
+    /* The whole span, in the signed order, before a + skip is formed. */
+    if (!span.len || a > store || span.len > store - a || skip > span.len) return PIECE_READ_RANGE;
+    if (skip == span.len) return PIECE_READ_OK;
+    if (!capacity) return PIECE_READ_RANGE;
+    uint64_t at = a + skip;
+    size_t n = (size_t)piece_min(piece_min(span.len - skip, capacity), PIECE_CHUNK - (at & PIECE_MASK));
+    bool mapped = !add && piece_mapped(c);
+    if (mapped && !validate) return PIECE_READ_CONFLICT;
+    uint64_t src = add ? PIECE_SPAN_ADD | at : at;
+    piece_note_read(v, src, n);
+    memcpy(dst, piece_data(v, src), n);
+    /* Identity on the held backing, then the closing poll after every
+     * dependent load (piece_backing). */
+    if (mapped && !(validate(ctx, &c->backing) && piece_pristine(c->backing.fault)))
+        return PIECE_READ_CONFLICT;
+    *written = n;
+    return PIECE_READ_OK;
+}
+
 piece_err piece_checkpoint_begin(piece_tree *t)
 {
-    ASSERT(t && t->cp == PIECE_CP_NONE);
+    ASSERT(t && !t->checkpoint);
     piece_snapshot *s;
     piece_err err = piece_snapshot_take(t, &s);
     if (err != PIECE_OK) return err;
-    t->cp = PIECE_CP_SHARED;
+    /* A cached header was never the cell of a checkpoint with inside takes
+     * (piece_snapshot). */
+    ASSERT(piece_cell_live(s) == 0);
     t->checkpoint = s;
     t->add_mark = t->add_length;
-    t->restore_add = t->view.add;
-    piece_add_get(t->restore_add);
     t->restore_tail = t->tail;
     t->mark_count = (t->add_mark & PIECE_MASK) ? t->tail->total : 0;
     return PIECE_OK;
@@ -1254,35 +1217,34 @@ piece_err piece_checkpoint_begin(piece_tree *t)
 
 void piece_checkpoint_commit(piece_tree *t)
 {
-    ASSERT(t && t->cp != PIECE_CP_NONE);
+    ASSERT(t && t->checkpoint);
+    /* Closing the checkpoint makes its provisional snapshots ordinary. */
     piece_snapshot_release(t->checkpoint);
     t->checkpoint = NULL;
-    t->cp = PIECE_CP_NONE;
-    piece_add_queue(t->view.core, t->restore_add);
-    t->restore_add = NULL;
     t->restore_tail = NULL;
 }
 
 void piece_checkpoint_abort(piece_tree *t)
 {
-    ASSERT(t && t->cp != PIECE_CP_NONE);
+    ASSERT(t && t->checkpoint);
+    piece_uncache(t); /* the cache's ownership has no reader */
+    ASSERT(piece_cell_live(t->checkpoint) == 0);
     piece_core *c = t->view.core;
     const piece_view *saved = &t->checkpoint->view;
     piece_node_get(saved->root);
+    piece_add_get(saved->add);
     piece_node_queue(c, t->view.root);
     piece_add_queue(c, t->view.add);
     t->view.root = saved->root;
     t->view.length = saved->length;
-    t->view.add = t->restore_add;
+    t->view.add = saved->add;
     t->add_length = t->add_mark;
     t->tail = t->restore_tail;
     if (t->add_mark & PIECE_MASK) t->tail->total = t->mark_count;
-    t->restore_add = NULL;
     t->restore_tail = NULL;
     piece_publish(t);
     piece_snapshot_release(t->checkpoint);
     t->checkpoint = NULL;
-    t->cp = PIECE_CP_NONE;
 }
 
 static unsigned piece_insert_claim(unsigned height)
@@ -1307,10 +1269,7 @@ piece_err piece_replenish(piece_tree *t)
      * inbox; take them even with no slot deficit, so the trim below returns
      * them to base (Astra 7b-G). */
     piece_reserve_inbox(r);
-    unsigned levels = t->view.add ? t->view.add->level : 0;
-    if (!piece_fund(c, target, true) ||
-        (!piece_spares_make(r, levels) && (!piece_retire(c, SIZE_MAX) || !piece_spares_make(r, levels))))
-        return PIECE_ERR_NOMEM;
+    if (!piece_fund(c, target, true)) return PIECE_ERR_NOMEM;
     size_t shortfall = target > c->free_slots ? target - c->free_slots : 0;
     r->target_extents = (shortfall + r->slots_per_extent - 1) / r->slots_per_extent;
     piece_extent_trim(r, r->target_extents);
@@ -1326,7 +1285,7 @@ bool piece_reclaim(piece_tree *t, size_t budget)
 
 void piece_close(piece_tree *t)
 {
-    ASSERT(t && t->cp == PIECE_CP_NONE);
+    ASSERT(t && !t->checkpoint);
     piece_core *c = t->view.core;
     piece_reserve *r = c->reserve;
     piece_uncache(t);
@@ -1724,7 +1683,6 @@ static piece_node *piece_shadow_new(piece_delete_plan *plan, unsigned height,
     s->node.refs = 1;
     s->node.count = 0;
     s->node.height = (uint8_t)height;
-    s->node.state.add_high = 0;
     return &s->node;
 }
 
@@ -1790,7 +1748,6 @@ static piece_node *piece_splice(piece_core *c, piece_delete_plan *plan,
         }
         for (unsigned i = 0; i < count; i++) piece_entry_set(n, first + i, insert[i]);
         n->count = (uint16_t)total;
-        piece_add_high(n);
         return NULL;
     }
 
@@ -1805,8 +1762,6 @@ static piece_node *piece_splice(piece_core *c, piece_delete_plan *plan,
     right->count = (uint16_t)(total - mid);
     for (unsigned i = 0; i < mid; i++) piece_entry_set(n, i, entries[i]);
     for (unsigned i = mid; i < total; i++) piece_entry_set(right, i - mid, entries[i]);
-    piece_add_high(n);
-    piece_add_high(right);
     return right;
 }
 
@@ -1818,7 +1773,6 @@ static piece_node *piece_root_grow(piece_core *c, piece_delete_plan *plan,
     root->count = 2;
     piece_entry_set(root, 0, piece_summary(left));
     piece_entry_set(root, 1, piece_summary(right));
-    piece_add_high(root);
     return root;
 }
 
@@ -1848,7 +1802,6 @@ static void piece_merge_children(piece_core *c, piece_delete_plan *plan,
         if (left->height && !plan) piece_node_get(e.as.child);
         piece_entry_set(left, left->count++, e);
     }
-    piece_add_high(left);
     piece_edit_node_drop(c, plan, right, inherited, true);
     piece_entry replacement = piece_summary(left);
     piece_node *split = piece_splice(c, plan, parent, i, 2, &replacement, 1);
@@ -1977,7 +1930,6 @@ static piece_node *piece_delete_apply(const piece_view *v, piece_delete_plan *pl
         if (!inherited && root->refs == 1 && !root->height) {
             root = piece_edit_node_own(c, plan, root, false);
             root->count = 0;
-            root->state.add_high = 0;
             return root;
         }
         piece_edit_node_drop(c, plan, root, inherited, false);
@@ -2290,10 +2242,8 @@ static piece_node *piece_insert_apply(piece_view v, uint64_t off, piece_input in
         extension.bytes = 0;
     } while (input.at < input.count);
 
-    for (unsigned h = 1; h <= path.height; h++) {
+    for (unsigned h = 1; h <= path.height; h++)
         piece_entry_set(path.node[h], path.index[h], piece_summary(path.node[h - 1]));
-        piece_add_high(path.node[h]);
-    }
     return path.node[path.height];
 }
 
@@ -2303,8 +2253,8 @@ static piece_node *piece_insert_apply(piece_view v, uint64_t off, piece_input in
  * base request per call.
  * 1. Fast path: the scalar claim (begin, a deletion, a one-chunk insertion of
  *    copied bytes, a take) and the companion storage (room in the ADD tail
- *    chunk, the reserve's spare boundary) are both local: proceed, no plan, no
- *    base call. The typing path after a successful replenish.
+ *    chunk) are both local: proceed, no plan, no base call. The typing path
+ *    after a successful replenish.
  * 2. Otherwise the exact plan; nothing missing: proceed, no drain.
  * 3. Otherwise every local source once: drain this core's retirement queue,
  *    take the reserve and its inbox, plan again (the drain can remove the
@@ -2380,8 +2330,7 @@ static piece_err piece_plan_make(piece_plan *p, piece_core *c)
     return err;
 }
 
-/* Companion storage already present: room in the ADD tail chunk, or the
- * reserve's spare boundary chunk and a directory node per level. */
+/* Companion storage already present: room in the ADD tail chunk. */
 static bool piece_extra_local(const piece_tree *t, piece_extra extra, uint64_t add_bytes)
 {
     switch (extra) {
@@ -2389,10 +2338,6 @@ static bool piece_extra_local(const piece_tree *t, piece_extra extra, uint64_t a
         return true;
     case PIECE_EXTRA_ADD:
         return piece_chunks(t->add_length) == piece_chunks(t->add_length + add_bytes);
-    case PIECE_EXTRA_BOUNDARY: {
-        const piece_reserve *r = t->view.core->reserve;
-        return r->boundary && r->free_dirs >= t->restore_add->level;
-    }
     }
     return false;
 }
@@ -2404,12 +2349,6 @@ static bool piece_extra_make(piece_tree *t, piece_extra extra, uint64_t add_byte
         return true;
     case PIECE_EXTRA_ADD:
         return piece_add_prepare(t, add_bytes, dir);
-    case PIECE_EXTRA_BOUNDARY: {
-        if (!piece_spares_make(t->view.core->reserve, t->restore_add->level)) return false;
-        bool made = piece_private_boundary(t); /* from the spares: no base call */
-        ASSERT(made);
-        return true;
-    }
     }
     return false;
 }
@@ -2583,6 +2522,9 @@ piece_err piece_capture(piece_tree *t, uint64_t off, uint64_t len, piece_span *o
         written += n;
     }
     piece_add_publish(t, add, len);
+    /* The readable ADD prefix grew: a cached take keeps its old one
+     * (erratum (i)). The text and the live revision are unchanged. */
+    piece_uncache(t);
     *out = (piece_span){ PIECE_SPAN_ADD | start, len };
     return PIECE_OK;
 }
@@ -2805,7 +2747,6 @@ piece_test_stats piece_test_measure(const piece_tree *t)
         .tree_pages = piece_round_pages(sizeof(piece_tree), r->page),
         .reserve_pages = piece_round_pages(sizeof(piece_reserve), r->page),
         .add_chunks = c->add_chunks, .add_dirs = c->add_dirs,
-        .spare_chunks = r->boundary != NULL, .spare_dirs = r->free_dirs,
         .mapped_reads = atomic_load_explicit(&c->mapped_reads, memory_order_relaxed),
         .private_reads = atomic_load_explicit(&c->private_reads, memory_order_relaxed),
         .query_visits = atomic_load_explicit(&c->query_visits, memory_order_relaxed),
