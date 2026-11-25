@@ -44,7 +44,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
 {
     /* S1: one nominal grid block plus one aligned successor is enough to
      * cover fragmented units; cap the eager oracle at one maximum span. */
-    if (len < 4 || len > FLAT_D)
+    if (len < 4 || len > VIEWPORT_DISPLAY_MAX)
         return 0;
     size_t wraps = data[0] % (len + 1);
     viewport_flat f = flat_open(data + 4, len - 4, wraps);

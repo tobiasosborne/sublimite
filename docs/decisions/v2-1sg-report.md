@@ -1,68 +1,41 @@
-# v2-1sg implementation and send-back report
+# v2-1sg owner send-back report
 
-Viewport implements every S2 action, resumable motion and selection, anchor rebase, affinity, and Q8 planning and inversion. The send-back applies the four behavioral fixes and signed E5/E6. The public header changes only for E5. The decision record describes the viewport and layout boundary, including how the driver conveys previous width and suppresses same-observation piece work during a SEEK_LINE wait. [Decisions](v2-1sg.md)
-
-## Red and green receipts
+This round integrates signed E7/E8 and makes layout the sole source of row-end and seam evidence. The published API documents cursor allocation, callback inputs and outputs, the two continuation statuses, and credit ownership. The decision record includes the proposed S2 bound text and carries forward E5/E6. [Decision record](v2-1sg.md)
 
 | Item | Red | Green |
 |---|---|---|
-| 1. Clip Home | Before the fix, Home from EOF in S+1 ASCII bytes failed the caret assertion. [Red](../../build/viewport-review/red-home.log) | The caret lands at S. The aligned long-span fixture also checks that Home reads only its active row and issues no rank/select. |
-| 2. Reflow preference | The original height-only reflow failed the assertion for retained column 7. [Red](../../build/viewport-review/red-reflow.log) | Same-width reflow keeps column 7. Width change clears it, and wrap-toggle acceptance clears both preference and hscroll. |
-| 3. Q8 clamp | In the review's three-line text, the in-range −2,559 movement passed, then −5,119 failed the zero-remainder assertion. [Red](../../build/viewport-review/red-scroll.log) | The positions are (0, 1) and (0, 0). The fixture also checks negative movement from BOF and landing exactly on or overshooting the terminal row. |
-| 4. Decoder debit | The test captured a 16,384-byte advance on a 4,096-credit step. [Red](../../build/viewport-review/red-decoder.log) | The same U+E0100 fixture advances at most 4,096 bytes per step and consumes the full S-byte cluster. |
-| 5. Reverse debit | M7 removes the debit and fails the reverse-only accounting assertion. | The fixture counts the paid visits after the last decoder call under one-credit steps. |
-| 6. Requested page displacement | M15 changes the PageUp top request to INT64_MIN and fails the displacement assertion. | Caret and top each request −R, including when the top at BOF stays put. The two operands are checked independently across simulated stalls. |
-| 7. Additional seams | M2 yields 65,538 and M4 yields 32,766 on the review inputs. | RIGHT yields 65,536 at the second grid and 32,769 from the scalar at g−3. The suite also covers g−2. |
-| 8. Stale geometry | M14 fails the rejection assertion. | Each of buffer, text, geometry and intent serial is made stale independently. Rejection preserves both installed outputs. |
-| E5. Snapshot and column evidence | The empty test found the original metadata query. The E5-column mutant using `count` reaches byte 0 instead of byte 3. [Empty red](../../build/viewport-review/red-empty.log) | Empty DOC_END and SELECT_ALL use zero port queries. The continuation fixture sees a source column of 3 including one synthetic indent cell while `count` is zero. |
-| E6. Visual Home | Covered by item 1. | Ordinary Home uses the active visual row in clip and wrap. Piece rank/select is a SELECT_LINE path. |
+| V1. Interface and shared constants | Source contract review. | All functions document inputs, returned values and output timing. Requests list the populated fields and ownership of bytes and credits. S and D have one public definition used by implementation, tests, fuzz and bench. The implementation explicitly includes string and ASSERT declarations. |
+| V2. Certified seams | A word split by two soft wraps used one row lookup and failed the three-certificate assertion. [Red](../../build/viewport-owner/red-rows.log) | The walker gets all three certificates. The independent flat oracle exercises shifted, CRLF, invalid and blocked A29 seams. Viewport has no grid arithmetic or alignment phase. |
+| V3. Local arrow work | Deep LEFT failed the decoder-byte assertion at the byte-60,000 witness. [Red](../../build/viewport-owner/red-arrows.log) | LEFT and RIGHT each consume one decoded byte there. All five local motions stay within two four-byte fixture windows. The Unicode Prepend test requires the row-start proof for lone ASCII and the nearer break for an ASCII pair. Fragmented decoding and reverse-credit tests pass. |
+| V4. E7 | Height-only REFLOW with a non-width target failed to preserve column 7. [Red](../../build/viewport-owner/red-reflow.log) | REFLOW preserves a supplied column and an issuer-cleared preference. Wrap-toggle acceptance retains its existing reset. |
+| V5. E8 | Inexact SEEK_LINE returned VP_MORE and failed the required third-status assertion. [Red](../../build/viewport-owner/red-wait.log) | It returns VP_WAIT with positive credit and output untouched. Independent VP_ROW and VP_WINDOW stalls also propagate WAIT and resume after new evidence. |
+| V6. FOLLOW clamp | A saved top beyond snapshot length passed through FOLLOW and failed the clamp assertion. [Red](../../build/viewport-owner/red-follow.log) | Begin clamps the saved top for FOLLOW as for every other action. |
 
-The focused ASan/UBSan suite passes with the unmodified implementation. It reuses a cursor abandoned during segmentation, then compares every answer field against a fresh cursor and provider on a different motion. SELECT_LINE also reuses one inexact rank for a collapsed selection. The generated fuzzer completed 5,376 executions, using the 21 action tags × 256 byte values as an iteration count. [Focused green](../../build/viewport-review/green-suite.log) · [Generated fuzz](../../build/viewport-review/generated-fuzz.log)
+The full focused ASan/UBSan suite passed with the revised cursor. A separate differential run agreed with the pre-review cursor on 31,988 legal-endpoint comparisons over fixed generated ASCII, malformed, newline and Unicode inputs in clip and wrap. The count is the actual set of legal endpoints × tested actions. Generated fuzzer coverage ran for 5,376 executions (21 action tags × 256 byte values as an iteration count). [Focused green](../../build/viewport-owner/green-suite.log) · [Differential](../../build/viewport-owner/differential.log) · [Generated fuzz](../../build/viewport-owner/generated-fuzz.log)
 
-## Mutation table
+## Release benchmark
 
-Each mutant changes only viewport.c and links against the same ASan/UBSan test object and L1 library. All fifteen review mutations and the added E5 carrier mutation reached an assertion. M13 targets the new shared clamp because the old BOF special case was removed. M15 changes only the requested displacement. [Mutant red receipts](../../build/viewport-review/mutants.log)
+All motions start at the final byte boundary. The 80-byte fixture has two content rows with an LF between them. The paragraph has 3,000 bytes. The largest fixture supplies an explicit single 65,540-byte certificate at conservative D to exercise the provider bound. The flat oracle's naturally aligned rows are shorter. The fixtures end with an ASCII three-letter word after a space. Both LEFT and nearby WORD_LEFT complete in one positive 4,096-credit step on each fixture. Flat rows and column caches are built before timing.
 
-| Mutant | Assertion that rejects it |
-|---|---|
-| M1 | Hard LF blocks the first grid and the following combining mark still joins its base. |
-| M2 | Shifted synthetic seam keeps the next nominal grid phase. |
-| M3 | Nominal cut cannot split an overlapping scalar. |
-| M4 | A strict lead at g−3 remains whole. |
-| M5 | CRLF crossing a grid stays one terminator. |
-| M6 | Exact SELECT_LINE queries require zero raw window bytes. |
-| M7 | Reverse visits debit each summary after decoding ceases. |
-| M8 | The old right edge of a deletion travels with the suffix. |
-| M9 | Pixel inversion includes the Q8 origin. |
-| M10 | A usable select prefix limits the raw suffix scan to three bytes on the fixture. |
-| M11 | Select Word requests each of its two display lines once. |
-| M12 | Vertical motion latches the indented screen column. |
-| M13 | Scroll overshoot sets the remainder to zero. |
-| M14 | The geometry-stale answer is rejected. |
-| M15 | The top PageUp request is within the same R bound as its caret operand. |
-| E5-column | The port's screen column is used while its unrelated rank count is zero. |
+| Fixture | Action | Motion p50 ns | Motion p99 ns | Step p50 ns | Step p99 ns |
+|---|---|---:|---:|---:|---:|
+| 80-byte lines | LEFT | 196 | 215 | 150 | 170 |
+| 80-byte lines | WORD_LEFT | 422 | 465 | 378 | 501 |
+| 3,000-byte paragraph | LEFT | 296 | 316 | 250 | 273 |
+| 3,000-byte paragraph | WORD_LEFT | 512 | 586 | 462 | 524 |
+| 65,540-byte certified row | LEFT | 195 | 221 | 149 | 174 |
+| 65,540-byte certified row | WORD_LEFT | 422 | 471 | 380 | 432 |
 
-## Benchmark
-
-The fixture precomputes source columns, cluster edges, rows and ranks outside the measurement. Window bytes, destination-column visits and metadata answers are metered. A separate test runs a four-cluster destination lookup with one credit per callback and observes one visit each. The timed motion is word-left over S+1 ASCII bytes. One motion took 49 positive-credit steps at a grant of 4,096. The motion and step passes time separately to keep the step timers out of the motion measurement.
-
-| Metric | Samples | p50 | p99 |
-|---|---:|---:|---:|
-| Whole motion | 1,000 | 4,321,373 ns | 60,952,356 ns |
-| Positive-credit step | 49,000 | 66,395 ns | 160,760 ns |
-
-Measured (M) with BAT0 Charging [AC] and load1 20.23 → 19.13. The sample counts are 1,000 motions, giving ten observations in the upper 1% tail, and all 49 steps per motion in the separate step pass. The benchmark exited 0. The step result measures this flat port under the recorded load. Production G1 and reader, layout and render costs remain integration measurements. [Benchmark receipt](../../build/viewport-review/bench.log)
+Measured (M) with BAT0 Charging [AC] and load1 20.46 → 20.46. The host was busy. Each row uses 1,000 complete-motion samples and 1,000 separately timed positive steps, giving ten observations in the upper 1% tail. The benchmark exited 0. The short local motions and precomputed port measure cursor work. Integrated certification, real reader service and the production input-to-submit budget have their own evidence. [Benchmark receipt](../../build/viewport-owner/bench.log)
 
 ## Footprint
 
-The send-back adds 519 lines and removes 107 across code, tests, benchmark and Makefile (M, diff against the pre-review checkout). Across the bead those files and the original build/tool changes add 1,944 lines and remove 15 (M, against the pre-bead checkout). Both counts exclude the decision/report documents and binary seed corpus.
-
-GCC preprocessing with comments and blank lines stripped counts 668 lines in viewport.c and 91 in viewport.h (M). The subtotal of 759 is 59 above the S3 estimate of 700 and 2,016 below the v1 harvest footprint of 2,775.
+This owner round added 523 lines and removed 268 across implementation, header, tests, fuzz and benchmark (M, line diff against the pre-owner checkout, excluding these records). The viewport C source adds 201 and removes 202 raw lines. The C source has 667 comment-free lines, down from 668, and the header has 92, up from 91 (M, GCC preprocessed nonblank count). The total is 759 versus the S3 estimate of 700 and the v1 harvest footprint of 2,775.
 
 ## Final lanes
 
 | Command | Result |
 |---|---|
-| `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189` | Exit 0. Viewport export gate passed, all six isolated layer links passed, all 33 sanitizer binaries and all eight Law 2 suites passed, and the contract harness recorded 64 PASS outcomes. Existing out-of-scope export diagnostics were piece 12, undo 17 and journal 28. [Log](../../build/viewport-review/final-check.log) |
-| `nice make -j2 check-tsan` | Exit 0. All 13 suites passed, including viewport. [Log](../../build/viewport-review/final-tsan.log) |
-| `nice make -j2 fuzz-smoke` | Exit 0. All 16 fuzzers replayed their seeds, including viewport. [Log](../../build/viewport-review/final-fuzz.log) |
+| `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189` | Exit 0. Viewport exports and all six isolated links passed. The 33 ASan/UBSan binaries and eight Law 2 suites passed, and the contract harness recorded 64 PASS outcomes. [Log](../../build/viewport-owner/final-check.log) |
+| `nice make -j2 check-tsan` | Exit 0. All 13 suites passed, including viewport. [Log](../../build/viewport-owner/final-tsan.log) |
+| `nice make -j2 fuzz-smoke` | Exit 0. All 16 fuzzers replayed their seeds, including viewport. [Log](../../build/viewport-owner/final-fuzz.log) |
