@@ -98,3 +98,13 @@ config_toml_parse LF-2-toml # The unit in one paragraph and opening scope. Wave 
 dnd_parse_uri_list LF-1-dnd # The module in one paragraph. The GUI drop handler decodes a text/uri-list payload into an IPC open request.
 
 work_mailbox_receive wave1-export-triage # Advisor decisions. Temporary pending the L2-1 file integration decision on selective receive.
+
+# Wave 2 layout and L5 use the signed viewport port and value types.
+viewport_accept wave2-viewport-layout-spec # L5 accepts a matching intent with the submitted picture.
+viewport_motion_begin wave2-viewport-layout-spec # Layout starts the motion cursor before placement.
+viewport_motion_size wave2-viewport-layout-spec # Layout prepays the aligned motion cursor.
+viewport_motion_step wave2-viewport-layout-spec # Layout drives motion over certified evidence.
+viewport_pixel_row wave2-viewport-layout-spec # Layout inverts the accepted text clip transform.
+viewport_plan wave2-viewport-layout-spec # Layout computes clip rows and the Q8 origin.
+viewport_rebase wave2-viewport-layout-spec # L5 transports anchors through committed replacements.
+viewport_wrap_default wave2-viewport-layout-spec # L5 chooses wrap behavior from the file name.

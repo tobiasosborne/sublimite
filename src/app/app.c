@@ -1,8 +1,8 @@
 #include "app/app.h"
 
-#include "viewport/viewport.h"
+#include "render/render.h"
 
 size_t app_smoke(void)
 {
-	return viewport_smoke();
+	return render_smoke();
 }
