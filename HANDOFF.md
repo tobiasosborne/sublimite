@@ -78,8 +78,17 @@ branches: push each at every pause or session end; delete the remote branch once
     - The deletion review table gets file 2,159 vs v1 1,664, with the reason, and asks whether the custody states can
       be fewer.
     - Publish-by-exchange BREAKS (wave1-publish-by-exchange.md); rename-over with its stated window stays.
-  - CLAUDE QUEUE, each at room >= 1.0, one at a time: L2-1 round 3, its re-check, 2b-1 (after the advisor's L5 read),
-    EDIT-CORE's finishing pass, then the source-witness bead v2-hy8.
+  - Source witness: SIGNED at 9968034 as v2-hy8's contract.
+  - New bead v2-4xk (Claude): file's publish/verify results name the changed side (source vs destination). It blocks the
+    savectl bead.
+  - CLAUDE QUEUE, each at room >= 1.0, one at a time:
+    1. L2-1 round 3's re-check, then the advisor's owner read, then the landing with wake-on-drain (1.32) adopted at
+       the merge;
+    2. v2-4xk;
+    3. 2b-1 (after the advisor's L5 read);
+    4. EDIT-CORE's finishing pass;
+    5. later, v2-hy8 (after savectl).
+    Codex is idle (the Wave 2 harvest exists, 907cbef).
   - Codex: Astra on the Wave 2 harvest (docs/decisions/wave2-L3-L4-harvest.md), document only. Muse: no dispatch while
     unreadable.
   - Serial chains:
