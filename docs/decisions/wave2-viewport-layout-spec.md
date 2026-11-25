@@ -80,7 +80,7 @@ In the table **keep** preserves selection. **Move** applies the computed byte/af
 | DOWN | L supplies following row and column lookup. V chooses destination/edge affinity. | V move | one neighboring row + F |
 | PAGE_UP | V requests a fully visible page upward for caret and top. L resolves rows and preferred column. | V move | ≤ R row displacement per operand + F |
 | PAGE_DOWN | V requests a fully visible page downward for caret and top. L resolves rows and preferred column. | V move | ≤ R row displacement per operand + F |
-| HOME | V uses L's active row, first nonblank and current caret for smart Home. On a soft continuation use row.byte. For physical-line Home resolve the hard start by piece rank/select as below. | V move, leading at start | O(D) for visual Home, plus physical-start lookup if needed + F |
+| HOME | V uses L's active row, first nonblank and current caret for smart Home. On a soft continuation use row.byte. | V move, leading at start | O(D) for visual Home + F |
 | END | V uses L's active row.end and successor kind. | V move, trailing at shared seam | O(D) + F |
 | DOC_HOME | V chooses BOF. | V move | O(1) + F |
 | DOC_END | V reads snapshot length. | V move | O(1) + F |
@@ -88,7 +88,7 @@ In the table **keep** preserves selection. **Move** applies the computed byte/af
 | SELECT_WORD | V takes clustered class run around caret with the pin's existing-selection/EOL rule. | V sets both ends | O(D + bytes traversed) + F |
 | SELECT_LINE | V uses piece rank/select for the physical LF bounds of both selection edges, excludes an end exactly at the next start, extends one line on repeat. | V sets mark/start and caret/next, or EOF | O(H+K) per indexed query + fallback bytes (worst O(length)) + F |
 
-Word/line selection still acts on file content. For physical-line Home and SELECT_LINE, rank an endpoint with `piece_lines_before`. On an exact rank n, use `piece_lines_start(n)` for the hard start and select the needed successor rank for the exclusive selection end (EOF past the last line). Use each exact answer immediately. On inexact rank, find the required LF bounds around that byte with resumable raw scans. On an inexact select, scan locally from the endpoint for the missing boundary. The returned (off, before) is an exact prefix on valid backing and can shorten a forward LF count. Keep the repeat, exclusive-end and smart-Home rules above. A backing conflict follows Q13. Text-run and fallback LF walks can outlast a slice. Reverse word scan stages each preceding display line forward once and visits its summaries backwards. Report these command-specific costs separately from caret-follow, under the same input serial.
+Word/line selection still acts on file content. For SELECT_LINE, rank an endpoint with `piece_lines_before`. On an exact rank n, use `piece_lines_start(n)` for the hard start and select the needed successor rank for the exclusive selection end (EOF past the last line). Use each exact answer immediately. On inexact rank, find the required LF bounds around that byte with resumable raw scans. On an inexact select, scan locally from the endpoint for the missing boundary. The returned (off, before) is an exact prefix on valid backing and can shorten a forward LF count. Keep the repeat and exclusive-end rules above. A backing conflict follows Q13. Text-run and fallback LF walks can outlast a slice. Reverse word scan stages each preceding display line forward once and visits its summaries backwards. Report these command-specific costs separately from caret-follow, under the same input serial.
 
 ## Q12 · one emitter and visible repair
 
@@ -269,3 +269,20 @@ Budget comment-free C plus public headers. Each group is an implementation estim
 A29 awaits signature. L5 lifecycle, render admission, font holds, tabs and minimap remain with their owners. This checkout’s `src/edit/edit.h` is a smoke stub. S8 uses the signed Wave 1 declaration. Implementation counts and timing gates remain to be measured.
 
 Advisor signature ____________________    Date ____________________
+
+## Errata after signature (advisor, 2026-11-25)
+E5 (port contract; from v2-1sg Q1). There are no local conventions.
+- (a) The length is given once, by the driver: viewport_motion_begin(viewport_motion *, const viewport_intent *,
+  viewport_frame, uint64_t length). Layout passes the length of the snapshot it has bound, and it is valid for an empty
+  snapshot. `length` is removed from viewport_evidence. DOC_END and SELECT_ALL use the value from begin and need no
+  query.
+- (b) viewport_evidence gains `uint64_t screen_column`, defined for VP_ROW only. It is the screen column of the queried
+  byte with the queried affinity, counted in cells from the left edge of the row's text area, including synthetic
+  continuation indent. Vertical motion latches its preferred column from it. `count` keeps its one meaning (a rank or a
+  select prefix count). UINT64_MAX is not a signal in any evidence field.
+- Layout's side of the contract: its port fills screen_column on every VP_ROW answer and never reports a length.
+E6 (Home; from v2-1sg Q2). There is no physical Home in Wave 2. HOME is visual Home in both modes (§S1, §S2, §S5). The
+words "physical-line Home" (from E4) named an action that does not exist and are struck from the HOME row and from the
+paragraph under the table. The rank/select algorithm stays for SELECT_LINE only. A distinct logical-line Home bound to a
+key at the v1 pin, if any, is a harvest finding for the Wave 3 keys work.
+
