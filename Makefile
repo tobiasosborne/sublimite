@@ -283,6 +283,9 @@ $(B)/rel/bench/undo_bench: $(B)/rel/bench/undo_bench.o $(call libs_of,rel,L1 L0)
 
 # ---- check lanes (docs/PLAN_V2.md §5) ----
 # Sequential local lanes, fail-fast. Each lane can build in parallel.
+$(B)/rel/bench/viewport_bench: $(B)/rel/bench/viewport_bench.o $(call libs_of,rel,L4 L1 L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
+
 check:
 	@$(MAKE) --no-print-directory check-lints
 	@$(MAKE) --no-print-directory check-layers
@@ -384,7 +387,7 @@ check-symbols: $(call libs_desc,rel) $(B)/rel/src/main.o
 	+$(MAKE) --no-print-directory -f Makefile -f tests/symbols/fixtures.mk check-symbol-fixtures
 
 check-exports: $(call libs_desc,rel) $(B)/rel/src/main.o
-	python3 -B tools/check_exports.py $(symbol_inputs) $(addprefix --module ,os base ipc trace work scan utf8 indent find config dnd)
+	python3 -B tools/check_exports.py $(symbol_inputs) $(addprefix --module ,os base ipc trace work scan utf8 indent find config dnd viewport)
 
 $(LAYER_TEST_BINS) $(LAYER_L5_BIN): | check-module-ldlibs
 check-module-ldlibs:
