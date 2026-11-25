@@ -180,6 +180,15 @@ typedef struct edit_options {
     piece_validate_fn validate;
     void *ctx;
     uint64_t current_id, saved_id;
+    /* The journal key of the tree's declared ORIGINAL generation, or zero if
+     * there is none (new, private-copy or by-value recovered buffer); with
+     * zero every restore is by value. A nonzero key is the one the session
+     * obtained from journal_source_key at open. Edit passes it to
+     * journal_range_allowed, and a false result also means by value. It is
+     * fixed for the tree's life: a save makes the displaced generation
+     * value-only, and a reload builds a new tree and a new edit buffer.
+     * (Erratum, signed by the advisor 2026-11-25.) */
+    uint64_t original_generation;
 } edit_options;
 edit_result edit_create(edit_buffer **out, const edit_options *options);
 /* Destroy releases the log, snapshot, tree and storage off the typing path.

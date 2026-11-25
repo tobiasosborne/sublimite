@@ -52,6 +52,17 @@ branches: push each at every pause or session end; delete the remote branch once
       - errata 3/4/5 become ONE follow-up file bead; L2-1 lands as reviewed, without them;
       - errata 2/8/9 go into the 2b-1 brief;
       - erratum 1 and the edit event go into the savectl and EDIT-CORE briefs.
+  - RULE FOR EVERY CODEX BRIEF (advisor, 2026-11-25): the worker writes its decision file and its report BEFORE it
+    runs the final lanes, and afterwards updates only the lane results. Two Codex filter cuts (the N2 read and
+    EDIT-CORE) both came at the last step with the work intact.
+  - EDIT-CORE (v2-4ht): the Sol run was cut by the filter at its last step. Wip dd58ba7 is pushed as
+    t3/implement-edit-core. After 2b-1 lands, a fresh Opus finishes it against the real writer: it owns every line it
+    keeps, writes v2-4ht.md, shows red/green, lists the EDIT-INTEGRATION cases, compares the double with the real
+    journal, and judges the two out-of-brief edits (undo's static maintain_retired, the render smoke placeholder).
+    original_generation in edit_options is SIGNED and in the edit spec.
+  - CLAUDE QUEUE, each at room >= 1.0, one at a time: the L2-1 adversarial read, 2b-1, EDIT-CORE's finishing pass.
+  - Codex: Astra on the Wave 2 harvest (docs/decisions/wave2-L3-L4-harvest.md), document only. Muse: no dispatch while
+    unreadable.
   - Serial chains:
     - Codex: N2 (LANDED 1.27), then Astra's N2 landing read (docs/reviews/wave1-N2-astra.md), then Astra's minimal
       L5 spec (docs/decisions/wave1-app-spec.md; PLAN 4.7: app_loop, app_buffers, app_save, app_session, the headless
