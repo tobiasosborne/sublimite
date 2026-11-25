@@ -9,13 +9,12 @@
 
 /* A29 and S1. The flat oracle eagerly constructs grid/row boundaries once.
  * The metered port then hands out only the evidence asked for by a motion. */
-enum { FLAT_S = 32768, FLAT_D = 2 * FLAT_S + 4 };
 typedef struct {
     size_t row, next;
     uint64_t column;
 } viewport_flat_byte;
 
-typedef enum { FLAT_READY, FLAT_DELAYED, FLAT_COLUMN } flat_query_state;
+typedef enum { FLAT_READY, VIEWPORT_DISPLAY_MAXELAYED, FLAT_COLUMN } flat_query_state;
 
 typedef struct {
     const uint8_t *text;
@@ -77,7 +76,7 @@ static inline void flat_rows(viewport_flat *f, size_t first, size_t stop, bool s
 
 static inline viewport_flat flat_open(const uint8_t *text, size_t len, size_t wrap_cols)
 {
-    viewport_flat f = {.text = text, .length = len, .wrap_cols = wrap_cols, .window_cap = FLAT_S};
+    viewport_flat f = {.text = text, .length = len, .wrap_cols = wrap_cols, .window_cap = VIEWPORT_GRID_BYTES};
     f.row = calloc(len + 1, sizeof *f.row);
     f.lines = calloc(len + 1, sizeof *f.lines);
     f.at = calloc(len + 1, sizeof *f.at);
@@ -87,7 +86,7 @@ static inline viewport_flat flat_open(const uint8_t *text, size_t len, size_t wr
     size_t first = 0, last_hard = 0, seam = 0;
     bool synthetic = false;
     for (size_t i = 0; i < len; ++i) {
-        if (i && i % FLAT_S == 0 && last_hard <= i - FLAT_S) {
+        if (i && i % VIEWPORT_GRID_BYTES == 0 && last_hard <= i - VIEWPORT_GRID_BYTES) {
             seam = i;
             for (size_t lead = i - 3; lead < i; ++lead) {
                 utf8_step u = utf8_decode(text + lead, len - lead);
@@ -215,7 +214,7 @@ static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
     flat_query_state previous = f->state;
     if (f->delay && previous == FLAT_READY) {
         f->pending = *r;
-        f->state = FLAT_DELAYED;
+        f->state = VIEWPORT_DISPLAY_MAXELAYED;
         return VP_MORE;
     }
     if (previous != FLAT_READY)
@@ -255,7 +254,6 @@ static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
         f->row_hops += (size_t)hops;
         i = delta < 0 ? src - (size_t)hops : src + (size_t)hops;
         e->row = f->row[i];
-        e->point = e->row.byte;
         break;
     }
     case VP_COLUMN:
@@ -301,7 +299,7 @@ static inline viewport_answer flat_motion(viewport_motion *m, viewport_flat *f,
             assert(out.intent_serial == in.serial);
             return out;
         }
-        assert(out.intent_serial == 0);
+        assert(progress == VP_MORE && out.intent_serial == 0);
     }
 }
 

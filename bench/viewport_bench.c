@@ -18,7 +18,7 @@ static int compare(const void *a, const void *b)
 }
 
 static size_t run(viewport_motion *m, viewport_flat *flat, const viewport_intent *in,
-                  viewport_frame frame, uint64_t *step_ns, size_t capacity)
+                  viewport_frame frame, uint64_t expect, uint64_t *step_ns, size_t capacity)
 {
     viewport_motion_begin(m, in, frame, flat->length);
     viewport_port port = {flat, flat_query};
@@ -37,7 +37,7 @@ static size_t run(viewport_motion *m, viewport_flat *flat, const viewport_intent
         assert(flat->work - before <= UTF8_GRAPHEME_BUDGET - credit);
         ++steps;
     } while (progress == VP_MORE);
-    assert(out.selection.caret == 0);
+    assert(progress == VP_DONE && out.selection.caret == expect);
     return steps;
 }
 
@@ -48,38 +48,66 @@ static void percentiles(const char *label, uint64_t *samples, size_t count)
            label, count, samples[count / 2 - 1], samples[99 * count / 100 - 1]);
 }
 
-int main(void)
+static void measure(viewport_motion *motion, viewport_flat *flat, const char *fixture,
+                    viewport_action action, uint64_t expect)
 {
-    /* 1,000 motions give ten observations in the upper 1% tail.
-     * The flat-port fixture has one A29 seam and a one-byte suffix. */
+    /* 1,000 motions give ten observations in the upper 1% tail. */
     enum { SAMPLES = 1000 };
     uint64_t motion_ns[SAMPLES];
-    uint8_t text[FLAT_S + 1];
-    memset(text, 'a', sizeof text);
-    viewport_flat flat = flat_open(text, sizeof text, 0);
-    viewport_motion *motion = malloc(viewport_motion_size());
-    assert(motion);
     viewport_frame frame;
     assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
-    viewport_intent in = {.serial = 1, .action = VIEWPORT_WORD_LEFT,
-        .selection = {sizeof text, sizeof text, UINT64_MAX}};
-    /* Warm up and size the samples from the steps in the fixed workload. */
-    size_t steps = run(motion, &flat, &in, frame, NULL, 0);
+    viewport_intent in = {.serial = 1, .action = action,
+        .selection = {flat->length, flat->length, UINT64_MAX}};
+    size_t steps = run(motion, flat, &in, frame, expect, NULL, 0);
     uint64_t *step_ns = calloc(steps * SAMPLES, sizeof *step_ns);
     assert(step_ns);
     for (size_t i = 0; i < SAMPLES; ++i) {
         uint64_t start = now_ns();
-        size_t complete = run(motion, &flat, &in, frame, NULL, 0);
+        size_t complete = run(motion, flat, &in, frame, expect, NULL, 0);
         motion_ns[i] = now_ns() - start;
         assert(complete == steps);
     }
     for (size_t i = 0; i < SAMPLES; ++i)
-        assert(run(motion, &flat, &in, frame, step_ns + i * steps, steps) == steps);
-    printf("viewport word-left over S+1 bytes, metered flat port, %zu steps per motion\n", steps);
+        assert(run(motion, flat, &in, frame, expect, step_ns + i * steps, steps) == steps);
+    printf("%s %s, %zu positive-credit steps per motion\n",
+           fixture, action == VIEWPORT_LEFT ? "LEFT" : "WORD_LEFT", steps);
     percentiles("motion", motion_ns, SAMPLES);
     percentiles("positive-credit step", step_ns, steps * SAMPLES);
     free(step_ns);
-    free(motion);
+}
+
+static void benchmark(viewport_motion *motion, uint8_t *text, size_t len, size_t lf,
+                      const char *name)
+{
+    const char tail[] = " abc";
+    memset(text, 'x', len);
+    if (lf < len)
+        text[lf] = '\n';
+    memcpy(text + len - (sizeof tail - 1), tail, sizeof tail - 1);
+    viewport_flat flat = flat_open(text, len, 0);
+    if (len == VIEWPORT_DISPLAY_MAX) {
+        /* Feed an exactly D-byte certificate to exercise the conservative
+         * contract bound. A29's independent oracle builds shorter real rows. */
+        flat.rows = 0;
+        flat_rows(&flat, 0, len, false, false, 0);
+        flat.at[len].row = 0;
+    }
+    assert(flat.row[flat.rows - 1].end - flat.row[flat.rows - 1].byte == len - (lf < len ? lf + 1 : 0));
+    measure(motion, &flat, name, VIEWPORT_LEFT, len - 1);
+    measure(motion, &flat, name, VIEWPORT_WORD_LEFT, len - (sizeof tail - 2));
     flat_close(&flat);
+}
+
+int main(void)
+{
+    uint8_t text[VIEWPORT_DISPLAY_MAX];
+    viewport_motion *motion = malloc(viewport_motion_size());
+    assert(motion);
+    /* Two 80-byte content rows separated by one LF, the requested 3,000
+     * byte paragraph, and one certificate at the public A29 bound. */
+    benchmark(motion, text, 2 * 80 + 1, 80, "80-byte lines");
+    benchmark(motion, text, 3000, 3000, "3,000-byte paragraph");
+    benchmark(motion, text, sizeof text, sizeof text, "65,540-byte certified row");
+    free(motion);
     return 0;
 }

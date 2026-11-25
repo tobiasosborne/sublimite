@@ -1,14 +1,15 @@
 #include "viewport/viewport.h"
 
-#include "piece/piece.h"
+#include <string.h>
+
+#include "os/os.h"
 #include "utf8/utf8.h"
 
-/* S1/A29 and the signed pixel format. */
-enum { GRID = 32768, SPAN = 2 * GRID + 4, Q8 = 256, SCALAR = 4 };
+enum { Q8 = 256 };
 
 typedef enum {
-    MOTION_START, SEEK_LINE, TOP_ROW, TOP_NEIGHBOR, ACTIVE_ROW, CARET_NEIGHBOR, COLUMN,
-    SEGMENT, STAGE, ALIGN, FORWARD, REVERSE, RANK, LINE_START, RAW_BACK, RAW_NEXT, FINISHED
+    SEEK_LINE, TOP_ROW, TOP_NEIGHBOR, ACTIVE_ROW, CARET_NEIGHBOR, COLUMN,
+    SEGMENT, PROBE, FORWARD, REVERSE, RANK, LINE_START, RAW_BACK, RAW_NEXT, FINISHED
 } motion_phase;
 typedef enum { BOUND_LOW, BOUND_HIGH, BOUND_REPEAT } line_bound;
 typedef enum { WALK_FORWARD, WALK_BACKWARD } walk_direction;
@@ -26,16 +27,17 @@ struct viewport_motion {
 
     uint64_t window_off;
     size_t window_len;
-    uint64_t start, grid, cursor, run_start, target, left_seam;
-    size_t staged, limit, pos, cluster, summaries, decode_paid;
+    uint64_t start, cursor, limit, pos, cluster;
+    size_t summaries, decode_paid, fragment;
     utf8_gseg seg;
-    word_class kind, run, wanted;
+    word_class kind, wanted;
     walk_direction direction;
-    bool synthetic, seam;
+    uint8_t proof_right;
+    uint8_t unit[4]; /* A UTF-8 scalar is at most four bytes. */
 
-    uint8_t buffer[UTF8_GRAPHEME_BUDGET], bytes[SPAN];
-    uint32_t offsets[SPAN];
-    uint8_t classes[SPAN];
+    uint8_t buffer[UTF8_GRAPHEME_BUDGET];
+    uint32_t offsets[VIEWPORT_DISPLAY_MAX];
+    uint8_t classes[VIEWPORT_DISPLAY_MAX];
 };
 
 static uint64_t min_u64(uint64_t a, uint64_t b) { return a < b ? a : b; }
@@ -107,25 +109,6 @@ bool viewport_pixel_row(const viewport_frame *f, int64_t y, uint32_t *row, uint3
     return true;
 }
 
-size_t viewport_motion_size(void) { return sizeof(viewport_motion); }
-
-void viewport_motion_begin(viewport_motion *m, const viewport_intent *in, viewport_frame frame,
-                           uint64_t length)
-{
-    memset(m, 0, offsetof(viewport_motion, buffer));
-    m->in = *in;
-    m->frame = frame;
-    m->length = length;
-    m->out = (viewport_answer){in->key, in->serial, in->origin.top, in->selection};
-    if (in->action != VIEWPORT_FOLLOW)
-        m->out.top.byte = min_u64(m->out.top.byte, length);
-    if (in->origin.wrap)
-        m->out.top.hscroll_cols = 0;
-    m->low = min_u64(in->selection.caret, in->selection.mark);
-    m->high = in->selection.caret > in->selection.mark ? in->selection.caret : in->selection.mark;
-    m->left_seam = UINT64_MAX;
-}
-
 static void move(viewport_motion *m, uint64_t byte, bool trailing)
 {
     m->out.selection.caret = byte;
@@ -172,9 +155,6 @@ static void start_motion(viewport_motion *m)
     case VIEWPORT_RESTORE: case VIEWPORT_FOLLOW:
         break;
     case VIEWPORT_REFLOW:
-        /* The driver puts the preceding width in target. */
-        if (m->in.target != m->frame.width_px)
-            m->out.selection.preferred_col = UINT64_MAX;
         relative_top(m, 0);
         break;
     case VIEWPORT_SEEK_BYTE:
@@ -229,13 +209,31 @@ static void start_motion(viewport_motion *m)
         } else if ((left && !caret) || (!left && caret == m->length)) {
             move(m, caret, false);
         } else {
-            m->target = caret;
-            m->cursor = left ? caret - 1 : caret;
+            m->cursor = caret;
+            m->direction = left ? WALK_BACKWARD : WALK_FORWARD;
             m->phase = SEGMENT;
         }
         break;
     }
     }
+}
+
+size_t viewport_motion_size(void) { return sizeof(viewport_motion); }
+
+void viewport_motion_begin(viewport_motion *m, const viewport_intent *in, viewport_frame frame,
+                           uint64_t length)
+{
+    memset(m, 0, offsetof(viewport_motion, buffer));
+    m->in = *in;
+    m->frame = frame;
+    m->length = length;
+    m->out = (viewport_answer){in->key, in->serial, in->origin.top, in->selection};
+    m->out.top.byte = min_u64(m->out.top.byte, length);
+    if (in->origin.wrap)
+        m->out.top.hscroll_cols = 0;
+    m->low = min_u64(in->selection.caret, in->selection.mark);
+    m->high = in->selection.caret > in->selection.mark ? in->selection.caret : in->selection.mark;
+    start_motion(m);
 }
 
 static word_class classify(utf8_step u)
@@ -255,41 +253,58 @@ static word_class classify(utf8_step u)
     return CLASS_WORD;
 }
 
-static bool take_byte(viewport_motion *m, const viewport_port *port, size_t *credits,
-                      uint64_t byte, uint8_t *out, bool backward)
+static viewport_progress window(viewport_motion *m, const viewport_port *port, size_t *credits,
+                                uint64_t byte)
 {
-    if (byte < m->window_off || byte - m->window_off >= m->window_len) {
-        size_t capacity = (size_t)min_u64(*credits, sizeof m->buffer);
-        viewport_evidence e;
-        viewport_request q = {.kind = VP_WINDOW, .as.window = {byte}};
-        if (port->query(port->ctx, &q, credits, &e) == VP_MORE)
-            return false;
-        ASSERT(byte >= e.off && byte - e.off < e.len);
-        size_t at = (size_t)(byte - e.off);
-        size_t from = backward ? at - (size_t)min_u64(at, capacity - 1) : at;
-        m->window_off = e.off + from;
-        m->window_len = (size_t)min_u64(e.len - from, capacity);
-        memcpy(m->buffer, e.bytes + from, m->window_len);
-    }
-    if (!*credits)
-        return false;
-    --*credits;
-    *out = m->buffer[byte - m->window_off];
-    return true;
+    if (byte >= m->window_off && byte - m->window_off < m->window_len)
+        return VP_DONE;
+    size_t grant = (size_t)min_u64(*credits, sizeof m->buffer), remaining = grant;
+    viewport_evidence e;
+    viewport_request q = {.kind = VP_WINDOW, .as.window = {byte}};
+    viewport_progress result = port->query(port->ctx, &q, &remaining, &e);
+    *credits -= grant - remaining;
+    if (result != VP_DONE)
+        return result;
+    ASSERT(byte >= e.off && byte - e.off < e.len && e.len <= grant - remaining);
+    memcpy(m->buffer, e.bytes, e.len);
+    m->window_off = e.off;
+    m->window_len = e.len;
+    return VP_DONE;
 }
 
-static void stage_begin(viewport_motion *m, uint64_t start, uint64_t limit, bool synthetic)
+static viewport_progress take_byte(viewport_motion *m, const viewport_port *port, size_t *credits,
+                                   uint64_t byte, uint8_t *out)
 {
-    m->start = start;
-    m->synthetic = synthetic;
-    /* A synthetic start retains its raw grid phase even after alignment. */
-    uint64_t seed = start + (synthetic ? 0 : GRID - 1);
-    m->grid = (seed / GRID + 1) * GRID;
-    m->limit = (size_t)(min_u64(limit, m->grid + SCALAR - 1) - start);
-    m->staged = m->pos = m->cluster = m->summaries = 0;
-    m->run = CLASS_NONE;
-    m->seam = false;
-    m->phase = STAGE;
+    viewport_progress result = window(m, port, credits, byte);
+    if (result != VP_DONE || !*credits)
+        return result == VP_DONE ? VP_MORE : result;
+    --*credits;
+    *out = m->buffer[byte - m->window_off];
+    return VP_DONE;
+}
+
+static void scan_begin(viewport_motion *m, uint64_t start, uint64_t end)
+{
+    ASSERT(start <= end && end - start <= VIEWPORT_DISPLAY_MAX);
+    m->start = m->pos = m->cluster = start;
+    m->limit = end;
+    m->summaries = 0;
+    m->phase = FORWARD;
+}
+
+static void scan_back(viewport_motion *m)
+{
+    m->phase = FINISHED;
+    if (!m->cursor || (m->cursor == m->row.byte && m->row.byte == m->row.line_start &&
+                       !m->row.approximate)) {
+        if (m->in.action == VIEWPORT_WORD_LEFT)
+            move(m, m->cursor, false);
+    } else if (m->cursor > m->row.byte && m->cursor <= min_u64(m->row.next, m->length)) {
+        m->pos = m->cursor;
+        m->proof_right = 0x80;
+        m->phase = PROBE;
+    } else
+        m->phase = SEGMENT;
 }
 
 /* Reserve one complete unit across grants. Already paid bytes count
@@ -310,70 +325,68 @@ static size_t scalar_cost(uint8_t lead, size_t available)
 {
     if (lead < 0xc2 || lead > 0xf4)
         return 1;
-    return (size_t)min_u64(available, lead < 0xe0 ? 2u : lead < 0xf0 ? 3u : SCALAR);
+    return (size_t)min_u64(available, lead < 0xe0 ? 2u : lead < 0xf0 ? 3u : 4u);
 }
 
-static bool stage_finish(viewport_motion *m, size_t *credits, size_t *ceiling)
+/* Decode straight from the retained window, stitching only split units. */
+static viewport_progress scalar(viewport_motion *m, const viewport_port *port, size_t *credits,
+                                const uint8_t **p, size_t *n)
 {
-    size_t grid = (size_t)(m->grid - m->start);
-    if (grid < m->staged && m->grid < m->length &&
-        !(m->bytes[grid - 1] == '\r' && m->bytes[grid] == '\n')) {
-        size_t first = grid - (size_t)min_u64(grid, SCALAR - 1);
-        /* S1 permits at most three four-byte candidate probes. */
-        if (!pay_decode(m, credits, ceiling, (grid - first) * SCALAR))
-            return false;
-        size_t end = grid;
-        for (size_t lead = first; lead < grid; ++lead) {
-            utf8_step u = utf8_decode(m->bytes + lead, m->staged - lead);
-            if (u.valid && lead + u.len > grid)
-                end = lead + u.len;
+    *p = m->unit;
+    uint64_t left = m->limit - m->pos;
+    *n = m->fragment ? scalar_cost(m->unit[0], (size_t)left) : 0;
+    while (left && (!*n || m->fragment < *n)) {
+        if (!*credits)
+            return VP_MORE;
+        viewport_progress result = window(m, port, credits, m->pos + m->fragment);
+        if (result != VP_DONE)
+            return result;
+        size_t at = (size_t)(m->pos + m->fragment - m->window_off);
+        const uint8_t *bytes = m->buffer + at;
+        size_t available = m->window_len - at;
+        if (!*n)
+            *n = scalar_cost(*bytes, (size_t)left);
+        if (!m->fragment && available >= *n) {
+            *p = bytes;
+            return VP_DONE;
         }
-        m->staged = end;
-        m->seam = m->start + end < m->length;
+        size_t copy = (size_t)min_u64(*n - m->fragment, min_u64(available, *credits));
+        memcpy(m->unit + m->fragment, bytes, copy);
+        m->fragment += copy;
+        *credits -= copy;
     }
-    m->phase = FORWARD;
-    return true;
+    return VP_DONE;
 }
 
 static void finish_word(viewport_motion *m, uint64_t end)
 {
     if (m->in.action == VIEWPORT_WORD_RIGHT) {
         move(m, end, false);
-        return;
-    }
-    m->out.selection.caret = end;
-    m->out.top.visual_end = false;
-    m->phase = FINISHED;
-    if (m->left_seam != UINT64_MAX) {
+    } else {
+        m->out.selection.caret = end;
+        m->out.top.visual_end = false;
         m->direction = WALK_BACKWARD;
-        m->target = m->left_seam;
-        m->cursor = m->target - 1;
-        m->phase = SEGMENT;
+        m->cursor = m->in.selection.caret;
+        scan_back(m);
     }
 }
 
 static void cluster_found(viewport_motion *m)
 {
-    uint64_t start = m->start + m->cluster, end = m->start + m->pos;
+    uint64_t start = m->cluster, end = m->pos, caret = m->in.selection.caret;
     word_class kind = m->kind;
     switch (m->in.action) {
     case VIEWPORT_HOME:
         if (kind != CLASS_SPACE)
-            move(m, start == m->in.selection.caret ? m->row.byte : start, false);
+            move(m, start == caret ? m->row.byte : start, false);
         break;
-    case VIEWPORT_LEFT:
-        if (end >= m->target)
-            move(m, start, false);
-        break;
-    case VIEWPORT_RIGHT:
-        if (end > m->target)
-            move(m, end, false);
+    case VIEWPORT_LEFT: case VIEWPORT_RIGHT:
+        if (m->direction == WALK_FORWARD || end == m->cursor)
+            move(m, m->direction == WALK_FORWARD ? end : start, false);
         break;
     case VIEWPORT_WORD_RIGHT:
-        if (end <= m->target)
-            break;
         if (kind == CLASS_NEWLINE)
-            move(m, start <= m->target ? end : start, false);
+            move(m, start == caret ? end : start, false);
         else if (m->wanted != CLASS_NONE && m->wanted != kind)
             move(m, start, false);
         else if (kind != CLASS_SPACE)
@@ -381,33 +394,18 @@ static void cluster_found(viewport_motion *m)
         break;
     case VIEWPORT_WORD_LEFT:
     case VIEWPORT_SELECT_WORD:
-        if (m->in.action == VIEWPORT_WORD_LEFT || m->direction == WALK_BACKWARD) {
-            m->offsets[m->summaries] = (uint32_t)m->cluster;
+        if (m->direction == WALK_BACKWARD) {
+            m->offsets[m->summaries] = (uint32_t)(start - m->start);
             m->classes[m->summaries++] = (uint8_t)kind;
-            if (end >= m->target)
-                m->phase = REVERSE;
-            break;
-        }
-        if (kind == CLASS_NEWLINE && (m->bytes[m->cluster] == '\n' || end - start > 1)) {
+        } else if ((kind == CLASS_NEWLINE && m->row.newline && start >= m->row.end) ||
+                   (m->wanted != CLASS_NONE && m->wanted != kind)) {
             if (m->wanted != CLASS_NONE)
                 finish_word(m, start);
             else
                 m->phase = FINISHED;
-            break;
-        }
-        if (m->wanted != CLASS_NONE) {
-            if (kind != m->wanted)
-                finish_word(m, start);
-            break;
-        }
-        if (kind != m->run)
-            m->run_start = start;
-        m->run = kind;
-        if (end > m->target) {
+        } else if (m->wanted == CLASS_NONE) {
             m->wanted = kind;
-            m->out.selection.mark = m->run_start;
-            if (m->synthetic && m->run_start == m->start)
-                m->left_seam = m->start;
+            m->out.selection.mark = start;
         }
         break;
     case VIEWPORT_RESTORE: case VIEWPORT_REFLOW: case VIEWPORT_FOLLOW:
@@ -422,48 +420,41 @@ static void cluster_found(viewport_motion *m)
 
 static void finish_segment(viewport_motion *m)
 {
-    uint64_t end = m->start + m->staged;
     if (m->in.action == VIEWPORT_HOME) {
-        uint64_t dest = end == m->in.selection.caret ? m->row.byte : end;
+        uint64_t dest = m->limit == m->in.selection.caret ? m->row.byte : m->limit;
         move(m, dest, dest != m->row.byte && shared_end(m->row, dest));
-    } else if (m->in.action == VIEWPORT_WORD_LEFT || m->direction == WALK_BACKWARD) {
+    } else if (m->direction == WALK_BACKWARD) {
         m->phase = REVERSE;
-    } else if (m->seam && m->in.action != VIEWPORT_RIGHT) {
-        stage_begin(m, end, m->length, true);
-    } else if (m->wanted == CLASS_NONE && m->in.action == VIEWPORT_SELECT_WORD) {
-        m->phase = FINISHED;
+    } else if (!m->row.newline && m->row.next != UINT64_MAX) {
+        m->cursor = m->row.next;
+        m->phase = SEGMENT;
     } else {
-        finish_word(m, end);
+        finish_word(m, m->limit);
     }
 }
 
 static void reverse_cluster(viewport_motion *m)
 {
-    if (m->summaries) {
-        size_t i = --m->summaries;
-        word_class kind = (word_class)m->classes[i];
-        uint64_t end = m->start + m->pos;
-        m->pos = m->offsets[i];
-        uint64_t byte = m->start + m->pos;
-        if (m->in.action == VIEWPORT_SELECT_WORD) {
-            if (kind == m->wanted)
-                m->out.selection.mark = byte;
-            else
-                m->phase = FINISHED;
-        } else if (m->wanted != CLASS_NONE && kind != m->wanted) {
-            move(m, end, false);
-        } else if (kind == CLASS_NEWLINE) {
-            move(m, end >= m->target ? byte : end, false);
-        } else if (kind != CLASS_SPACE) {
-            m->wanted = kind;
-        }
-    } else if (m->synthetic) {
-        m->cursor = m->start - 1;
-        m->phase = SEGMENT;
-    } else if (m->in.action == VIEWPORT_WORD_LEFT) {
-        move(m, m->start, false);
-    } else {
-        m->phase = FINISHED;
+    if (!m->summaries) {
+        m->cursor = m->start;
+        scan_back(m);
+        return;
+    }
+    size_t i = --m->summaries;
+    word_class kind = (word_class)m->classes[i];
+    uint64_t end = m->pos;
+    uint64_t byte = m->pos = m->start + m->offsets[i];
+    if (m->in.action == VIEWPORT_SELECT_WORD) {
+        if (kind == m->wanted)
+            m->out.selection.mark = byte;
+        else
+            m->phase = FINISHED;
+    } else if (m->wanted != CLASS_NONE && kind != m->wanted) {
+        move(m, end, false);
+    } else if (kind == CLASS_NEWLINE) {
+        move(m, end >= m->in.selection.caret ? byte : end, false);
+    } else if (kind != CLASS_SPACE) {
+        m->wanted = kind;
     }
 }
 
@@ -511,7 +502,7 @@ static void active_row(viewport_motion *m, viewport_evidence e)
         if (e.row.continuation)
             move(m, e.row.byte, false);
         else
-            stage_begin(m, e.row.byte, e.row.end, false);
+            scan_begin(m, e.row.byte, e.row.end);
     } else if (m->in.action == VIEWPORT_END) {
         move(m, e.row.end, shared_end(e.row, e.row.end));
     } else {
@@ -530,21 +521,19 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
     while (m->phase != FINISHED && *credits) {
         viewport_evidence e;
         viewport_request q;
+        viewport_progress result;
         uint64_t caret = m->in.selection.caret;
         uint8_t byte;
         switch (m->phase) {
-        case MOTION_START:
-            start_motion(m);
-            break;
         case SEEK_LINE:
         case LINE_START:
             q = (viewport_request){.kind = VP_LOGICAL_START,
                 .as.logical_start = {m->phase == SEEK_LINE ? m->in.target : m->line}};
-            if (port->query(port->ctx, &q, credits, &e) == VP_MORE)
-                return VP_MORE;
+            if ((result = port->query(port->ctx, &q, credits, &e)) != VP_DONE)
+                return result;
             if (m->phase == SEEK_LINE) {
                 if (!e.exact)
-                    return VP_MORE;
+                    return VP_WAIT;
                 m->out.top.byte = e.off;
                 m->out.top.subrow_q8 = 0;
                 m->phase = FINISHED;
@@ -563,8 +552,8 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
             break;
         case RANK:
             q = (viewport_request){.kind = VP_LOGICAL_RANK, .as.logical_rank = {m->endpoint}};
-            if (port->query(port->ctx, &q, credits, &e) == VP_MORE)
-                return VP_MORE;
+            if ((result = port->query(port->ctx, &q, credits, &e)) != VP_DONE)
+                return result;
             if (e.exact) {
                 m->line = e.count + (m->bound == BOUND_HIGH);
                 m->phase = LINE_START;
@@ -579,8 +568,8 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
                 line_found(m, 0);
                 break;
             }
-            if (!take_byte(m, port, credits, m->cursor - 1, &byte, true))
-                return VP_MORE;
+            if ((result = take_byte(m, port, credits, m->cursor - 1, &byte)) != VP_DONE)
+                return result;
             if (byte == '\n')
                 line_found(m, m->cursor);
             else
@@ -591,8 +580,8 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
                 line_found(m, m->cursor);
                 break;
             }
-            if (!take_byte(m, port, credits, m->cursor, &byte, false))
-                return VP_MORE;
+            if ((result = take_byte(m, port, credits, m->cursor, &byte)) != VP_DONE)
+                return result;
             ++m->cursor;
             if (byte == '\n')
                 line_found(m, m->cursor);
@@ -602,18 +591,25 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
         case SEGMENT: {
             bool segment = m->phase == SEGMENT;
             bool top = m->phase == TOP_ROW;
+            uint64_t point = segment ? m->cursor - (m->direction == WALK_BACKWARD) : caret;
             q = (viewport_request){.kind = VP_ROW, .as.row = {
-                top ? m->out.top.byte : segment ? m->cursor : caret,
-                !top && !segment && m->in.origin.top.visual_end}};
-            if (port->query(port->ctx, &q, credits, &e) == VP_MORE)
-                return VP_MORE;
+                top ? m->out.top.byte : point, !top && !segment && m->in.origin.top.visual_end}};
+            if ((result = port->query(port->ctx, &q, credits, &e)) != VP_DONE)
+                return result;
             if (top) {
                 m->out.top.byte = e.row.byte;
                 m->phase = TOP_NEIGHBOR;
-            } else if (segment)
-                stage_begin(m, e.row.line_start, m->length, e.row.approximate);
-            else
+            } else if (!segment) {
                 active_row(m, e);
+            } else {
+                m->row = e.row;
+                if (m->direction == WALK_FORWARD)
+                    scan_begin(m, m->cursor, min_u64(m->row.next, m->length));
+                else if (m->in.action == VIEWPORT_SELECT_WORD && e.row.newline && m->cursor > e.row.end)
+                    m->phase = FINISHED;
+                else
+                    scan_back(m);
+            }
             break;
         }
         case TOP_NEIGHBOR:
@@ -625,8 +621,8 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
                 delta = delta < 0 ? -1 : 1;
             q = (viewport_request){.kind = VP_NEIGHBOR, .as.neighbor = {
                 top ? m->out.top.byte : caret, !top && m->in.origin.top.visual_end, delta}};
-            if (port->query(port->ctx, &q, credits, &e) == VP_MORE)
-                return VP_MORE;
+            if ((result = port->query(port->ctx, &q, credits, &e)) != VP_DONE)
+                return result;
             if (top) {
                 /* A unit step returning its source proves a clamp. A final
                  * successful step onto a boundary preserves the modulus. */
@@ -652,44 +648,47 @@ viewport_progress viewport_motion_step(viewport_motion *m, const viewport_port *
         case COLUMN:
             q = (viewport_request){.kind = VP_COLUMN,
                 .as.column = {m->row.byte, m->out.selection.preferred_col}};
-            if (port->query(port->ctx, &q, credits, &e) == VP_MORE)
-                return VP_MORE;
+            if ((result = port->query(port->ctx, &q, credits, &e)) != VP_DONE)
+                return result;
             move(m, e.point, shared_end(m->row, e.point));
             if (page(m->in.action))
                 m->phase = TOP_NEIGHBOR;
             break;
-        case STAGE:
-            if (m->staged == m->limit) {
-                m->phase = ALIGN;
-                break;
+        case PROBE: {
+            if ((result = take_byte(m, port, credits, m->pos - 1, &byte)) != VP_DONE)
+                return result;
+            --m->pos;
+            bool ascii = byte < 0x80 && byte != '\r' && byte != '\n';
+            if (ascii && m->proof_right < 0x80) {
+                scan_begin(m, m->pos + 1, m->cursor);
+                m->unit[0] = m->proof_right; /* Already read by the proof. */
+                m->fragment = 1;
+            } else if (m->pos == m->row.byte) {
+                scan_begin(m, m->pos, m->cursor);
             }
-            if (!take_byte(m, port, credits, m->start + m->staged, &byte, false))
-                return VP_MORE;
-            m->bytes[m->staged++] = byte;
-            if (byte == '\n')
-                m->phase = ALIGN;
+            m->proof_right = ascii ? byte : 0x80;
             break;
-        case ALIGN:
-            if (!stage_finish(m, credits, &ceiling))
-                return VP_MORE;
-            break;
+        }
         case FORWARD: {
-            if (m->cluster == m->staged) {
+            if (m->cluster == m->limit) {
                 finish_segment(m);
                 break;
             }
-            size_t used, n = m->staged - m->pos;
-            const uint8_t *p = m->bytes + m->pos;
+            const uint8_t *p;
+            size_t used, n;
+            result = scalar(m, port, credits, &p, &n);
+            if (result != VP_DONE)
+                return result;
             bool first = m->pos == m->cluster && m->in.action != VIEWPORT_LEFT &&
                          m->in.action != VIEWPORT_RIGHT;
-            size_t cost = n ? scalar_cost(*p, n) : 1;
-            if (!pay_decode(m, credits, &ceiling, cost * (first ? 2u : 1u)))
+            if (!pay_decode(m, credits, &ceiling, (n ? n : 1) * (first ? 2u : 1u)))
                 return VP_MORE;
             if (first)
                 m->kind = classify(utf8_decode(p, n));
-            int result = utf8_grapheme_step(&m->seg, p, n, 1, 1, &used);
+            int decoded = utf8_grapheme_step(&m->seg, p, n, 1, n == m->limit - m->pos, &used);
+            m->fragment = 0;
             m->pos += used;
-            if (result == UTF8_G_END) {
+            if (decoded == UTF8_G_END) {
                 cluster_found(m);
                 m->cluster = m->pos;
             }
