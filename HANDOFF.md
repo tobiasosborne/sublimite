@@ -78,6 +78,15 @@ branches: push each at every pause or session end; delete the remote branch once
     - The deletion review table gets file 2,159 vs v1 1,664, with the reason, and asks whether the custody states can
       be fewer.
     - Publish-by-exchange BREAKS (wave1-publish-by-exchange.md); rename-over with its stated window stays.
+  - L2-1 ROUND 4 (round-2 Opus worker), before landing:
+    - MF-E: copy buffers no longer validate the lent source at prepare. file.h rule: source validation protects bytes
+      read from the source; destination expectation protects what is overwritten.
+    - R3-A: no unlink unless the destination still matches.
+    - R3-C: recover classifies EACCES/NOENT as a mismatch.
+    Then a re-check limited to MF-E, R3-A, R3-C and a rerun of all mutants; then the advisor's single owner read;
+    then the landing.
+  - v2-4xk (P2, Claude, after L2-1, blocks the Wave 1 exit and savectl): the changed side named, plus named tests for
+    the 15 round-3 survivors and X12.
   - Source witness: SIGNED at 9968034 as v2-hy8's contract.
   - New bead v2-4xk (Claude): file's publish/verify results name the changed side (source vs destination). It blocks the
     savectl bead.
