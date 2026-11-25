@@ -97,7 +97,12 @@ branches: push each at every pause or session end; delete the remote branch once
     3. 2b-1 (after the advisor's L5 read);
     4. EDIT-CORE's finishing pass;
     5. later, v2-hy8 (after savectl).
-    Codex is idle (the Wave 2 harvest exists, 907cbef).
+    Codex (advisor, 07:55): Wave 2 design runs now on Astra, one at a time. It touches no Wave 1 file.
+    1. viewport + layout spec (docs/decisions/wave2-viewport-layout-spec.md, running);
+    2. font/font_async admission and retirement;
+    3. render + render_submit_prep frame contract;
+    4. plat.
+    After each signature, Sol implements from the signed text.
   - Codex: Astra on the Wave 2 harvest (docs/decisions/wave2-L3-L4-harvest.md), document only. Muse: no dispatch while
     unreadable.
   - Serial chains:
