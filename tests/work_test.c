@@ -44,7 +44,8 @@ static _Atomic int fails;
  * including the sanitizer runtime's pthread interception. The UI thread
  * owns the fixture state. Workers only read the live mutex marker. */
 static int fault_stage, acquisitions_seen, started_threads, joined_threads;
-static int wake_fd;
+static int acquired_fds[1 + 3 * WORK_MAX_MAILBOXES];
+static size_t acquired_fd_count;
 static bool mutex_live, cond_live[3];
 
 os_err __real_os_wake_init(os_wake *w);
@@ -53,6 +54,8 @@ void __real_os_mutex_destroy(os_mutex *m);
 void __real_os_mutex_lock(os_mutex *m);
 os_err __real_os_cond_init(os_cond *c);
 void __real_os_cond_destroy(os_cond *c);
+os_err __real_os_waitset_init(os_waitset *ws);
+os_err __real_os_waitset_add(os_waitset *ws, int fd, unsigned interest, uint64_t tag);
 os_err __real_os_thread_start(os_thread *t, void (*fn)(void *), void *arg);
 os_err __real_os_thread_join(os_thread *t);
 
@@ -65,7 +68,7 @@ os_err __wrap_os_wake_init(os_wake *w)
 {
     if (fail_acquisition()) return OS_E_IO;
     os_err rc = __real_os_wake_init(w);
-    if (fault_stage && rc == OS_OK) wake_fd = os_wake_fd(w);
+    if (fault_stage && rc == OS_OK) acquired_fds[acquired_fd_count++] = os_wake_fd(w);
     return rc;
 }
 
@@ -118,6 +121,23 @@ void __wrap_os_cond_destroy(os_cond *c)
         *live = false;
     }
     __real_os_cond_destroy(c);
+}
+
+os_err __wrap_os_waitset_init(os_waitset *ws)
+{
+    if (fail_acquisition()) return OS_E_IO;
+    os_err rc = __real_os_waitset_init(ws);
+    if (fault_stage && rc == OS_OK) {
+        acquired_fds[acquired_fd_count++] = os_waitset_fd(ws);
+        acquired_fds[acquired_fd_count++] = ws->alarm_fd;
+    }
+    return rc;
+}
+
+os_err __wrap_os_waitset_add(os_waitset *ws, int fd, unsigned interest, uint64_t tag)
+{
+    if (fail_acquisition()) return OS_E_IO;
+    return __real_os_waitset_add(ws, fd, interest, tag);
 }
 
 os_err __wrap_os_thread_start(os_thread *t, void (*fn)(void *), void *arg)
@@ -313,26 +333,30 @@ static void test_closed_submit(void)
     result("section5 closed_submit", before);
 }
 static void check_init_errors(int (*init)(work_pool *, uint32_t, uint32_t),
-                              int conditions)
+                              bool foreground)
 {
-    /* Wake + mutex + configured conditions + bulk/two raster/optional foreground. */
-    int synchronization = 2 + conditions;
-    int acquisitions = synchronization + 3 + (conditions == 3);
+    /* UI wake, mutex and class conditions, then wake, wait set, registration
+     * and thread per worker: one bulk, two raster, and optional foreground. */
+    int synchronization = 4 + foreground;
+    int per_worker = 4;
+    int acquisitions = synchronization + per_worker * (3 + foreground);
     for (int stage = 1; stage <= acquisitions; stage++) {
         fault_stage = stage;
         acquisitions_seen = 0;
         started_threads = 0;
         joined_threads = 0;
-        wake_fd = -1;
+        acquired_fd_count = 0;
         int rc = init(&pool, 1, 2);
         fault_stage = 0;
         CHECK(rc == -1 && acquisitions_seen == stage);
         if (rc == 0) work_pool_shutdown(&pool);
         CHECK(work_pool_wake(&pool) == NULL && !mutex_live);
         CHECK(!cond_live[0] && !cond_live[1] && !cond_live[2]);
-        CHECK(started_threads == (stage > synchronization ? stage - synchronization - 1 : 0));
+        CHECK(started_threads == (stage > synchronization ?
+                                  (stage - synchronization - 1) / per_worker : 0));
         CHECK(joined_threads == started_threads && !pool.foreground_started);
-        CHECK(stage == 1 || (wake_fd >= 0 && fcntl(wake_fd, F_GETFD) == -1 && errno == EBADF));
+        for (size_t i = 0; i < acquired_fd_count; i++)
+            CHECK(fcntl(acquired_fds[i], F_GETFD) == -1 && errno == EBADF);
         work_pool_shutdown(&pool);
     }
     CHECK(init(&pool, 1, 2) == 0);
@@ -342,7 +366,7 @@ static void check_init_errors(int (*init)(work_pool *, uint32_t, uint32_t),
 static void test_init_errors(void)
 {
     int before = atomic_load(&fails);
-    check_init_errors(work_pool_init, 2);
+    check_init_errors(work_pool_init, false);
     result("section6 init_errors", before);
 }
 
@@ -698,6 +722,11 @@ static void test_foreground_cancel_shutdown(void);
 static void test_foreground_mailbox(void);
 static void test_foreground_init_errors(void);
 static void test_continuations(void);
+static void test_full_continuation_idle(void);
+static void test_full_continuation_drain(void);
+static void test_full_continuation_cancel(void);
+static void test_full_continuation_shutdown(void);
+static void test_finish_before_wake(void);
 static bool init_foreground_pool(uint32_t raster);
 /* The pool shape is the caller's configuration: n_bulk != 1 is a caller bug (A15). */
 static void init_two_bulk(void)
@@ -730,6 +759,11 @@ int main(int argc, char **argv)
         {"foreground", test_foreground_mailbox},
         {"foreground", test_foreground_init_errors},
         {"continue", test_continuations},
+        {"full-idle", test_full_continuation_idle},
+        {"full-drain", test_full_continuation_drain},
+        {"full-cancel", test_full_continuation_cancel},
+        {"full-shutdown", test_full_continuation_shutdown},
+        {"finish-wake", test_finish_before_wake},
         {"trace", test_trace_pool_lifetimes}
     };
     bool ran = false;
@@ -781,6 +815,155 @@ static void test_continuations(void)
         work_pool_shutdown(&pool);
     }
     result("continuation_same_lease_all_classes", before);
+}
+
+typedef struct full_retry {
+    _Atomic uint32_t refused, calls, release;
+    bool pause;
+} full_retry;
+
+static void job_retry_publish(work_ctx *c)
+{
+    full_retry *f = c->arg;
+    atomic_fetch_add(&f->calls, 1);
+    work_msg m = {.generation = c->generation};
+    if (work_publish(c, &m)) return;
+    atomic_store(&f->refused, 1);
+    while (f->pause && !atomic_load(&f->release) && !work_should_stop(c))
+        sleep_ms(1);
+    (void)work_continue(c);
+}
+
+static work_handle fill_bulk_mailbox(void)
+{
+    fixture fill = {.n = WORK_MAILBOX_CAP};
+    work_handle h = work_submit(&pool, (work_job){job_pub, &fill, 0, WORK_BULK});
+    CHECK(h.epoch);
+    wait_finished(h);
+    return h;
+}
+
+static work_handle submit_full_retry(full_retry *f)
+{
+    work_handle h = work_submit(&pool, (work_job){job_retry_publish, f, 1, WORK_BULK});
+    CHECK(h.epoch && wait_value(&f->refused, 1));
+    return h;
+}
+
+static void run_bulk_sentinel(void)
+{
+    fixture next = {0};
+    work_handle h = work_submit(&pool, (work_job){job_noop, &next, 0, WORK_BULK});
+    CHECK(h.epoch);
+    wait_finished(h);
+    CHECK(atomic_load(&next.ran) == 1);
+}
+
+static void test_full_continuation_idle(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    (void)fill_bulk_mailbox();
+    full_retry f = {0};
+    work_handle h = submit_full_retry(&f);
+    run_bulk_sentinel();
+    /* Observe over one and then four legacy cancel-poll quanta. One call is
+     * needed to discover full. The bound is identical in both windows. */
+    sleep_ms(5);
+    uint32_t short_hold = atomic_load(&f.calls);
+    sleep_ms(4 * 5);
+    uint32_t long_hold = atomic_load(&f.calls);
+    printf("work_test: full mailbox invocation counts %u then %u\n", short_hold, long_hold);
+    CHECK(short_hold == 1 && long_hold == 1 && !work_handle_finished(&pool, h));
+    work_pool_shutdown(&pool);
+    result("full_continuation_idle", before);
+}
+
+static void test_full_continuation_drain(void)
+{
+    int before = atomic_load(&fails);
+    for (uint32_t mode = 0; mode < 3; mode++) {
+        if (!init_pool(0)) return;
+        work_handle fill = fill_bulk_mailbox();
+        full_retry f = {.pause = mode == 2};
+        work_handle h = submit_full_retry(&f);
+        if (!f.pause) {
+            run_bulk_sentinel();
+            sleep_ms(5); /* One continuation cancellation-poll quantum. */
+            CHECK(atomic_load(&f.calls) == 1);
+        }
+        /* Selective receive reclaims the same physical head as ordinary
+         * drain. The final case lets the drain win before the retry yields. */
+        size_t n = mode == 0 ?
+            work_test_mailbox_drain_bounded(&pool, discard, NULL, 1, 0) :
+            work_test_mailbox_receive_bounded(&pool, fill, 0, discard, NULL, 1, 0);
+        CHECK(n == 1);
+        atomic_store(&f.release, 1);
+        wait_finished(h);
+        CHECK(atomic_load(&f.calls) == 2);
+        CHECK(work_test_mailbox_receive_bounded(&pool, h, 1, discard, NULL, WORK_MAILBOX_CAP, 0) == 1);
+        work_pool_shutdown(&pool);
+    }
+    result("full_continuation_drain", before);
+}
+
+static void test_full_continuation_cancel(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    (void)fill_bulk_mailbox();
+    full_retry f = {0};
+    work_handle h = submit_full_retry(&f);
+    run_bulk_sentinel();
+    sleep_ms(5); /* One continuation cancellation-poll quantum. */
+    work_cancel(&pool, h);
+    CHECK(work_handle_finished(&pool, h));
+    uint32_t epoch = atomic_load(&pool.slots[h.slot].epoch);
+    work_cancel(&pool, h);
+    CHECK(epoch == h.epoch + 1u && atomic_load(&pool.slots[h.slot].epoch) == epoch);
+    CHECK(work_test_mailbox_drain_bounded(&pool, discard, NULL, 1, 0) == 1);
+    run_bulk_sentinel();
+    CHECK(atomic_load(&f.calls) == 1 && atomic_load(&pool.slots[h.slot].busy) == 0);
+    work_pool_shutdown(&pool);
+    result("full_continuation_cancel", before);
+}
+
+static void test_full_continuation_shutdown(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    (void)fill_bulk_mailbox();
+    full_retry f = {0};
+    work_handle h = submit_full_retry(&f);
+    run_bulk_sentinel();
+    sleep_ms(5); /* One continuation cancellation-poll quantum. */
+    work_pool_shutdown(&pool);
+    CHECK(atomic_load(&f.calls) == 1 && atomic_load(&pool.slots[h.slot].busy) == 0);
+    CHECK(atomic_load(&pool.slots[h.slot].finished_epoch) == h.epoch);
+    CHECK(pool.queue[WORK_BULK].count == 0);
+    result("full_continuation_shutdown", before);
+}
+
+static void test_finish_before_wake(void)
+{
+    int before = atomic_load(&fails);
+    if (!init_pool(0)) return;
+    fixture block = {0}, queued = {0};
+    work_handle h = work_submit(&pool, (work_job){job_block, &block, 0, WORK_BULK});
+    CHECK(h.epoch && wait_value(&block.started, 1));
+    work_handle q = work_submit(&pool, (work_job){job_noop, &queued, 0, WORK_BULK});
+    CHECK(q.epoch);
+    work_cancel(&pool, q);
+    CHECK(wake_wait(work_pool_wake(&pool), 0) == OS_OK);
+    CHECK(work_handle_finished(&pool, q) && atomic_load(&pool.slots[q.slot].busy) == 0);
+    CHECK(work_mailbox_drain(&pool, discard, NULL) == 0 && !work_mailbox_pending(&pool));
+    work_cancel(&pool, h);
+    /* Same watchdog as wait_finished. Running cancellation can only signal
+     * once the worker has returned; the job itself publishes no messages. */
+    CHECK(wake_wait(work_pool_wake(&pool), 5000000000) == OS_OK);
+    CHECK(work_handle_finished(&pool, h) && atomic_load(&pool.slots[h.slot].busy) == 0);
+    work_pool_shutdown(&pool);
+    result("finish_before_wake_without_mail", before);
 }
 
 typedef struct selective_collection { work_handle h; uint32_t generation, next; size_t n; } selective_collection;
@@ -1253,6 +1436,6 @@ static void test_foreground_mailbox(void)
 static void test_foreground_init_errors(void)
 {
     int before = atomic_load(&fails);
-    check_init_errors(work_pool_init_foreground, 3);
+    check_init_errors(work_pool_init_foreground, true);
     result("foreground_init_failure_cleanup", before);
 }

@@ -184,7 +184,8 @@ $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 	$(CC_SAN) $(TSAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,tsan) $(LDLIBS) -o $@
 # Work initialization faults are injected at the OS boundary in this suite.
 WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
-                   os_cond_init os_cond_destroy os_thread_start os_thread_join
+                   os_cond_init os_cond_destroy \
+                   os_waitset_init os_waitset_add os_thread_start os_thread_join
 $(foreach c,rel san tsan,$(B)/$(c)/tests/work_test): private LDLIBS += $(foreach s,$(WORK_TEST_WRAPS),-Wl,--wrap=$(s))
 # Fault-service faults are injected beneath os (v2-0fv.2): per-suite link flags,
 # LDFLAGS_<suite stem>, consumed by the test link rules.

@@ -8,7 +8,7 @@
  * work_publish / work_should_stop: worker thread (inside a job) only.
  * No allocation here; the caller owns storage aligned to _Alignof(work_pool)
  * (64 bytes). Heap callers use aligned_alloc(_Alignof(work_pool), sizeof *p).
- * Idle workers sleep on a condvar (no wakeups when nothing is queued).
+ * Workers sleep until work is runnable or the pool shuts down.
  * Stated preconditions are ASSERTed (os.h, A15): a handle is a submit result,
  * a job's class is one the pool was configured for, callbacks are non-NULL. */
 #ifndef WORK_WORK_H
@@ -69,12 +69,19 @@ typedef struct work_handle {
     uint32_t epoch;        /* 0 = invalid */
 } work_handle;
 
+typedef enum work_space_state {
+    WORK_SPACE_NONE,
+    WORK_SPACE_REFUSED_FULL,
+    WORK_SPACE_PARKED
+} work_space_state;
+
 typedef struct work_slot {
     work_job job;
     _Atomic uint32_t epoch;      /* bumped by cancel; job stops when != ctx.epoch */
     _Atomic uint32_t busy;       /* 1 from submit until the worker is done with it */
     _Atomic uint32_t pending;    /* published, not yet drained; slot is not reused while >0 */
     _Atomic uint32_t finished_epoch; /* physical completion acknowledgement */
+    work_space_state space; /* owned by the dequeuing worker during invocation, otherwise under pool.mu */
     /* UI-only selective receive state; workers never read these fields. */
     uint32_t receive_epoch;
     uint32_t receive_scan_generation;
@@ -83,11 +90,17 @@ typedef struct work_slot {
     uint32_t mailbox_worker; /* under pool.mu: last invocation's producer identity */
 } work_slot;
 
+typedef enum work_mailbox_arm {
+    WORK_MAILBOX_DISARMED,
+    WORK_MAILBOX_ARMED
+} work_mailbox_arm;
+
 typedef struct work_mailbox {
     _Alignas(64) _Atomic uint32_t head;   /* consumer (UI) */
     _Alignas(64) _Atomic uint32_t tail;   /* producer (worker) */
     work_msg msgs[WORK_MAILBOX_CAP];
     uint8_t received[WORK_MAILBOX_CAP]; /* UI-only holes from selective receive */
+    _Atomic uint32_t space_arm; /* work_mailbox_arm. Producer arms, UI disarms without pool.mu. */
 } work_mailbox;
 
 typedef struct work_queue {
@@ -96,14 +109,27 @@ typedef struct work_queue {
     uint32_t head, count;
 } work_queue;
 
+typedef enum work_wait_mode {
+    WORK_WAIT_CLASS,
+    WORK_WAIT_SPACE
+} work_wait_mode;
+
+typedef struct work_worker {
+    struct work_pool *pool;
+    uint32_t index, cls;
+    os_thread thread;
+    os_wake wake;
+    os_waitset waitset;
+    work_wait_mode wait_mode; /* worker sets, class notifier reads, both under pool.mu */
+} work_worker;
+
 typedef struct work_pool {
     work_slot slots[WORK_MAX_JOBS];
     work_mailbox mb[WORK_MAX_WORKERS];
     work_queue queue[2];
     os_mutex mu;
     os_cond cv[2];
-    os_thread threads[WORK_MAX_WORKERS];
-    work_ctx wctx[WORK_MAX_WORKERS];
+    work_worker workers[WORK_MAX_MAILBOXES];
     uint32_t n_workers, n_bulk;
     bool shutting_down;                 /* under mu */
     os_wake wake;
@@ -116,14 +142,12 @@ typedef struct work_pool {
      * bulk/raster workers; its ctx.worker is WORK_FOREGROUND_WORKER. */
     work_queue foreground_queue;
     os_cond foreground_cv;
-    os_thread foreground_thread;
-    work_ctx foreground_wctx;
     work_mailbox foreground_mb;
     bool foreground_enabled, foreground_started;
 } work_pool;
 
 /* n_bulk in [1,1], n_raster in [0, WORK_MAX_RASTER]. 0 on success, -1 when
- * an OS resource (wake, mutex, condition, thread) cannot be acquired. Failure
+ * an OS resource (wake, mutex, condition, wait set, thread) cannot be acquired. Failure
  * releases all initialized resources and leaves an inactive pool safe for
  * shutdown, refused submit/cancel, or another init. Never init an active
  * pool; shutdown first. */
@@ -156,7 +180,11 @@ work_handle work_submit(work_pool *p, work_job job);
 /* UI-only physical lease acknowledgement. True for the refused handle, after
  * shutdown, or once its worker has returned / queued cancellation removed it.
  * Cancellation alone does not finish a running lease. Valid across slot reuse
- * within the same initialized pool lifetime, whose identities never wrap. */
+ * within the same initialized pool lifetime, whose identities never wrap.
+ * Physical completion and released capacity precede the pool wake, including
+ * jobs with no messages and synchronous queued cancellation. Drain through
+ * the mailbox protocol, then check finished handles, readiness and pending
+ * mail before sleeping. */
 bool work_handle_finished(const work_pool *p, work_handle h);
 /* Logical cancel: no-op on a stale handle. Removes queued jobs immediately;
  * running jobs hold their slot until they return. Does not free job arguments.
@@ -171,11 +199,11 @@ bool     work_should_stop(const work_ctx *c);   /* poll at least every 5 ms CPU 
  * finished stays false until the final invocation returns. No new slot or
  * allocation. Return false when cancelled. Arguments remain caller-owned
  * until work_handle_finished, including cancellation between invocations.
- * Invocations may change worker (also within the raster class). A new worker
- * waits for the old worker's result reservations/callbacks to drain before
- * invoking the continuation, preserving per-lease order. Other jobs still run.
- * Continuations must not wait for I/O or a full mailbox on the foreground
- * lane: retain progress and retry in a later invocation instead. */
+ * If the latest work_publish was refused for fullness, the continuation stays
+ * on that producer and is eligible when a UI drain reclaims ring capacity.
+ * Keep any unpublished result in the caller-owned argument for the retry.
+ * Other invocations may migrate once prior results and callbacks drain.
+ * Other runnable jobs still run. Foreground continuations must avoid I/O. */
 bool     work_continue(work_ctx *c);
 /* Returns false if dropped (stale job or mailbox full). */
 bool     work_publish(work_ctx *c, const work_msg *m);
@@ -185,7 +213,8 @@ bool     work_publish(work_ctx *c, const work_msg *m);
  * (stale messages also consume budget). Each callback must itself be bounded;
  * a callback or OS descheduling can overrun the wall-time deadline. Check input
  * between calls. Nested drains on the same pool return 0. Partial drains re-arm
- * the wake so the caller can resume after checking input. */
+ * the wake so the caller can resume after checking input. Reclaiming ring
+ * capacity wakes any continuation waiting for space in that mailbox. */
 size_t work_mailbox_drain(work_pool *p, void (*cb)(const work_msg *, void *), void *ud);
 /* UI-only continuation check; also true when all remaining messages are stale. */
 bool work_mailbox_pending(const work_pool *p);

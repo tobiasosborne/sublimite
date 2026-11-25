@@ -40,62 +40,204 @@ static uint32_t *receive_cursor(work_pool *p, work_slot *s, uint32_t pos)
     return pos == p->n_workers ? &s->receive_foreground_pos : &s->receive_pos[pos];
 }
 
+static work_mailbox *worker_mailbox(work_pool *p, uint32_t index)
+{
+    return index == WORK_FOREGROUND_WORKER ? &p->foreground_mb : &p->mb[index];
+}
+
+static void queue_push(work_queue *q, uint32_t slot, uint32_t epoch)
+{
+    uint32_t pos = (q->head + q->count) % WORK_MAX_JOBS;
+    q->q[pos] = slot;
+    q->epochs[pos] = epoch;
+    q->count++;
+}
+
+static void queue_remove(work_queue *q, uint32_t offset)
+{
+    if (offset == 0) {
+        q->head = (q->head + 1u) % WORK_MAX_JOBS;
+    } else {
+        for (uint32_t next = offset + 1u; next < q->count; next++) {
+            uint32_t src = (q->head + next) % WORK_MAX_JOBS;
+            uint32_t dst = (q->head + next - 1u) % WORK_MAX_JOBS;
+            q->q[dst] = q->q[src];
+            q->epochs[dst] = q->epochs[src];
+        }
+    }
+    q->count--;
+}
+
+static void wake_space_waiter(const work_worker *w)
+{
+    switch (w->wait_mode) {
+    case WORK_WAIT_CLASS:
+        break;
+    case WORK_WAIT_SPACE:
+        os_wake_signal(&w->wake);
+        break;
+    }
+}
+
+static void wake_class(work_pool *p, uint32_t cls, bool all)
+{
+    os_cond *cv = class_condition(p, cls);
+    if (all) os_cond_broadcast(cv);
+    else os_cond_signal(cv);
+
+    if (cls == (uint32_t)WORK_FOREGROUND) {
+        wake_space_waiter(&p->workers[WORK_FOREGROUND_WORKER]);
+        return;
+    }
+    for (uint32_t i = 0; i < p->n_workers; i++) {
+        work_worker *w = &p->workers[i];
+        if (w->cls == cls) wake_space_waiter(w);
+    }
+}
+
+static void retire_slot(work_slot *s, uint32_t epoch)
+{
+    s->space = WORK_SPACE_NONE;
+    atomic_store_explicit(&s->busy, 0, memory_order_release);
+    atomic_store_explicit(&s->finished_epoch, epoch, memory_order_release);
+}
+
+static bool mailbox_has_space(const work_mailbox *mb)
+{
+    uint32_t t = atomic_load_explicit(&mb->tail, memory_order_relaxed);
+    uint32_t h = atomic_load_explicit(&mb->head, memory_order_acquire);
+    return t - h < WORK_MAILBOX_CAP;
+}
+
+static bool retry_has_space(work_mailbox *mb)
+{
+    if (mailbox_has_space(mb)) return true;
+    /* The UI exchanges the same state after releasing head. If it already
+     * reclaimed capacity, the recheck sees that release. Otherwise it takes
+     * the arm and signals a wake that survives until the worker waits. */
+    atomic_exchange_explicit(&mb->space_arm, WORK_MAILBOX_ARMED, memory_order_acq_rel);
+    return mailbox_has_space(mb);
+}
+
+static uint32_t first_runnable(work_pool *p, const work_queue *q, uint32_t worker,
+                               work_wait_mode *wait_mode)
+{
+    for (uint32_t offset = 0; offset < q->count; offset++) {
+        uint32_t pos = (q->head + offset) % WORK_MAX_JOBS;
+        work_slot *s = &p->slots[q->q[pos]];
+        switch (s->space) {
+        case WORK_SPACE_NONE:
+            return offset;
+        case WORK_SPACE_PARKED:
+            if (worker != s->mailbox_worker || *wait_mode == WORK_WAIT_SPACE) break;
+            if (retry_has_space(worker_mailbox(p, worker))) return offset;
+            *wait_mode = WORK_WAIT_SPACE;
+            break;
+        case WORK_SPACE_REFUSED_FULL:
+            ASSERT(false); /* Refusal belongs to a dequeued invocation. */
+            break;
+        }
+    }
+    return q->count;
+}
+
+static void wait_for_space(work_worker *w)
+{
+    work_pool *p = w->pool;
+    w->wait_mode = WORK_WAIT_SPACE;
+    os_mutex_unlock(&p->mu);
+    os_wait_event event;
+    size_t count;
+    ASSERT(os_waitset_wait(&w->waitset, OS_DEADLINE_NEVER, &event, 1, &count) == OS_OK);
+    os_wake_drain(&w->wake);
+    os_mutex_lock(&p->mu);
+    w->wait_mode = WORK_WAIT_CLASS;
+}
+
 static void worker_main(void *vp)
 {
-    work_ctx *wc = vp;
-    work_pool *p = wc->pool;
-    uint32_t cls = wc->worker == WORK_FOREGROUND_WORKER ? (uint32_t)WORK_FOREGROUND :
-                   wc->worker < p->n_bulk ? (uint32_t)WORK_BULK : (uint32_t)WORK_RASTER;
-    work_queue *q = class_queue(p, cls);
-    os_cond *cv = class_condition(p, cls);
+    work_worker *w = vp;
+    work_pool *p = w->pool;
+    work_queue *q = class_queue(p, w->cls);
+    os_cond *cv = class_condition(p, w->cls);
 
-    /* Pair with diagnostic readers of the published worker identity. */
     /* Trace exhaustion disables recording for this worker. Work still runs. */
     int trace_slot = trace_thread_register();
     os_mutex_lock(&p->mu);
-    for (;;) {
-        while (q->count == 0 && !p->shutting_down)
-            os_cond_wait(cv, &p->mu);
-        if (p->shutting_down)
-            break;
-        uint32_t si = q->q[q->head], ep = q->epochs[q->head];
-        q->head = (q->head + 1u) % WORK_MAX_JOBS;
-        q->count--;
+    while (!p->shutting_down) {
+        work_wait_mode wait_mode = WORK_WAIT_CLASS;
+        uint32_t offset = first_runnable(p, q, w->index, &wait_mode);
+        if (offset == q->count) {
+            switch (wait_mode) {
+            case WORK_WAIT_CLASS:
+                os_cond_wait(cv, &p->mu);
+                break;
+            case WORK_WAIT_SPACE:
+                wait_for_space(w);
+                break;
+            }
+            continue;
+        }
+        uint32_t pos = (q->head + offset) % WORK_MAX_JOBS;
+        uint32_t si = q->q[pos], ep = q->epochs[pos];
+        queue_remove(q, offset);
         work_slot *s = &p->slots[si];
+        s->space = WORK_SPACE_NONE;
         /* On migration, acquire the UI's last reservation release, including
          * the callback, before the next invocation can publish. */
-        bool deferred = wc->worker != s->mailbox_worker &&
+        bool deferred = w->index != s->mailbox_worker &&
             atomic_load_explicit(&s->pending, memory_order_acquire) != 0;
-        if (!deferred) s->mailbox_worker = wc->worker;
+        if (!deferred) s->mailbox_worker = w->index;
         os_mutex_unlock(&p->mu);
 
-        bool continuing = deferred;
-        if (!deferred && atomic_load_explicit(&s->epoch, memory_order_acquire) == ep) {
-            work_ctx c = { p, s, ep, s->job.generation, wc->worker, s->job.arg, false };
+        work_ctx c = { p, s, ep, s->job.generation, w->index, s->job.arg, false };
+        if (!deferred && !work_should_stop(&c))
             s->job.fn(&c);
-            continuing = c.continue_;
-        }
         os_mutex_lock(&p->mu);
         /* Requeue and cancellation share the dequeue mutex. In particular,
          * cancellation during the final CPU slice cannot resurrect a lease. */
-        if (continuing && !p->shutting_down &&
-            atomic_load_explicit(&s->epoch, memory_order_acquire) == ep) {
-            work_queue *next = class_queue(p, (uint32_t)s->job.cls);
-            uint32_t pos = (next->head + next->count) % WORK_MAX_JOBS;
-            next->q[pos] = si;
-            next->epochs[pos] = ep;
-            next->count++;
-            os_cond_signal(class_condition(p, (uint32_t)s->job.cls));
+        if ((deferred || c.continue_) && !p->shutting_down && !work_should_stop(&c)) {
+            queue_push(q, si, ep);
+            switch (s->space) {
+            case WORK_SPACE_NONE:
+                if (!deferred) wake_class(p, w->cls, false);
+                break;
+            case WORK_SPACE_REFUSED_FULL:
+                s->space = WORK_SPACE_PARKED;
+                break;
+            case WORK_SPACE_PARKED:
+                ASSERT(false); /* A running invocation cannot be parked. */
+                break;
+            }
         } else {
-            /* Publish physical retirement to handle queries and reserve
-             * release to slot selection only after the invocation returns. */
-            atomic_store_explicit(&s->finished_epoch, ep, memory_order_release);
-            atomic_store_explicit(&s->busy, 0, memory_order_release);
+            retire_slot(s, ep);
+            mailbox_notify(p);
         }
     }
     os_mutex_unlock(&p->mu);
     if (trace_slot >= 0)
         trace_thread_release();
+}
+
+static int worker_start(work_pool *p, uint32_t index, uint32_t cls)
+{
+    work_worker *w = &p->workers[index];
+    *w = (work_worker){.pool = p, .index = index, .cls = cls, .waitset = OS_WAITSET_INIT};
+    if (os_wake_init(&w->wake) != OS_OK) return -1;
+    if (os_waitset_init(&w->waitset) == OS_OK &&
+        os_waitset_add(&w->waitset, os_wake_fd(&w->wake), OS_WAIT_IN, 1) == OS_OK &&
+        os_thread_start(&w->thread, worker_main, w) == OS_OK)
+        return 0;
+    os_waitset_close(&w->waitset);
+    os_wake_close(&w->wake);
+    return -1;
+}
+
+static void worker_join(work_worker *w)
+{
+    (void)os_thread_join(&w->thread);
+    os_waitset_close(&w->waitset);
+    os_wake_close(&w->wake);
 }
 
 /* A handle is a submit result: {0, 0} when refused, otherwise an issued slot
@@ -113,51 +255,44 @@ static int pool_init(work_pool *p, uint32_t n_bulk, uint32_t n_raster, bool fore
     for (uint32_t i = 0; i < WORK_MAX_JOBS; i++)
         atomic_init(&p->slots[i].epoch, 1u);
     p->n_bulk = n_bulk;
-    p->n_workers = n_bulk + n_raster;
     if (os_wake_init(&p->wake) != OS_OK)
         return -1;
-    p->active = true;
     if (os_mutex_init(&p->mu) != OS_OK)
-        goto fail_fd;
+        goto fail_wake;
     if (os_cond_init(&p->cv[0]) != OS_OK)
         goto fail_mutex;
     if (os_cond_init(&p->cv[1]) != OS_OK)
-        goto fail_cond;
-    if (foreground) {
-        if (os_cond_init(&p->foreground_cv) != OS_OK)
-            goto fail_raster_cond;
-        p->foreground_enabled = true;
-    }
-    for (uint32_t i = 0; i < p->n_workers; i++) {
-        p->wctx[i].pool = p;
-        p->wctx[i].worker = i;
-        if (os_thread_start(&p->threads[i], worker_main, &p->wctx[i]) != OS_OK) {
-            p->n_workers = i;
-            work_pool_shutdown(p);
-            return -1;
-        }
+        goto fail_bulk_cond;
+    if (foreground && os_cond_init(&p->foreground_cv) != OS_OK)
+        goto fail_raster_cond;
+    p->active = true;
+    p->foreground_enabled = foreground;
+    os_mutex_lock(&p->mu);
+    for (uint32_t i = 0; i < n_bulk + n_raster; i++) {
+        if (worker_start(p, i, i < n_bulk ? WORK_BULK : WORK_RASTER) != 0)
+            goto fail_workers;
+        p->n_workers++;
     }
     if (foreground) {
-        p->foreground_wctx.pool = p;
-        p->foreground_wctx.worker = WORK_FOREGROUND_WORKER;
-        if (os_thread_start(&p->foreground_thread, worker_main, &p->foreground_wctx) != OS_OK) {
-            work_pool_shutdown(p);
-            return -1;
-        }
+        if (worker_start(p, WORK_FOREGROUND_WORKER, WORK_FOREGROUND) != 0)
+            goto fail_workers;
         p->foreground_started = true;
     }
+    os_mutex_unlock(&p->mu);
     return 0;
 
+fail_workers:
+    os_mutex_unlock(&p->mu);
+    work_pool_shutdown(p);
+    return -1;
 fail_raster_cond:
     os_cond_destroy(&p->cv[1]);
-fail_cond:
+fail_bulk_cond:
     os_cond_destroy(&p->cv[0]);
 fail_mutex:
     os_mutex_destroy(&p->mu);
-fail_fd:
+fail_wake:
     os_wake_close(&p->wake);
-    p->active = false;
-    p->n_workers = 0;
     return -1;
 }
 
@@ -188,21 +323,16 @@ void work_pool_shutdown(work_pool *p)
     for (uint32_t cls = 0; cls < (p->foreground_enabled ? 3u : 2u); cls++) {
         work_queue *q = class_queue(p, cls);
         while (q->count) {
-            atomic_store_explicit(&p->slots[q->q[q->head]].finished_epoch,
-                                  q->epochs[q->head], memory_order_release);
-            atomic_store_explicit(&p->slots[q->q[q->head]].busy, 0, memory_order_release);
-            q->head = (q->head + 1u) % WORK_MAX_JOBS;
-            q->count--;
+            retire_slot(&p->slots[q->q[q->head]], q->epochs[q->head]);
+            queue_remove(q, 0);
         }
         q->head = 0;
+        wake_class(p, cls, true);
     }
-    os_cond_broadcast(&p->cv[0]);
-    os_cond_broadcast(&p->cv[1]);
-    if (p->foreground_enabled) os_cond_broadcast(&p->foreground_cv);
     os_mutex_unlock(&p->mu);
     for (uint32_t i = 0; i < p->n_workers; i++)
-        (void)os_thread_join(&p->threads[i]);
-    if (p->foreground_started) (void)os_thread_join(&p->foreground_thread);
+        worker_join(&p->workers[i]);
+    if (p->foreground_started) worker_join(&p->workers[WORK_FOREGROUND_WORKER]);
     p->foreground_started = false;
     os_wake_close(&p->wake);
     p->active = false;
@@ -279,6 +409,7 @@ static int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, w
         work_slot *s = &p->slots[i];
         s->job = jobs[j];
         s->mailbox_worker = WORK_MAX_MAILBOXES;
+        s->space = WORK_SPACE_NONE;
         /* Only a free slot can advance here. The queue mutex publishes the
          * job and its new epoch together. */
         uint32_t ep = atomic_fetch_add_explicit(&s->epoch, 1u, memory_order_acq_rel) + 1u;
@@ -291,15 +422,11 @@ static int work_submit_batch(work_pool *p, const work_job *jobs, size_t count, w
         handles[j] = (work_handle){i, ep};
     }
     for (size_t j = 0; j < count; j++) {
-        uint32_t cls = (uint32_t)jobs[j].cls;
-        work_queue *q = class_queue(p, cls);
-        uint32_t pos = (q->head + q->count) % WORK_MAX_JOBS;
-        q->q[pos] = handles[j].slot;
-        q->epochs[pos] = handles[j].epoch;
-        q->count++;
+        work_queue *q = class_queue(p, (uint32_t)jobs[j].cls);
+        queue_push(q, handles[j].slot, handles[j].epoch);
     }
     for (uint32_t cls = 0; cls < 3; cls++)
-        if (needed[cls]) os_cond_broadcast(class_condition(p, cls));
+        if (needed[cls]) wake_class(p, cls, true);
     os_mutex_unlock(&p->mu);
     return 0;
 }
@@ -342,15 +469,9 @@ void work_cancel(work_pool *p, work_handle h)
         uint32_t pos = (q->head + offset) % WORK_MAX_JOBS;
         if (q->q[pos] != h.slot || q->epochs[pos] != h.epoch)
             continue;
-        for (uint32_t next = offset + 1u; next < q->count; next++) {
-            uint32_t src = (q->head + next) % WORK_MAX_JOBS;
-            uint32_t dst = (q->head + next - 1u) % WORK_MAX_JOBS;
-            q->q[dst] = q->q[src];
-            q->epochs[dst] = q->epochs[src];
-        }
-        q->count--;
-        atomic_store_explicit(&s->finished_epoch, h.epoch, memory_order_release);
-        atomic_store_explicit(&s->busy, 0, memory_order_release);
+        queue_remove(q, offset);
+        retire_slot(s, h.epoch);
+        mailbox_notify(p);
         break;
     }
     os_mutex_unlock(&p->mu);
@@ -370,16 +491,18 @@ bool work_continue(work_ctx *c)
 bool work_publish(work_ctx *c, const work_msg *m)
 {
     work_pool *p = c->pool;
+    c->slot->space = WORK_SPACE_NONE;
     if (work_should_stop(c)) {
         atomic_fetch_add_explicit(&p->dropped_stale, 1, memory_order_relaxed);
         return false;
     }
-    work_mailbox *mb = c->worker == WORK_FOREGROUND_WORKER ? &p->foreground_mb : &p->mb[c->worker];
+    work_mailbox *mb = worker_mailbox(p, c->worker);
     /* tail is single-producer. Acquire the UI's reclaimed head before
      * overwriting a ring entry that the consumer previously read. */
     uint32_t t = atomic_load_explicit(&mb->tail, memory_order_relaxed);
     uint32_t h = atomic_load_explicit(&mb->head, memory_order_acquire);
     if (t - h >= WORK_MAILBOX_CAP) {
+        c->slot->space = WORK_SPACE_REFUSED_FULL;
         atomic_fetch_add_explicit(&p->dropped_full, 1, memory_order_relaxed);
         return false;
     }
@@ -432,7 +555,19 @@ static void mailbox_reclaim(work_pool *p, work_mailbox *mb)
         uint32_t w = mb == &p->foreground_mb ? p->n_workers : (uint32_t)(mb - p->mb);
         for (uint32_t i = 0; i < WORK_MAX_JOBS; i++) *receive_cursor(p, &p->slots[i], w) = next;
     }
-    if (next != h) atomic_store_explicit(&mb->head, next, memory_order_release);
+    if (next == h) return;
+    atomic_store_explicit(&mb->head, next, memory_order_release);
+    if (!p->active) return;
+    switch ((work_mailbox_arm)atomic_exchange_explicit(&mb->space_arm, WORK_MAILBOX_DISARMED,
+                                                        memory_order_acq_rel)) {
+    case WORK_MAILBOX_DISARMED:
+        break;
+    case WORK_MAILBOX_ARMED: {
+        uint32_t worker = mb == &p->foreground_mb ? WORK_FOREGROUND_WORKER : (uint32_t)(mb - p->mb);
+        os_wake_signal(&p->workers[worker].wake);
+        break;
+    }
+    }
 }
 
 static bool mailbox_consume(work_pool *p, work_mailbox *mb, uint32_t pos,
