@@ -1,7 +1,6 @@
 #ifndef RENDER_INTERNAL_H
 #define RENDER_INTERNAL_H
 
-#include <stdatomic.h>
 #include <string.h>
 #include "render/render_driver.h"
 
@@ -11,124 +10,113 @@ typedef struct render_node {
     uint64_t epoch, ordinal;
     uint32_t prev, next, version;
 } render_node;
-typedef struct render_delivery {
+typedef struct render_bank {
+    render_binding binding;
     render_node *nodes;
-    uint64_t ordinal, watermark;
+    uint64_t epoch, ordinal, watermark;
     uint32_t head, tail, count, cursor;
-} render_delivery;
+} render_bank;
 
-typedef struct render_buffers {
-    render_strip *runs;
-    render_cell *cells;
-    uint32_t *region_rgb;
-    render_delta *deltas;
-    uint8_t *r8;
-} render_buffers;
+struct render_scene {
+    render_scene_view view;
+    size_t overscan_count;
+    uint32_t background;
+#ifdef RENDER_TEST_HOOKS
+    size_t scan_cells, drawn_rows;
+    uint64_t scan_ns;
+    render_binding observed_binding;
+#endif
+};
 
-typedef enum render_lease { RENDER_LEASE_LIVE, RENDER_LEASE_RELEASED } render_lease;
-typedef struct render_evidence { uint64_t ns; render_clock clock; } render_evidence;
 struct render {
     base_arena *arena;
     base_arena_mark_t mark;
     render_setup setup;
     render_backend_caps caps;
     void *driver;
-    render_binding binding;
-    uint64_t epoch;
-    uint32_t *sheet_versions;
-    render_delivery delivery;
-    render_buffers buffers;
+    os_wake command_wake;
+    render_driver_port port;
+    render_bank active, staged;
+    uint64_t next_epoch;
+    bool suspended;
+    render_sheet sheet;
+    uint8_t *sheet_bytes;
+    render_scene scene;
     render_packet packet;
-    _Atomic(const render_packet *) command;
     render_counters stats;
-    render_state bind_previous;
     render_rc progress;
-    render_lease lease;
-    render_device device;
-    render_presentation presentation;
-    render_evidence fence, display;
     render_rect region;
     render_scroll scroll;
     uint32_t background;
 };
 
-static inline bool render_product(size_t a, size_t b, size_t *out)
-{
-    return !__builtin_mul_overflow(a, b, out);
-}
+/* Packet arrays are allocated writable once. Only idle staging may write
+ * through their const owner-facing representation. */
+#define RENDER_WRITE(type, ptr) ((type *)(ptr))
+#define RENDER_STORAGE(a, n, t) render_storage((a), (n), sizeof(t), _Alignof(t))
 
-static inline void *render_storage(base_arena *a, size_t count, size_t elem, size_t align)
+static inline void *render_storage(base_arena *a, size_t n, size_t size, size_t align)
 {
     size_t bytes;
-    if (!count || !render_product(count, elem, &bytes)) return NULL;
+    if (!n || __builtin_mul_overflow(n, size, &bytes)) return NULL;
     void *p = base_arena_alloc(a, bytes, align);
     if (p) memset(p, 0, bytes);
     return p;
 }
-#define RENDER_STORAGE(a, count, type) render_storage(a, count, sizeof(type), _Alignof(type))
-
 static inline bool render_same_frame(render_frame_id a, render_frame_id b)
 {
     return a.epoch == b.epoch && a.frame == b.frame;
 }
-
 static inline bool render_same_generation(render_generation a, render_generation b)
 {
     return a.owner == b.owner && a.generation == b.generation;
 }
-
 static inline bool render_inside(render_rect r, uint32_t w, uint32_t h)
 {
     return r.x <= w && r.width <= w - r.x && r.y <= h && r.height <= h - r.y;
 }
-
 static inline bool render_empty(render_rect r)
 {
-    return r.width == 0 && r.height == 0 && r.x == 0 && r.y == 0;
+    return !(r.width | r.height | r.x | r.y);
 }
-
-static inline bool render_same_rect(render_rect a, render_rect b)
-{
-    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
-}
-
-static inline void render_copy_rows(void *dst, const void *src, size_t width,
-                                    size_t stride, uint32_t rows)
-{
-    if (width == stride) {
-        memcpy(dst, src, width * rows);
-        return;
-    }
-    for (uint32_t row = 0; row < rows; ++row)
-        memcpy((unsigned char *)dst + row * width, (const unsigned char *)src + row * stride, width);
-}
-
 static inline render_rc render_reason(render_need *need, render_field field, render_rc rc,
                                      size_t required, size_t supported)
 {
-    if (need) *need = (render_need){field, required, supported};
+    *need = (render_need){field, required, supported};
     return rc;
 }
+#define RENDER_REFUSE(need, field, rc) render_reason((need), (field), (rc), 0, 0)
 
-/* Shared sheet/runtime check. Offsets are formed only after these checks. */
-static inline bool render_tile_size(const render_binding *b, const render_tile_view *v,
-                                    render_image_id expected, size_t *bytes)
+static inline bool render_tile_extent(const render_binding *b, const render_tile_view *v, size_t *bytes)
+{
+    return v->span && v->span <= RENDER_TILE_MAX_SPAN && v->rect.width && v->rect.height &&
+        v->rect.width <= (size_t)b->cell_width * v->span && v->rect.height <= b->cell_height &&
+        !__builtin_mul_overflow((size_t)v->rect.width, v->rect.height, bytes);
+}
+/* Validate readable rows only after an extent is selected. */
+static inline bool render_tile_page(const render_tile_view *v, render_image_id id)
 {
     render_rect r = v->rect;
     size_t last;
-    return v->image.slot == expected.slot && v->image.version == expected.version &&
-        v->page && v->span && v->span <= RENDER_TILE_MAX_SPAN &&
-        r.width && r.height && r.width <= (size_t)b->cell_width * v->span &&
-        r.height <= b->cell_height && v->stride >= v->page_width &&
-        render_inside(r, v->page_width, v->page_height) &&
-        render_product(r.y + r.height - 1u, v->stride, &last) &&
-        last <= v->length && (size_t)r.x + r.width <= v->length - last &&
-        render_product(r.width, r.height, bytes);
+    return v->image.slot == id.slot && v->image.version == id.version && v->page &&
+        v->stride >= v->page_width && render_inside(r, v->page_width, v->page_height) &&
+        !__builtin_mul_overflow((size_t)(r.y + r.height - 1u), v->stride, &last) &&
+        last <= v->length && (size_t)r.x + r.width <= v->length - last;
 }
-
-static inline void render_copy_tile(uint8_t *dst, const render_tile_view *v)
+static inline void render_copy_tile(uint8_t *out, const render_tile_view *v)
 {
-    render_rect r = v->rect;
-    render_copy_rows(dst, v->page + (size_t)r.y * v->stride + r.x, r.width, v->stride, r.height);
+    const render_rect r = v->rect;
+    const uint8_t *src = v->page + (size_t)r.y * v->stride + r.x;
+    for (uint32_t y = 0; y < r.height; ++y)
+        memcpy(out + (size_t)y * r.width, src + y * v->stride, r.width);
+}
+static inline render_rect render_damage_union(render_rect a, render_rect b)
+{
+    if (!a.width) return b;
+    if (!b.width) return a;
+    uint32_t x = a.x < b.x ? a.x : b.x, y = a.y < b.y ? a.y : b.y;
+    uint32_t right = a.x + a.width > b.x + b.width ? a.x + a.width : b.x + b.width;
+    uint32_t bottom = a.y + a.height > b.y + b.height ? a.y + a.height : b.y + b.height;
+    return (render_rect){x, y, right - x, bottom - y};
 }
 #endif

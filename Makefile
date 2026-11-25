@@ -228,6 +228,12 @@ LDFLAGS_find_timeout_test := -Wl,--wrap=work_should_stop
 # journal codec (L2-2a): CRC32C hardware/portable selection is forced in the
 # suite through the base CPU predicate (no env switch, harvest 2.3).
 LDFLAGS_journal_codec_test := -Wl,--wrap=base_cpu_has_sse42
+# Render probes inspect the real owner slot and retained scene.
+render_hooks = $(B)/$(1)/src/render/render_test_hooks.o $(B)/$(1)/src/render/render_null_test_hooks.o
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/render_test: $(call render_hooks,$(c))))
+$(B)/rel/tests/law2_render_test: $(call render_hooks,rel)
+$(B)/fuzz/render_fuzz: $(call render_hooks,fuzz)
+$(foreach c,san tsan fuzz,$(eval $(B)/$(c)/src/render/render.o $(B)/$(c)/src/render/render_test_hooks.o $(B)/$(c)/tests/render_test.o: private CF_$(c) += -DRENDER_ASSERT_IDENTITIES))
 # file (L2-1): sync-barrier and fault-registry failures are injected at the
 # os seam; the six save step hooks link from the FILE_TEST_HOOKS variant.
 LDFLAGS_file_test := -Wl,--wrap=os_file_sync,--wrap=os_dir_sync,--wrap=os_fault_register,--wrap=os_rename_at,--wrap=os_fault_poll,--wrap=os_fault_retire,--wrap=os_unmap,--wrap=os_stat_at,--wrap=os_file_pread,--wrap=openat

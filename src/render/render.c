@@ -1,16 +1,22 @@
 #include "render/render_submit_prep.h"
+#include "render/render_scene.h"
 #include "trace/trace.h"
+#ifdef RENDER_TEST_HOOKS
+#include "render/render_test.h"
+#endif
 
 render_rc render_measure(const render_binding *b, const render_limits *l,
                          const render_backend_caps *caps, render_need *need)
 {
-    if (need) *need = (render_need){0};
+    render_need local;
+    if (!need) need = &local;
+    *need = (render_need){0};
     if (!b || !l || !caps)
         return render_reason(need, RENDER_FIELD_BINDING, RENDER_INVALID, 0, 0);
     if (!b->client_width || !b->client_height) return RENDER_WAIT;
     if (!b->surface || !b->geometry || !b->font.owner || !b->font.generation ||
         !b->cols || !b->rows || !b->cell_width || !b->cell_height || b->overscan > 1 ||
-        b->rows == RENDER_NO_ROW || b->sheet.count < RENDER_TILE_MAX_SPAN ||
+        b->rows == RENDER_NO_ROW || b->sheet.count < RENDER_ASCII_COUNT + RENDER_TILE_MAX_SPAN ||
         b->sheet.count > RENDER_NO_SLOT - b->sheet.first ||
         b->runtime.count > RENDER_NO_SLOT - b->runtime.first)
         return render_reason(need, RENDER_FIELD_BINDING, RENDER_INVALID, 0, 0);
@@ -37,18 +43,18 @@ render_rc render_measure(const render_binding *b, const render_limits *l,
         (uint64_t)b->rows * b->cell_height > b->client_height)
         return render_reason(need, RENDER_FIELD_BINDING, RENDER_INVALID, 0, 0);
     size_t cells, target, tile, slots, atlas, pitch;
-    if (!render_product(b->client_width, sizeof(uint32_t), &pitch))
+    if (__builtin_mul_overflow((size_t)b->client_width, sizeof(uint32_t), &pitch))
         return render_reason(need, RENDER_FIELD_TARGET, RENDER_CAPACITY, SIZE_MAX, b->target_stride);
     if (b->target_stride < pitch)
         return render_reason(need, RENDER_FIELD_TARGET, RENDER_CAPACITY, pitch, b->target_stride);
-    if (!render_product(b->cols, (size_t)b->rows + b->overscan, &cells) ||
+    if (__builtin_mul_overflow((size_t)b->cols, (size_t)b->rows + b->overscan, &cells) ||
         cells > SIZE_MAX / sizeof(render_cell))
         return render_reason(need, RENDER_FIELD_CELLS, RENDER_CAPACITY, SIZE_MAX, l->cells);
-    if (!render_product(b->client_height, b->target_stride, &target))
+    if (__builtin_mul_overflow((size_t)b->client_height, b->target_stride, &target))
         return render_reason(need, RENDER_FIELD_TARGET, RENDER_CAPACITY, SIZE_MAX, l->target_bytes);
-    if (!render_product((size_t)b->cell_width * RENDER_TILE_MAX_SPAN, b->cell_height, &tile) ||
+    if (__builtin_mul_overflow((size_t)b->cell_width * RENDER_TILE_MAX_SPAN, b->cell_height, &tile) ||
         __builtin_add_overflow((size_t)b->sheet.count, b->runtime.count, &slots) ||
-        !render_product(slots, tile, &atlas))
+        __builtin_mul_overflow(slots, tile, &atlas))
         return render_reason(need, RENDER_FIELD_ATLAS, RENDER_CAPACITY, SIZE_MAX, l->atlas_bytes);
     RENDER_LIMIT(RENDER_FIELD_CELLS, cells, cells);
     RENDER_LIMIT(RENDER_FIELD_TARGET, target_bytes, target);
@@ -68,434 +74,345 @@ render_rc render_measure(const render_binding *b, const render_limits *l,
     return RENDER_OK;
 }
 
-static render_rc render_drive_open(render *r)
+static bool render_reserve(render *r)
 {
-    render_rc rc = r->setup.driver.ops->open(&r->driver, r->arena, &r->setup);
+    base_arena *a = r->arena;
+    const render_limits *l = &r->setup.limits;
+    size_t slots, rows, sheet_bytes, tile;
+    if (__builtin_add_overflow(l->sheet_slots, l->runtime_slots, &slots) ||
+        __builtin_add_overflow((size_t)l->rows, 1u, &rows)) return false;
+#define RENDER_RESERVE(member, count, type) do { \
+    size_t n = (count); \
+    if (n && !(r->member = RENDER_STORAGE(a, n, type))) return false; \
+} while (0)
+    RENDER_RESERVE(packet.cells, l->cells, render_cell);
+    RENDER_RESERVE(packet.runs, rows / 2u, render_strip);
+    RENDER_RESERVE(packet.region_rgb, l->region_pixels, uint32_t);
+    RENDER_RESERVE(packet.deltas, l->tile_descriptors, render_delta);
+    RENDER_RESERVE(packet.r8, l->tile_bytes, uint8_t);
+    RENDER_RESERVE(scene.view.cells, l->cells, render_cell);
+    RENDER_RESERVE(scene.view.row_frames, rows, uint32_t);
+    RENDER_RESERVE(scene.view.region_rgb, l->region_pixels, uint32_t);
+    RENDER_RESERVE(scene.view.installed, slots, render_resident);
+    RENDER_RESERVE(sheet.tiles, l->sheet_slots, render_tile_view);
+    if (__builtin_mul_overflow((size_t)l->cell_width, l->cell_height, &tile) ||
+        __builtin_mul_overflow(tile, RENDER_TILE_MAX_SPAN, &tile) ||
+        __builtin_mul_overflow(tile, l->sheet_slots, &sheet_bytes) || sheet_bytes > l->atlas_bytes)
+        sheet_bytes = l->atlas_bytes;
+    RENDER_RESERVE(sheet_bytes, sheet_bytes, uint8_t);
+    RENDER_RESERVE(active.nodes, l->runtime_slots, render_node);
+    RENDER_RESERVE(staged.nodes, l->runtime_slots, render_node);
+#undef RENDER_RESERVE
+    return true;
+}
+
+render_rc render_open(base_arena *a, const render_setup *setup, render **out)
+{
+    if (!a || !setup || !out || !setup->wake || !setup->driver.ops) return RENDER_INVALID;
+    render *r = *out;
+    if (!r) {
+        const render_driver_ops *ops = setup->driver.ops;
+        const render_limits *l = &setup->limits;
+        if (!ops->query_caps || !ops->open || !ops->bind || !ops->consume || !ops->poll ||
+            !ops->quiesce || !ops->close || !l->cells || !l->rows || !l->atlas_bytes ||
+            l->sheet_slots < RENDER_ASCII_COUNT + RENDER_TILE_MAX_SPAN ||
+            (l->runtime_slots && (!setup->directory || !setup->recovery_slots))) return RENDER_INVALID;
+        base_arena_mark_t mark = base_arena_mark(a);
+        r = RENDER_STORAGE(a, 1, render);
+        if (!r) return RENDER_CAPACITY;
+        r->arena = a;
+        r->mark = mark;
+        r->setup = *setup;
+        r->caps = ops->query_caps(setup);
+        if (!render_reserve(r) || os_wake_init(&r->command_wake) != OS_OK) {
+            base_arena_reset_to_mark(a, mark);
+            return RENDER_CAPACITY;
+        }
+        atomic_init(&r->port.command, NULL);
+        r->port.wake = &r->command_wake;
+        r->port.scene = &r->scene;
+        r->port.apply = render_apply_scene;
+        r->stats.state = RENDER_OPENING;
+    } else if (r->stats.state != RENDER_OPENING || r->arena != a) return RENDER_INVALID;
+
+    render_rc rc = r->setup.driver.ops->open(&r->driver, a, &r->setup, &r->port);
     r->progress = rc;
     if (rc == RENDER_OK) r->stats.state = RENDER_UNBOUND;
-    else if (rc != RENDER_MORE && rc != RENDER_WAIT) r->stats.state = RENDER_CLOSING;
+    if (rc != RENDER_OK && rc != RENDER_MORE && rc != RENDER_WAIT) {
+        os_wake_close(&r->command_wake);
+        base_arena_reset_to_mark(a, r->mark);
+        r = NULL;
+    }
+    *out = r;
     return rc;
 }
 
-render_rc render_open(base_arena *arena, const render_setup *setup, render **out)
+static render_rc render_quiesce(render *r, render_quiescence mode)
 {
-    if (!arena || !setup || !out || !setup->driver.ops) return RENDER_INVALID;
-    const render_driver_ops *ops = setup->driver.ops;
-    const render_limits *l = &setup->limits;
-    if (!ops->query_caps || !ops->open || !ops->bind || !ops->consume || !ops->poll ||
-        !ops->quiesce || !ops->close || !l->cells || !l->rows || !l->sheet_slots ||
-        (l->runtime_slots && (!setup->directory || !setup->recovery_slots)))
+    return r->progress = r->setup.driver.ops->quiesce(r->driver, mode);
+}
+
+/* UI calls drive a physical wait after its owner wake. No wake is evidence. */
+static render_rc render_idle(render *r)
+{
+    switch (r->stats.state) {
+    case RENDER_RETIRING:
+        if (render_quiesce(r, RENDER_RETIRE_FRAME) != RENDER_OK) return r->progress;
+        if (r->stats.accepted.frame != UINT32_MAX) {
+            r->stats.state = RENDER_IDLE;
+            return RENDER_OK;
+        }
+        r->stats.state = RENDER_QUIESCING;
+        /* fall through */
+    case RENDER_QUIESCING:
+        if (render_quiesce(r, RENDER_STOP_EPOCH) != RENDER_OK) return r->progress;
+        r->active.epoch = r->staged.epoch = 0;
+        r->stats.state = RENDER_UNBOUND;
+        return RENDER_OK;
+    case RENDER_UNBOUND:
+    case RENDER_IDLE_FULL:
+    case RENDER_IDLE:
+        return RENDER_OK;
+    case RENDER_OPENING:
+    case RENDER_ACCEPTED:
+    case RENDER_ISSUED:
+        return RENDER_BUSY;
+    case RENDER_CLOSED:
+    case RENDER_CLOSING:
         return RENDER_INVALID;
-    base_arena_mark_t mark = base_arena_mark(arena);
-    render *r = RENDER_STORAGE(arena, 1, render);
-    if (!r) return RENDER_CAPACITY;
-    r->arena = arena;
-    r->mark = mark;
-    r->setup = *setup;
-    r->caps = ops->query_caps(setup);
-    r->buffers.cells = RENDER_STORAGE(arena, l->cells, render_cell);
-    r->buffers.runs = RENDER_STORAGE(arena, l->rows / 2u + l->rows % 2u, render_strip);
-    r->buffers.region_rgb = RENDER_STORAGE(arena, l->region_pixels, uint32_t);
-    r->buffers.deltas = RENDER_STORAGE(arena, l->tile_descriptors, render_delta);
-    r->buffers.r8 = RENDER_STORAGE(arena, l->tile_bytes, uint8_t);
-    r->sheet_versions = RENDER_STORAGE(arena, l->sheet_slots, uint32_t);
-    r->delivery.nodes = RENDER_STORAGE(arena, l->runtime_slots, render_node);
-    if (!r->buffers.cells || !r->buffers.runs || !r->sheet_versions ||
-        (l->region_pixels && !r->buffers.region_rgb) || (l->tile_descriptors && !r->buffers.deltas) ||
-        (l->tile_bytes && !r->buffers.r8) || (l->runtime_slots && !r->delivery.nodes)) {
-        base_arena_reset_to_mark(arena, mark);
-        return RENDER_CAPACITY;
     }
-    r->packet = (render_packet){.runs = r->buffers.runs, .cells = r->buffers.cells,
-        .region_rgb = r->buffers.region_rgb, .deltas = r->buffers.deltas, .r8 = r->buffers.r8};
-    atomic_init(&r->command, NULL);
-    r->stats.state = RENDER_OPENING;
-    render_rc rc = render_drive_open(r);
-    if (rc == RENDER_OK || rc == RENDER_MORE || rc == RENDER_WAIT) *out = r;
-    else base_arena_reset_to_mark(arena, mark);
-    return rc;
+    return RENDER_INVALID;
 }
 
 static bool render_sheet_valid(const render_binding *b, const render_sheet *s)
 {
-    if (!s || !s->tiles || s->count != b->sheet.count) return false;
+    if (!s || !s->tiles || s->count != b->sheet.count || s->ascii_count != RENDER_ASCII_COUNT) return false;
     for (size_t i = 0; i < s->count; ++i) {
         const render_tile_view *v = &s->tiles[i];
         size_t bytes;
-        if (!v->image.version ||
-            !render_tile_size(b, v, (render_image_id){b->sheet.first + (uint32_t)i, v->image.version}, &bytes))
+        if (!v->image.version || (i < s->ascii_count && v->span != 1) ||
+            !render_tile_extent(b, v, &bytes) ||
+            !render_tile_page(v, (render_image_id){b->sheet.first + (uint32_t)i, v->image.version}))
             return false;
     }
     for (uint32_t i = 0; i < RENDER_TILE_MAX_SPAN; ++i) {
-        render_image_id marker = s->marker[i];
-        if (!render_has_slot(b->sheet, marker.slot)) return false;
-        const render_tile_view *v = &s->tiles[marker.slot - b->sheet.first];
-        if (v->span != i + 1u || v->image.version != marker.version) return false;
+        render_image_id m = s->marker[i];
+        if (!render_has_slot(b->sheet, m.slot) || m.slot - b->sheet.first < s->ascii_count) return false;
+        const render_tile_view *v = &s->tiles[m.slot - b->sheet.first];
+        if (v->span != i + 1u || v->image.version != m.version) return false;
     }
     return true;
-}
-
-static void render_clear_delivery(render *r)
-{
-    r->delivery = (render_delivery){.nodes = r->delivery.nodes, .head = RENDER_LIST_END,
-                                    .tail = RENDER_LIST_END};
 }
 
 render_rc render_bind(render *r, const render_binding *b, const render_sheet *s, render_need *need)
 {
     if (!r) return RENDER_INVALID;
-    switch (r->stats.state) {
-    case RENDER_UNBOUND:
-    case RENDER_IDLE_FULL:
-    case RENDER_IDLE:
-        r->bind_previous = r->stats.state;
-        break;
-    case RENDER_BINDING:
-        break;
-    case RENDER_CLOSED:
-    case RENDER_OPENING:
-    case RENDER_ACCEPTED:
-    case RENDER_ISSUED:
-    case RENDER_QUIESCING:
-    case RENDER_CLOSING:
-        return RENDER_BUSY;
-    }
-    render_rc rc = render_measure(b, &r->setup.limits, &r->caps, need);
-    if (rc == RENDER_WAIT) {
-        r->stats.state = RENDER_BINDING;
-        r->progress = RENDER_WAIT;
-    }
+    render_rc rc = render_idle(r);
     if (rc != RENDER_OK) return rc;
-    if (r->epoch == UINT64_MAX)
-        return render_reason(need, RENDER_FIELD_EPOCH, RENDER_CAPACITY, SIZE_MAX, SIZE_MAX);
-    if (!render_sheet_valid(b, s))
-        return render_reason(need, RENDER_FIELD_SHEET, RENDER_INVALID, 0, 0);
-    rc = r->setup.driver.ops->bind(r->driver, b, s);
-    r->progress = rc;
-    if (rc == RENDER_MORE || rc == RENDER_WAIT) r->stats.state = RENDER_BINDING;
-    else if (rc != RENDER_OK) r->stats.state = r->bind_previous;
+    render_need local;
+    if (!need) need = &local;
+    rc = render_measure(b, &r->setup.limits, &r->caps, need);
+    if (rc == RENDER_WAIT) r->suspended = true;
     if (rc != RENDER_OK) return rc;
+    if (r->next_epoch == UINT64_MAX || r->stats.accepted.frame == UINT32_MAX)
+        return RENDER_REFUSE(need, RENDER_FIELD_EPOCH, RENDER_CAPACITY);
+    if (!render_sheet_valid(b, s)) return RENDER_REFUSE(need, RENDER_FIELD_SHEET, RENDER_INVALID);
 
-    r->binding = *b;
-    ++r->epoch;
-    for (size_t i = 0; i < s->count; ++i) r->sheet_versions[i] = s->tiles[i].image.version;
-    render_clear_delivery(r);
-    r->stats = (render_counters){.state = RENDER_IDLE_FULL};
-    r->region = (render_rect){0};
-    r->scroll = (render_scroll){.overscan_row = RENDER_NO_ROW};
+    render_tile_view *views = RENDER_WRITE(render_tile_view, r->sheet.tiles);
+    uint8_t *dst = r->sheet_bytes;
+    for (size_t i = 0; i < s->count; ++i) {
+        const render_tile_view *v = &s->tiles[i];
+        uint32_t w = v->rect.width, h = v->rect.height;
+        size_t bytes = (size_t)w * h;
+        render_copy_tile(dst, v);
+        views[i] = (render_tile_view){v->image, dst, bytes, w, w, h, v->span, {0, 0, w, h}};
+        dst += bytes;
+    }
+    r->sheet = *s;
+    r->sheet.tiles = views;
+    r->staged = (render_bank){.binding = *b, .nodes = r->staged.nodes, .epoch = ++r->next_epoch,
+                              .head = RENDER_LIST_END, .tail = RENDER_LIST_END};
+    r->suspended = false;
+    if (!r->active.epoch) r->stats.state = RENDER_IDLE_FULL;
     return RENDER_OK;
 }
 
-static void render_unlink(render_delivery *q, render_node *n)
+static void render_update_slot(const render_setup *s, render_bank *q, uint32_t slot)
 {
-    if (n->prev == RENDER_LIST_END) q->head = n->next;
-    else q->nodes[n->prev].next = n->next;
-    if (n->next == RENDER_LIST_END) q->tail = n->prev;
-    else q->nodes[n->next].prev = n->prev;
-    n->ordinal = 0;
-    --q->count;
-}
-
-static void render_update_slot(render *r, uint32_t slot)
-{
-    render_delivery *q = &r->delivery;
-    uint32_t index = slot - r->binding.runtime.first;
+    uint32_t index = slot - q->binding.runtime.first;
     render_node *n = &q->nodes[index];
-    bool current = n->epoch == r->epoch;
-    bool linked = current && n->ordinal > q->watermark;
+    bool current = n->epoch == q->epoch, linked = current && n->ordinal > q->watermark;
     render_image_id id = {0};
-    render_image_state state = r->setup.directory(r->setup.directory_ctx, r->binding.font, slot, &id);
-    switch (state) {
+    switch (s->directory(s->directory_ctx, q->binding.font, slot, &id)) {
     case RENDER_IMAGE_VACANT:
     case RENDER_IMAGE_QUEUED:
     case RENDER_IMAGE_EMPTY:
-        if (linked) render_unlink(q, n);
+        if (linked) {
+            if (n->prev == RENDER_LIST_END) q->head = n->next;
+            else q->nodes[n->prev].next = n->next;
+            if (n->next == RENDER_LIST_END) q->tail = n->prev;
+            else q->nodes[n->next].prev = n->prev;
+            n->ordinal = 0;
+            --q->count;
+        }
         if (current) n->version = 0;
         return;
     case RENDER_IMAGE_INK:
         break;
     }
     if (id.slot != slot || !id.version || (current && n->version == id.version)) return;
-    if (linked) {
-        n->version = id.version;
-        return;
+    if (linked) n->version = id.version;
+    else if (q->ordinal != UINT64_MAX) {
+        *n = (render_node){q->epoch, ++q->ordinal, q->tail, RENDER_LIST_END, id.version};
+        if (q->tail == RENDER_LIST_END) q->head = index;
+        else q->nodes[q->tail].next = index;
+        q->tail = index;
+        ++q->count;
     }
-    if (q->ordinal == UINT64_MAX) return;
-    *n = (render_node){r->epoch, ++q->ordinal, q->tail, RENDER_LIST_END, id.version};
-    if (q->tail == RENDER_LIST_END) q->head = index;
-    else q->nodes[q->tail].next = index;
-    q->tail = index;
-    ++q->count;
 }
 
 void render_image_changed(render *r, render_generation gen, uint32_t slot)
 {
-    if (!r || !render_same_generation(gen, r->binding.font) ||
-        !render_has_slot(r->binding.runtime, slot)) return;
-    switch (r->stats.state) {
-    case RENDER_IDLE_FULL:
-    case RENDER_IDLE:
-    case RENDER_ACCEPTED:
-    case RENDER_ISSUED:
-        render_update_slot(r, slot);
-        break;
-    case RENDER_BINDING:
-        if (r->bind_previous != RENDER_UNBOUND) render_update_slot(r, slot);
-        break;
-    case RENDER_CLOSED:
-    case RENDER_OPENING:
-    case RENDER_UNBOUND:
-    case RENDER_QUIESCING:
-    case RENDER_CLOSING:
-        break;
+    if (!r || r->stats.state == RENDER_QUIESCING || r->stats.state == RENDER_CLOSING) return;
+    render_bank *banks[] = {&r->active, &r->staged};
+    for (size_t i = 0; i < sizeof banks / sizeof *banks; ++i) {
+        render_bank *b = banks[i];
+        if (b->epoch && render_same_generation(gen, b->binding.font) && render_has_slot(b->binding.runtime, slot))
+            render_update_slot(&r->setup, b, slot);
     }
 }
 
-static render_rc render_recover(render *r)
+static void render_credit(render_bank *q, render_stage stage)
 {
-    render_delivery *q = &r->delivery;
-    const render_slot_range slots = r->binding.runtime;
-    size_t grant = r->setup.recovery_slots;
-    while (q->cursor < slots.count && grant--) {
-        render_update_slot(r, slots.first + q->cursor++);
-        ++r->stats.recovery_inspections;
-    }
-    return q->cursor < slots.count ? RENDER_MORE : RENDER_OK;
-}
-
-static void render_credit(render_delivery *q, uint32_t endpoint, size_t count)
-{
-    if (!count) return;
-    const render_node *n = &q->nodes[endpoint];
+    if (!stage.tiles) return;
+    const render_node *n = &q->nodes[stage.endpoint];
     q->head = n->next;
     q->watermark = n->ordinal;
-    q->count -= (uint32_t)count;
+    q->count -= (uint32_t)stage.tiles;
     if (q->head == RENDER_LIST_END) q->tail = RENDER_LIST_END;
     else q->nodes[q->head].prev = RENDER_LIST_END;
 }
 
-static bool render_exhausted(const render *r)
+static render_rc render_lose(render *r)
 {
-    return r->stats.accepted.frame == UINT32_MAX || r->delivery.ordinal == UINT64_MAX;
+    atomic_store_explicit(&r->port.command, NULL, memory_order_release);
+    r->stats.state = RENDER_QUIESCING;
+    (void)render_idle(r);
+    return RENDER_LOST;
+}
+
+static render_rc render_reject(render *r, render_rc rc, render_need reason, render_need *out)
+{
+    r->stats.rejected = rc;
+    r->stats.rejection = reason;
+    if (out) *out = reason;
+    return rc;
 }
 
 render_rc render_submit(render *r, const render_offer *o, const render_source *src,
                         render_frame_id *out, render_need *need)
 {
-    if (need) *need = (render_need){0};
     if (!r) return RENDER_INVALID;
-    switch (r->stats.state) {
-    case RENDER_IDLE_FULL:
-    case RENDER_IDLE:
-        break;
-    case RENDER_OPENING:
-    case RENDER_BINDING:
-    case RENDER_ACCEPTED:
-    case RENDER_ISSUED:
-        return RENDER_BUSY;
-    case RENDER_UNBOUND:
-        return RENDER_WAIT;
-    case RENDER_QUIESCING:
-        return RENDER_LOST;
-    case RENDER_CLOSED:
-    case RENDER_CLOSING:
-        return RENDER_INVALID;
-    }
-    if (render_exhausted(r)) return render_reason(need, RENDER_FIELD_EPOCH, RENDER_LOST, 0, 0);
-    if (!o || !src || !out || !src->current || !src->get_run || !src->get_row ||
+    render_rc rc = render_idle(r);
+    if (rc == RENDER_OK && (r->suspended || r->stats.state == RENDER_UNBOUND)) rc = RENDER_WAIT;
+    if (rc != RENDER_OK) return render_reject(r, rc, (render_need){0}, need);
+    if (!o || !out || !src || !src->current || !src->get_run || !src->get_row ||
         !src->get_region || !src->get_identity || !src->get_tile)
-        return RENDER_INVALID;
+        return render_reject(r, RENDER_INVALID, (render_need){.field = RENDER_FIELD_BINDING}, need);
 
-    uint64_t epoch = r->epoch;
+    bool adopt = o->mode == RENDER_FULL && render_matches(&r->staged, o->stamp);
+    render_bank *bank = adopt ? &r->staged : &r->active;
+    if (r->stats.accepted.frame == UINT32_MAX || bank->ordinal == UINT64_MAX)
+        return render_reject(r, render_lose(r), (render_need){.field = RENDER_FIELD_EPOCH}, need);
     render_stage stage = {0};
-    render_rc rc = render_prepare(r, o, src, &stage, need);
-    if (rc != RENDER_OK) return rc;
-    render_packet *p = &r->packet;
-    if (epoch != r->epoch || !render_same_stamp(p->offer.stamp, o->stamp) ||
-        !render_stamp_current(r, &p->offer, src))
-        return render_reason(need, RENDER_FIELD_STAMP, RENDER_STALE, 0, 0);
+    render_need reason = {0};
+    rc = render_prepare(r, bank, o, src, &stage, &reason);
+    if (rc != RENDER_OK) return render_reject(r, rc, reason, need);
 
-    p->id = (render_frame_id){r->epoch, r->stats.accepted.frame + 1u};
-    p->binding = &r->binding;
-    render_credit(&r->delivery, stage.endpoint, stage.tiles);
+    render_packet *p = &r->packet;
+    p->id = (render_frame_id){bank->epoch, r->stats.accepted.frame + 1u};
+    p->sheet = adopt ? &r->sheet : NULL;
+    render_credit(bank, stage);
+    render_slot_range slots = bank->binding.runtime;
+    if (!o->stamp.input_first)
+        for (size_t i = 0; i < r->setup.recovery_slots && bank->cursor < slots.count; ++i)
+            render_update_slot(&r->setup, bank, slots.first + bank->cursor++);
+    if (adopt) {
+        render_node *spare = r->active.nodes;
+        r->active = *bank;
+        r->staged = (render_bank){.nodes = spare};
+    }
     r->region = p->region;
-    r->scroll = p->offer.scroll;
-    r->background = p->offer.background;
-    r->device = RENDER_WAIT_FENCE;
-    r->presentation = RENDER_WAIT_DISPLAY;
-    r->lease = RENDER_LEASE_LIVE;
-    r->stats = (render_counters){
-        .state = RENDER_ACCEPTED, .accepted = p->id, .stamp = p->offer.stamp,
-        .recovery_inspections = r->stats.recovery_inspections,
-        .rows = stage.rows, .runs = stage.runs, .cells = stage.cells,
+    r->scroll = o->scroll;
+    r->background = o->background;
+    r->stats = (render_counters){.state = RENDER_ACCEPTED, .accepted = p->id, .stamp = p->offer.stamp,
+        .recovery_inspections = r->active.cursor, .rows = stage.rows, .runs = stage.runs, .cells = stage.cells,
         .region_pixels = stage.region_pixels, .tile_inspections = stage.inspections,
-        .tiles = stage.tiles, .tile_bytes = stage.bytes
-    };
-    r->progress = RENDER_MORE;
-    atomic_store_explicit(&r->command, p, memory_order_release);
+        .tiles = stage.tiles, .tile_bytes = stage.bytes,
+        .rejected = r->stats.rejected, .rejection = r->stats.rejection};
+    atomic_store_explicit(&r->port.command, p, memory_order_release);
+    os_wake_signal(&r->command_wake);
+    if (need) *need = (render_need){0};
     *out = p->id;
     return RENDER_OK;
 }
 
-static render_rc render_quiesce(render *r)
+static void render_time(render_counters *c, uint64_t *time, render_clock clock, enum trace_ev which)
 {
-    r->progress = r->setup.driver.ops->quiesce(r->driver);
-    return r->progress;
+    if (!c->t4 || clock == RENDER_UNTIMED) return;
+    if (*time < c->t4) *time = c->t4;
+    if (clock == RENDER_MONOTONIC) trace_record_at(*time, which, c->accepted.frame);
 }
 
-static render_rc render_lose(render *r)
+render_rc render_event(render *r, const render_notice *n)
 {
-    r->stats.state = RENDER_QUIESCING;
-    r->progress = RENDER_MORE;
-    atomic_store_explicit(&r->command, NULL, memory_order_release);
-    return RENDER_LOST;
-}
-
-static void render_publish_evidence(render *r)
-{
+    if (!r || !n || n->kind > RENDER_NOTICE_LOST) return RENDER_INVALID;
     render_counters *c = &r->stats;
-    if (c->state != RENDER_ISSUED) return;
-    switch (r->device) {
-    case RENDER_WAIT_FENCE:
-        break;
-    case RENDER_DEVICE_DONE:
-        if (c->device == RENDER_WAIT_FENCE) {
-            c->device = RENDER_DEVICE_DONE;
-            c->device_clock = r->fence.clock;
-            c->t5 = r->fence.ns > c->t4 ? r->fence.ns : c->t4;
-            if (c->device_clock == RENDER_MONOTONIC)
-                trace_record_at(c->t5, TRACE_T5_DEVICE_DONE, c->accepted.frame);
-        }
-        break;
-    }
-    switch (r->presentation) {
-    case RENDER_WAIT_DISPLAY:
-        break;
-    case RENDER_PRESENTED:
-        if (c->presentation == RENDER_WAIT_DISPLAY) {
-            c->presentation = RENDER_PRESENTED;
-            c->presentation_clock = r->display.clock;
-            if (r->display.clock != RENDER_UNTIMED)
-                c->t6 = r->display.ns > c->t4 ? r->display.ns : c->t4;
-            if (c->presentation_clock == RENDER_MONOTONIC)
-                trace_record_at(c->t6, TRACE_T6_PRESENT_COMPLETE, c->accepted.frame);
-        }
-        break;
-    case RENDER_DISCARDED:
-        c->presentation = RENDER_DISCARDED;
-        break;
-    }
-    if (c->device == RENDER_DEVICE_DONE && c->presentation != RENDER_WAIT_DISPLAY &&
-        r->lease == RENDER_LEASE_RELEASED)
-        c->state = RENDER_IDLE;
-}
-
-static bool render_notice_timed(const render *r, const render_notice *n)
-{
-    return n->ns && n->clock == (r->caps.synthetic ? RENDER_SYNTHETIC : RENDER_MONOTONIC);
-}
-
-static render_rc render_evidence_event(render *r, const render_notice *n)
-{
-    render_counters *c = &r->stats;
-    if (n->kind > RENDER_NOTICE_LOST) return RENDER_INVALID;
-    if ((c->state != RENDER_ACCEPTED && c->state != RENDER_ISSUED) ||
-        !render_same_frame(n->id, c->accepted)) return RENDER_STALE;
+    bool flight = c->state == RENDER_ACCEPTED || c->state == RENDER_ISSUED || c->state == RENDER_RETIRING;
+    if (n->kind == RENDER_NOTICE_LOST && !n->id.frame && r->active.epoch && n->id.epoch == r->active.epoch &&
+        (flight || c->state == RENDER_IDLE)) return render_lose(r);
+    if (!flight || !render_same_frame(n->id, c->accepted)) return RENDER_STALE;
+    bool timed = n->ns && n->clock == (r->caps.synthetic ? RENDER_SYNTHETIC : RENDER_MONOTONIC);
     switch (n->kind) {
-    case RENDER_PUMP:
-        return RENDER_INVALID;
     case RENDER_NOTICE_LOST:
         return render_lose(r);
     case RENDER_NOTICE_ISSUED:
-        if (c->state != RENDER_ACCEPTED ||
-            atomic_load_explicit(&r->command, memory_order_acquire)) return RENDER_STALE;
-        if (!render_notice_timed(r, n)) return RENDER_INVALID;
+        if (c->state != RENDER_ACCEPTED || atomic_load_explicit(&r->port.command, memory_order_acquire))
+            return RENDER_STALE;
+        if (!timed) return RENDER_INVALID;
         c->state = RENDER_ISSUED;
-        c->issue_clock = n->clock;
         c->t4 = n->ns;
-        c->draw = n->draw;
-        if (c->issue_clock == RENDER_MONOTONIC)
-            trace_record_at(c->t4, TRACE_T4_PRESENT_SUBMITTED, c->accepted.frame);
+        c->issue_clock = n->clock;
+        render_time(c, &c->t4, c->issue_clock, TRACE_T4_PRESENT_SUBMITTED);
+        render_time(c, &c->t5, c->device_clock, TRACE_T5_DEVICE_DONE);
+        render_time(c, &c->t6, c->presentation_clock, TRACE_T6_PRESENT_COMPLETE);
         break;
     case RENDER_NOTICE_DEVICE_DONE:
-        if (r->device != RENDER_WAIT_FENCE) return RENDER_STALE;
-        if (!render_notice_timed(r, n)) return RENDER_INVALID;
-        r->fence = (render_evidence){n->ns, n->clock};
-        r->device = RENDER_DEVICE_DONE;
+        if (c->device != RENDER_WAIT_FENCE) return RENDER_STALE;
+        if (!timed) return RENDER_INVALID;
+        c->device = RENDER_DEVICE_DONE;
+        c->t5 = n->ns;
+        c->device_clock = n->clock;
+        render_time(c, &c->t5, c->device_clock, TRACE_T5_DEVICE_DONE);
         break;
     case RENDER_NOTICE_PRESENTED:
-        if (r->presentation != RENDER_WAIT_DISPLAY) return RENDER_STALE;
-        if (!render_notice_timed(r, n) && (n->clock != RENDER_UNTIMED || n->ns))
-            return RENDER_INVALID;
-        r->display = (render_evidence){n->ns, n->clock};
-        r->presentation = RENDER_PRESENTED;
+        if (c->presentation != RENDER_WAIT_DISPLAY) return RENDER_STALE;
+        if (!timed && (n->clock != RENDER_UNTIMED || n->ns)) return RENDER_INVALID;
+        c->presentation = RENDER_PRESENTED;
+        c->t6 = n->ns;
+        c->presentation_clock = n->clock;
+        render_time(c, &c->t6, c->presentation_clock, TRACE_T6_PRESENT_COMPLETE);
         break;
     case RENDER_NOTICE_DISCARDED:
-        if (r->presentation != RENDER_WAIT_DISPLAY) return RENDER_STALE;
-        r->presentation = RENDER_DISCARDED;
-        break;
-    case RENDER_NOTICE_RELEASED:
-        if (r->lease == RENDER_LEASE_RELEASED ||
-            atomic_load_explicit(&r->command, memory_order_acquire)) return RENDER_STALE;
-        r->lease = RENDER_LEASE_RELEASED;
+        if (c->presentation != RENDER_WAIT_DISPLAY) return RENDER_STALE;
+        c->presentation = RENDER_DISCARDED;
         break;
     }
-    render_publish_evidence(r);
+    if (c->state == RENDER_ISSUED && c->device == RENDER_DEVICE_DONE && c->presentation != RENDER_WAIT_DISPLAY) {
+        c->state = RENDER_RETIRING;
+        (void)render_idle(r);
+    }
     return RENDER_OK;
-}
-
-static render_rc render_pump_flight(render *r)
-{
-    const render_driver_ops *ops = r->setup.driver.ops;
-    const render_packet *p = atomic_load_explicit(&r->command, memory_order_acquire);
-    if (p) {
-        render_rc rc = ops->consume(r->driver, p);
-        if (rc == RENDER_OK) {
-            atomic_store_explicit(&r->command, NULL, memory_order_release);
-            return RENDER_MORE;
-        }
-        if (rc != RENDER_MORE && rc != RENDER_WAIT) return render_lose(r);
-        return rc;
-    }
-    render_notice n = {0};
-    render_rc rc = ops->poll(r->driver, &n);
-    if (rc == RENDER_MORE || rc == RENDER_WAIT) return rc;
-    if (rc != RENDER_OK) return render_lose(r);
-    rc = render_evidence_event(r, &n);
-    if (rc == RENDER_LOST) return rc;
-    return r->stats.state == RENDER_IDLE ? RENDER_OK : RENDER_MORE;
-}
-
-render_rc render_event(render *r, const render_notice *notice)
-{
-    if (!r || !notice) return RENDER_INVALID;
-    if (notice->kind != RENDER_PUMP) return render_evidence_event(r, notice);
-    switch (r->stats.state) {
-    case RENDER_OPENING:
-        return render_drive_open(r);
-    case RENDER_IDLE_FULL:
-    case RENDER_IDLE:
-        if (render_exhausted(r)) return render_lose(r);
-        return render_recover(r);
-    case RENDER_ACCEPTED:
-    case RENDER_ISSUED:
-        r->progress = render_pump_flight(r);
-        if (r->progress == RENDER_LOST) r->progress = RENDER_MORE;
-        return r->stats.state == RENDER_QUIESCING ? RENDER_LOST : r->progress;
-    case RENDER_QUIESCING:
-        if (render_quiesce(r) != RENDER_OK) return r->progress;
-        r->stats.state = RENDER_UNBOUND;
-        r->stats.draw = (render_draw_report){0};
-        render_clear_delivery(r);
-        return RENDER_OK;
-    case RENDER_BINDING:
-    case RENDER_UNBOUND:
-    case RENDER_CLOSING:
-        return RENDER_WAIT;
-    case RENDER_CLOSED:
-        return RENDER_INVALID;
-    }
-    return RENDER_INVALID;
 }
 
 bool render_pending(const render *r, render_wake *out)
@@ -504,16 +421,20 @@ bool render_pending(const render *r, render_wake *out)
     if (r) {
         w.wake = r->setup.wake;
         switch (r->stats.state) {
-        case RENDER_IDLE_FULL:
         case RENDER_IDLE:
-            w.recovery = r->delivery.cursor < r->binding.runtime.count;
-            w.delivery = r->delivery.count != 0;
-            w.runnable = w.recovery || w.delivery || render_exhausted(r);
+        case RENDER_IDLE_FULL:
+            if (r->suspended) break;
+            w.delivery = (r->active.epoch && r->active.count) || (r->staged.epoch && r->staged.count);
+            w.recovery = (r->active.epoch && r->active.cursor < r->active.binding.runtime.count) ||
+                (r->staged.epoch && r->staged.cursor < r->staged.binding.runtime.count);
+            w.runnable = w.delivery || w.recovery || r->staged.epoch;
             break;
-        case RENDER_OPENING:
-        case RENDER_BINDING:
         case RENDER_ACCEPTED:
         case RENDER_ISSUED:
+            w.waiting = true;
+            break;
+        case RENDER_OPENING:
+        case RENDER_RETIRING:
         case RENDER_QUIESCING:
         case RENDER_CLOSING:
             w.waiting = r->progress == RENDER_WAIT;
@@ -532,9 +453,17 @@ void render_stats(const render *r, render_counters *out)
 {
     if (!out) return;
     *out = r ? r->stats : (render_counters){0};
-    if (r) {
-        out->queued = r->delivery.count;
-        out->watermark = r->delivery.watermark;
+    if (!r) return;
+    const render_bank *b = r->active.epoch ? &r->active : &r->staged;
+    if (b->epoch) {
+        out->queued = b->count;
+        out->watermark = b->watermark;
+    }
+    if (!out->t4) {
+        out->device = RENDER_WAIT_FENCE;
+        out->presentation = RENDER_WAIT_DISPLAY;
+        out->device_clock = out->presentation_clock = RENDER_UNTIMED;
+        out->t5 = out->t6 = 0;
     }
 }
 
@@ -542,12 +471,27 @@ render_rc render_close(render *r)
 {
     if (!r) return RENDER_OK;
     r->stats.state = RENDER_CLOSING;
-    atomic_store_explicit(&r->command, NULL, memory_order_release);
+    atomic_store_explicit(&r->port.command, NULL, memory_order_release);
     if (r->driver) {
-        render_rc rc = render_quiesce(r);
+        render_rc rc = render_quiesce(r, RENDER_STOP_EPOCH);
         if (rc != RENDER_OK) return rc;
         r->setup.driver.ops->close(r->driver);
     }
+    os_wake_close(&r->command_wake);
     base_arena_reset_to_mark(r->arena, r->mark);
     return RENDER_OK;
 }
+
+#ifdef RENDER_TEST_HOOKS
+render_test_owner render_test_owner_get(render *r)
+{
+    return (render_test_owner){r->setup.driver, r->driver, &r->port};
+}
+render_test_view render_test_inspect(render *r)
+{
+    render_scene *s = &r->scene;
+    render_test_view v = {s->view, s->observed_binding, s->scan_cells, s->drawn_rows, s->scan_ns};
+    if (!v.scene.region.width) v.scene.region_rgb = NULL;
+    return v;
+}
+#endif

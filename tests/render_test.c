@@ -10,6 +10,7 @@ static int start(render_fixture *f)
     /* One page per live fixture row is ample for the two tiny scene copies,
      * atlas, packet, metadata and setup. */
     CHECK(base_arena_init(&f->arena, (RF_ROWS + 1u) * os_page_size()) == 0);
+    CHECK(os_wake_init(&f->wake) == OS_OK);
     CHECK(render_open(&f->arena, &f->setup, &f->r) == RENDER_OK);
     render_counters c;
     render_stats(f->r, &c);
@@ -24,6 +25,7 @@ static int stop(render_fixture *f)
 {
     CHECK(render_close(f->r) == RENDER_OK);
     CHECK(base_arena_mark(&f->arena) == 0);
+    os_wake_close(&f->wake);
     base_arena_free(&f->arena);
     return 0;
 }
@@ -32,6 +34,36 @@ static render_rc notice(render_fixture *f, render_frame_id id, render_notice_kin
                         render_clock clock, uint64_t ns)
 {
     return render_event(f->r, &(render_notice){.kind = kind, .id = id, .clock = clock, .ns = ns});
+}
+
+_Static_assert(_Generic(((render_setup){0}).native, plat_native_binding *:1, default:0),
+               "render uses the native platform binding");
+
+static render_rc finish_notices(render_fixture *f, render_test_owner owner)
+{
+    render_notice n;
+    render_rc rc;
+    while ((rc = owner.driver.ops->poll(owner.state, &n)) == RENDER_OK) {
+        rc = render_event(f->r, &n);
+        if (rc != RENDER_OK && rc != RENDER_STALE) return rc;
+    }
+    return rc == RENDER_WAIT ? RENDER_OK : rc;
+}
+
+typedef struct owner_job {
+    render_test_owner owner;
+    const render_packet *packet;
+    render_notice issue;
+    render_rc rc;
+} owner_job;
+
+static void owner_consume(void *arg)
+{
+    owner_job *job = arg;
+    job->packet = rf_take(job->owner);
+    job->rc = rf_dispatch(job->owner, job->packet);
+    if (job->rc == RENDER_OK)
+        job->rc = job->owner.driver.ops->poll(job->owner.state, &job->issue);
 }
 
 static int lifecycle(void)
@@ -47,51 +79,105 @@ static int lifecycle(void)
     f.offer.stamp.input_last = 8;
     CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && id.frame == 1 && id.epoch);
     render_stats(f.r, &c);
-    CHECK(c.state == RENDER_ACCEPTED && c.stamp.input_first == 7 && c.stamp.input_last == 8);
-    CHECK(render_submit(f.r, NULL, NULL, NULL, NULL) == RENDER_BUSY && f.stamp_reads == 2);
+    CHECK(c.state == RENDER_ACCEPTED && c.stamp.input_last == 8 && f.stamp_reads == 1);
+    CHECK(!render_test_inspect(f.r).binding.cols);
+    CHECK(render_submit(f.r, NULL, NULL, NULL, NULL) == RENDER_BUSY && f.stamp_reads == 1);
     CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_BUSY);
     CHECK(notice(&f, id, RENDER_NOTICE_ISSUED, RENDER_SYNTHETIC, 1) == RENDER_STALE);
     CHECK(notice(&f, id, RENDER_NOTICE_DEVICE_DONE, RENDER_MONOTONIC, 1) == RENDER_INVALID);
     CHECK(notice(&f, id, RENDER_NOTICE_DEVICE_DONE, RENDER_SYNTHETIC, 1) == RENDER_OK);
     CHECK(notice(&f, id, RENDER_NOTICE_DEVICE_DONE, RENDER_SYNTHETIC, 1) == RENDER_STALE);
     CHECK(notice(&f, id, RENDER_NOTICE_DISCARDED, RENDER_UNTIMED, 0) == RENDER_OK);
-    CHECK(notice(&f, id, RENDER_NOTICE_PRESENTED, RENDER_SYNTHETIC, 1) == RENDER_STALE);
     render_stats(f.r, &c);
     CHECK(c.device == RENDER_WAIT_FENCE && c.presentation == RENDER_WAIT_DISPLAY && !c.t5 && !c.t6);
-    CHECK(rf_pump(&f) == RENDER_MORE); /* consume */
-    CHECK(rf_pump(&f) == RENDER_MORE); /* real issue within the synthetic driver */
-    render_stats(f.r, &c);
-    CHECK(c.state == RENDER_ISSUED && c.device == RENDER_DEVICE_DONE && c.presentation == RENDER_DISCARDED);
-    CHECK(c.t4 && c.t5 == c.t4 && c.t6 == 0 && c.issue_clock == RENDER_SYNTHETIC);
-    CHECK(render_submit(f.r, NULL, NULL, NULL, NULL) == RENDER_BUSY);
-    CHECK(rf_finish(&f) == RENDER_OK);
-    render_stats(f.r, &c);
-    CHECK(c.state == RENDER_IDLE && c.presentation == RENDER_DISCARDED && !c.t6);
+    render_wake wake;
+    CHECK(render_pending(f.r, &wake) && wake.waiting && !wake.runnable && wake.wake == &f.wake);
 
-    render_frame_id old = id;
-    rf_offer(&f, RENDER_PATCH);
-    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && id.frame == old.frame + 1u);
-    CHECK(notice(&f, old, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_STALE);
-    CHECK(rf_pump(&f) == RENDER_MORE);
-    CHECK(rf_pump(&f) == RENDER_MORE);
-    CHECK(notice(&f, id, RENDER_NOTICE_PRESENTED, RENDER_SYNTHETIC, 1) == RENDER_OK);
+    owner_job job = {.owner = render_test_owner_get(f.r)};
+    os_thread thread;
+    CHECK(os_thread_start(&thread, owner_consume, &job) == OS_OK);
+    CHECK(os_thread_join(&thread) == OS_OK && job.rc == RENDER_OK && job.packet && job.packet->sheet);
+    CHECK(job.issue.kind == RENDER_NOTICE_ISSUED && render_event(f.r, &job.issue) == RENDER_OK);
+    CHECK(finish_notices(&f, job.owner) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(c.state == RENDER_ISSUED && c.presentation == RENDER_PRESENTED &&
-          c.device == RENDER_WAIT_FENCE && c.t6 == c.t4);
-    CHECK(rf_finish(&f) == RENDER_OK);
-    render_stats(f.r, &c);
-    CHECK(c.state == RENDER_IDLE && c.t5 >= c.t4 && c.t6 == c.t4 && c.draw.scan_cells == 0);
+    CHECK(c.state == RENDER_IDLE && c.device == RENDER_DEVICE_DONE && c.presentation == RENDER_DISCARDED);
+    CHECK(c.t4 && c.t5 == c.t4 && !c.t6 && !render_test_inspect(f.r).scan_cells);
+    CHECK(notice(&f, id, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_STALE);
 
     rf_offer(&f, RENDER_PATCH);
-    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
-    CHECK(rf_pump(&f) == RENDER_MORE && rf_pump(&f) == RENDER_MORE);
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && id.frame == 2);
+    CHECK(rf_dispatch(job.owner, rf_take(job.owner)) == RENDER_OK);
+    CHECK(job.owner.driver.ops->poll(job.owner.state, &job.issue) == RENDER_OK);
+    CHECK(render_event(f.r, &job.issue) == RENDER_OK);
     CHECK(notice(&f, id, RENDER_NOTICE_PRESENTED, RENDER_UNTIMED, 0) == RENDER_OK);
-    CHECK(rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(c.presentation == RENDER_PRESENTED && !c.t6 && c.presentation_clock == RENDER_UNTIMED);
+    CHECK(c.state == RENDER_ISSUED && c.presentation == RENDER_PRESENTED && c.device == RENDER_WAIT_FENCE);
+    CHECK(finish_notices(&f, job.owner) == RENDER_OK);
+    render_stats(f.r, &c);
+    CHECK(c.state == RENDER_IDLE && c.t5 >= c.t4 && !c.t6);
+
+    CHECK(notice(&f, (render_frame_id){id.epoch, 0}, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_LOST);
+    render_stats(f.r, &c);
+    CHECK(c.state == RENDER_UNBOUND && !c.watermark);
+    CHECK(render_submit(f.r, NULL, NULL, NULL, NULL) == RENDER_WAIT);
     return stop(&f);
 }
 
+static int staged_binding(void)
+{
+    render_fixture f;
+    CHECK(start(&f) == 0);
+    rf_notify(&f, 0, 21);
+    rf_wide(&f, 0, f.tiles[0].image);
+    rf_offer(&f, RENDER_FULL);
+    f.offer.tile_descriptors = 1;
+    f.offer.tile_bytes = RF_TILE;
+    render_frame_id old;
+    CHECK(rf_submit(&f, &old, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
+    render_binding first_binding = f.binding;
+    ++f.binding.geometry;
+
+    render_need need;
+    render_sheet bad = f.sheet;
+    ++bad.marker[0].version;
+    CHECK(render_bind(f.r, &f.binding, &bad, &need) == RENDER_INVALID && need.field == RENDER_FIELD_SHEET);
+    bad = f.sheet;
+    --bad.ascii_count;
+    CHECK(render_bind(f.r, &f.binding, &bad, &need) == RENDER_INVALID);
+    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
+    render_counters c;
+    render_stats(f.r, &c);
+    CHECK(c.accepted.frame == old.frame && c.stamp.geometry == first_binding.geometry &&
+          c.watermark == 1 && rf_sample(&f, 0).coverage[0] == 21);
+
+    rf_offer(&f, RENDER_FULL);
+    f.stale_stamp = true;
+    render_frame_id next = old;
+    CHECK(rf_submit(&f, &next, NULL) == RENDER_STALE && next.frame == old.frame);
+    render_stats(f.r, &c);
+    CHECK(c.accepted.frame == old.frame && c.stamp.geometry == first_binding.geometry &&
+          c.rejected == RENDER_STALE && c.rejection.field == RENDER_FIELD_STAMP);
+    f.stale_stamp = false;
+
+    render_binding staged = f.binding;
+    f.binding = first_binding;
+    rf_offer(&f, RENDER_PATCH);
+    CHECK(rf_submit(&f, &next, NULL) == RENDER_OK && next.epoch == old.epoch &&
+          next.frame == old.frame + 1u && rf_finish(&f) == RENDER_OK);
+    f.binding = staged;
+    rf_offer(&f, RENDER_FULL);
+    CHECK(rf_submit(&f, &next, NULL) == RENDER_OK && next.epoch != old.epoch && next.frame == old.frame + 2u);
+    CHECK(notice(&f, (render_frame_id){old.epoch, 0}, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_STALE);
+    render_stats(f.r, &c);
+    CHECK(c.stamp.geometry == staged.geometry && c.recovery_inspections == 1 && c.queued == 1);
+    CHECK(rf_finish(&f) == RENDER_OK && !rf_sample(&f, 0).coverage);
+    rf_offer(&f, RENDER_PATCH);
+    f.offer.tile_descriptors = 1;
+    f.offer.tile_bytes = RF_TILE;
+    CHECK(rf_submit(&f, &next, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
+    CHECK(rf_sample(&f, 0).coverage[0] == 21);
+    return stop(&f);
+}
 static int delivery(void)
 {
     render_fixture f;
@@ -116,15 +202,26 @@ static int delivery(void)
     f.rgb[5] = UINT32_MAX;
     render_frame_id id = {99, 99};
     render_need need;
-    f.stale_on_recheck = true;
+    f.stale_stamp = true;
     CHECK(rf_submit(&f, &id, &need) == RENDER_STALE && need.field == RENDER_FIELD_STAMP);
     render_counters c;
     render_stats(f.r, &c);
     CHECK(c.state == RENDER_IDLE_FULL && !c.accepted.frame && c.queued == RF_SLOTS && !c.watermark);
-    CHECK(id.frame == 99 && f.tile_reads == 2);
-    f.stamp_reads = f.tile_reads = 0;
-    f.stale_on_recheck = false;
+    CHECK(id.frame == 99 && !f.tile_reads && f.stamp_reads == 1);
+    f.stale_stamp = false;
+
+    /* A malformed selected second tile refuses the whole copied prefix. */
+    f.offer.tile_bytes = 2u * RF_TILE;
+    size_t saved_length = f.tiles[1].length;
+    f.tiles[1].length = 0;
+    CHECK(rf_submit(&f, &id, &need) == RENDER_INVALID && id.frame == 99);
+    render_stats(f.r, &c);
+    CHECK(!c.watermark && c.queued == RF_SLOTS && c.rejected == RENDER_INVALID &&
+          c.rejection.field == RENDER_FIELD_TILE);
+    /* The same head is only a byte-grant lookahead this time. */
+    f.offer.tile_bytes = RF_TILE + 1u;
     CHECK(rf_submit(&f, &id, &need) == RENDER_OK && id.frame == 1);
+    f.tiles[1].length = saved_length;
     render_stats(f.r, &c);
     CHECK(c.cells == RF_COLS * (RF_ROWS + 1) && c.rows == RF_ROWS + 1 && c.runs == 1);
     CHECK(c.tiles == 1 && c.tile_bytes == RF_TILE && c.region_pixels == 4 &&
@@ -138,13 +235,13 @@ static int delivery(void)
     f.runs[0].row_count = 0;
     CHECK(rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(c.draw.scan_cells == c.cells && c.draw.copied_tile_bytes == RF_TILE);
-    CHECK(c.draw.damage.width == f.binding.client_width && c.draw.damage.height == f.binding.client_height);
-    CHECK(c.draw.samples[0].cell.glyph_index == saved.glyph_index);
-    for (size_t i = 0; i < RF_TILE; ++i) CHECK(c.draw.samples[0].coverage[i] == 10);
-    CHECK(c.draw.samples[1].coverage[RF_W] == 10 && c.draw.samples[1].x_offset == RF_W);
-    CHECK(!c.draw.samples[RF_COLS].coverage && c.draw.samples[RF_COLS].cell.attrs == f.cells[1][0].attrs);
-    CHECK(c.draw.samples[2 * RF_COLS + 2].coverage && c.draw.region_rgb[2] == 0x222222);
+    CHECK(render_test_inspect(f.r).scan_cells == c.cells);
+    CHECK(render_test_inspect(f.r).scene.damage.width == f.binding.client_width && render_test_inspect(f.r).scene.damage.height == f.binding.client_height);
+    CHECK(rf_sample(&f, 0).cell.glyph_index == saved.glyph_index);
+    for (size_t i = 0; i < RF_TILE; ++i) CHECK(rf_sample(&f, 0).coverage[i] == 10);
+    CHECK(rf_sample(&f, 1).coverage[RF_W] == 10 && rf_sample(&f, 1).x_offset == RF_W);
+    CHECK(!rf_sample(&f, RF_COLS).coverage && rf_sample(&f, RF_COLS).cell.attrs == f.cells[1][0].attrs);
+    CHECK(rf_sample(&f, 2 * RF_COLS + 2).coverage && render_test_inspect(f.r).scene.region_rgb[2] == 0x222222);
 
     rf_notify(&f, 0, 11); /* recycled slot joins behind prior obligations */
     rf_wide(&f, 0, f.tiles[0].image);
@@ -153,23 +250,23 @@ static int delivery(void)
     f.offer.run_count = 1;
     f.offer.tile_descriptors = 1;
     f.offer.tile_bytes = RF_TILE;
-    f.stale_on_recheck = true;
+    f.stale_stamp = true;
     CHECK(rf_submit(&f, &id, &need) == RENDER_STALE && id.frame == 1);
     render_stats(f.r, &c);
     CHECK(c.accepted.frame == 1 && c.watermark == 1 && c.queued == 3 &&
-          c.draw.samples[0].coverage[0] == 10 && c.draw.region_rgb[2] == 0x222222);
-    f.stale_on_recheck = false;
+          rf_sample(&f, 0).coverage[0] == 10 && render_test_inspect(f.r).scene.region_rgb[2] == 0x222222);
+    f.stale_stamp = false;
     CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && id.frame == 2);
     CHECK(rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(c.watermark == 2 && c.queued == 2 && c.draw.scan_cells == RF_COLS * (RF_ROWS + 1));
-    CHECK(c.cells == RF_COLS && c.draw.drawn_rows == 3);
-    CHECK(!c.draw.samples[0].coverage && !c.draw.samples[1].coverage); /* ABA: reject resident v1 */
-    CHECK(c.draw.samples[0].cell.attrs == f.cells[0][0].attrs &&
-          c.draw.samples[1].cell.bg == f.cells[0][1].bg && c.draw.samples[1].x_offset == RF_W);
-    CHECK(c.draw.samples[RF_COLS].coverage[0] == 21 &&
-          c.draw.samples[RF_ROWS * RF_COLS].coverage[0] == 21);
-    CHECK(c.draw.region_rgb[2] == 0x222222);
+    CHECK(c.watermark == 2 && c.queued == 2 && render_test_inspect(f.r).scan_cells == RF_COLS * (RF_ROWS + 1));
+    CHECK(c.cells == RF_COLS && render_test_inspect(f.r).drawn_rows == 3);
+    CHECK(!rf_sample(&f, 0).coverage && !rf_sample(&f, 1).coverage); /* ABA: reject resident v1 */
+    CHECK(rf_sample(&f, 0).cell.attrs == f.cells[0][0].attrs &&
+          rf_sample(&f, 1).cell.bg == f.cells[0][1].bg && rf_sample(&f, 1).x_offset == RF_W);
+    CHECK(rf_sample(&f, RF_COLS).coverage[0] == 21 &&
+          rf_sample(&f, RF_ROWS * RF_COLS).coverage[0] == 21);
+    CHECK(render_test_inspect(f.r).scene.region_rgb[2] == 0x222222);
 
     f.states[2] = RENDER_IMAGE_EMPTY;
     render_image_changed(f.r, f.binding.font, f.tiles[2].image.slot);
@@ -182,9 +279,8 @@ static int delivery(void)
     CHECK(rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
     CHECK(c.watermark == 4 && !c.queued && !c.cells && !c.runs && c.tiles == 1);
-    CHECK(c.draw.samples[0].coverage[0] == 11 && c.draw.samples[1].coverage[RF_W] == 11);
-    CHECK(c.draw.scan_cells == RF_COLS * (RF_ROWS + 1) && c.draw.drawn_rows == 1);
-    for (size_t i = 0; i < RF_SLOTS; ++i) CHECK(rf_pump(&f) == (i + 1u == RF_SLOTS ? RENDER_OK : RENDER_MORE));
+    CHECK(rf_sample(&f, 0).coverage[0] == 11 && rf_sample(&f, 1).coverage[RF_W] == 11);
+    CHECK(render_test_inspect(f.r).scan_cells == RF_COLS * (RF_ROWS + 1) && render_test_inspect(f.r).drawn_rows == 1);
     render_stats(f.r, &c);
     CHECK(c.recovery_inspections == RF_SLOTS && !c.queued && !render_pending(f.r, &wake));
 
@@ -192,7 +288,7 @@ static int delivery(void)
     f.offer.region = RENDER_REMOVE;
     CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(!c.draw.scan_cells && !c.draw.drawn_rows && !c.draw.region_rgb && c.draw.damage.width == 2);
+    CHECK(!render_test_inspect(f.r).scan_cells && !render_test_inspect(f.r).drawn_rows && !render_test_inspect(f.r).scene.region_rgb && render_test_inspect(f.r).scene.damage.width == 2);
     CHECK(!f.row_reads && !f.identity_reads && !f.tile_reads && !f.region_reads);
 
     /* Installing new ink damages old-version users even if no row was
@@ -203,66 +299,77 @@ static int delivery(void)
     f.offer.tile_bytes = RF_TILE;
     CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(!c.cells && c.draw.drawn_rows == 1 && c.draw.samples[0].cell.glyph_index == saved.glyph_index + 1u &&
-          !c.draw.samples[0].coverage && !c.draw.samples[1].coverage);
+    CHECK(!c.cells && render_test_inspect(f.r).drawn_rows == 1 && rf_sample(&f, 0).cell.glyph_index == saved.glyph_index + 1u &&
+          !rf_sample(&f, 0).coverage && !rf_sample(&f, 1).coverage);
+    rf_notify(&f, 0, 13);
+    f.tiles[0].rect.width = RF_W;
+    rf_wide(&f, 0, f.tiles[0].image);
+    rf_offer(&f, RENDER_PATCH);
+    f.offer.run_count = 1;
+    f.runs[0] = (render_strip){0, 1};
+    f.offer.tile_descriptors = 1;
+    f.offer.tile_bytes = RF_TILE;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
+    CHECK(rf_sample(&f, 0).coverage && !rf_sample(&f, 1).coverage &&
+          rf_sample(&f, 1).cell.attrs == f.cells[0][1].attrs && rf_sample(&f, 1).x_offset == RF_W);
+    render_frame_id lost = id;
+    CHECK(notice(&f, (render_frame_id){lost.epoch, 0}, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_LOST);
+    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
+    rf_offer(&f, RENDER_FULL);
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && id.epoch != lost.epoch && id.frame == lost.frame + 1u);
+    CHECK(rf_finish(&f) == RENDER_OK && !rf_sample(&f, 0).coverage);
+    rf_offer(&f, RENDER_PATCH);
+    f.offer.tile_descriptors = 1;
+    f.offer.tile_bytes = RF_TILE;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
+    CHECK(rf_sample(&f, 0).coverage && rf_sample(&f, 0).coverage[0] == 13 && !rf_sample(&f, 1).coverage);
     return stop(&f);
 }
 
-/* Proxy exercises WAIT/MORE on the same production FSM and null backing.
- * First-member storage gives the wrapper its own per-service state. */
-typedef struct delayed_driver {
-    render_driver inner;
-    void *state;
-    unsigned opening, binding, consuming, quiescing;
-} delayed_driver;
 
-static render_rc delayed_open(void **out, base_arena *arena, const render_setup *s)
+typedef struct delayed {
+    const render_driver_ops *inner;
+    void *state;
+    bool hold;
+} delayed;
+
+static render_rc delayed_open(void **out, base_arena *arena, const render_setup *s, render_driver_port *port)
 {
-    delayed_driver *d = *out;
-    if (!d) {
-        d = base_arena_alloc(arena, sizeof *d, _Alignof(delayed_driver));
-        if (!d) return RENDER_CAPACITY;
-        *d = (delayed_driver){.inner = render_driver_null()};
-        *out = d;
-    }
-    if (d->opening++ == 0) return RENDER_MORE;
-    if (d->opening == 2) return RENDER_WAIT;
-    return d->inner.ops->open(&d->state, arena, s);
+    delayed *d = *out;
+    if (d) return d->inner->open(&d->state, arena, s, port);
+    d = base_arena_alloc(arena, sizeof *d, _Alignof(delayed));
+    if (!d) return RENDER_CAPACITY;
+    *d = (delayed){.inner = render_driver_null().ops};
+    *out = d;
+    return RENDER_WAIT;
 }
 static render_rc delayed_bind(void *state, const render_binding *b, const render_sheet *s)
 {
-    delayed_driver *d = state;
-    if (d->binding++ == 0) return RENDER_WAIT;
-    if (d->binding == 2) return RENDER_MORE;
-    if (d->binding == 4) return RENDER_UNSUPPORTED;
-    return d->inner.ops->bind(d->state, b, s);
+    delayed *d = state;
+    return d->inner->bind(d->state, b, s);
 }
 static render_rc delayed_consume(void *state, const render_packet *p)
 {
-    delayed_driver *d = state;
-    if (d->consuming++ == 0) return RENDER_WAIT;
-    if (d->consuming == 2) return RENDER_MORE;
-    return d->inner.ops->consume(d->state, p);
+    delayed *d = state;
+    return d->inner->consume(d->state, p);
 }
 static render_rc delayed_poll(void *state, render_notice *n)
 {
-    delayed_driver *d = state;
-    return d->inner.ops->poll(d->state, n);
+    delayed *d = state;
+    return d->inner->poll(d->state, n);
 }
-static render_rc delayed_quiesce(void *state)
+static render_rc delayed_quiesce(void *state, render_quiescence mode)
 {
-    delayed_driver *d = state;
-    if (d->quiescing++ % 2u == 0) return RENDER_WAIT;
-    d->consuming = 0;
-    return d->state ? d->inner.ops->quiesce(d->state) : RENDER_OK;
+    delayed *d = state;
+    return d->hold ? RENDER_WAIT : d->inner->quiesce(d->state, mode);
 }
 static void delayed_close(void *state)
 {
-    delayed_driver *d = state;
-    if (d->state) d->inner.ops->close(d->state);
+    delayed *d = state;
+    if (d->state) d->inner->close(d->state);
 }
 
-static int restart(void)
+static int physical_retirement(void)
 {
     render_fixture f;
     rf_init(&f);
@@ -275,87 +382,46 @@ static int restart(void)
     ops.close = delayed_close;
     f.setup.driver = (render_driver){&ops};
     CHECK(base_arena_init(&f.arena, (RF_ROWS + 1u) * os_page_size()) == 0);
-    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_MORE);
+    f.setup.wake = NULL;
+    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_INVALID && !f.r);
+    CHECK(os_wake_init(&f.wake) == OS_OK);
+    f.setup.wake = &f.wake;
+    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_WAIT);
     render_wake wake;
-    CHECK(render_pending(f.r, &wake) && wake.runnable);
-    CHECK(rf_pump(&f) == RENDER_WAIT && render_pending(f.r, &wake) && wake.waiting);
-    CHECK(rf_pump(&f) == RENDER_OK);
-    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_WAIT);
-    CHECK(render_pending(f.r, &wake) && wake.waiting);
-    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_MORE);
-    CHECK(render_pending(f.r, &wake) && wake.runnable);
+    CHECK(render_pending(f.r, &wake) && wake.waiting && wake.wake == &f.wake);
+    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_OK);
     CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
-    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_UNSUPPORTED);
+    delayed *d = render_test_owner_get(f.r).state;
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    d->hold = true;
+    CHECK(rf_finish(&f) == RENDER_OK);
     render_counters c;
     render_stats(f.r, &c);
-    CHECK(c.state == RENDER_IDLE_FULL);
-
-    rf_notify(&f, 0, 31);
-    rf_notify(&f, 1, 32);
-    rf_wide(&f, 0, f.tiles[0].image);
-    rf_wide(&f, RF_ROWS, f.tiles[1].image);
-    rf_offer(&f, RENDER_FULL);
-    f.offer.tile_descriptors = 1;
-    f.offer.tile_bytes = RF_TILE;
-    render_frame_id lost;
-    CHECK(rf_submit(&f, &lost, NULL) == RENDER_OK);
-    CHECK(rf_pump(&f) == RENDER_WAIT && rf_pump(&f) == RENDER_MORE);
-    CHECK(rf_pump(&f) == RENDER_MORE);
-    CHECK(notice(&f, lost, RENDER_NOTICE_PRESENTED, RENDER_SYNTHETIC, 1) == RENDER_OK);
-    CHECK(notice(&f, lost, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_LOST);
-    CHECK(rf_pump(&f) == RENDER_WAIT && render_pending(f.r, &wake) && wake.waiting);
-    CHECK(rf_submit(&f, &lost, NULL) == RENDER_LOST);
-    render_stats(f.r, &c);
-    CHECK(c.state == RENDER_QUIESCING && !c.t4 && !c.t5 && !c.t6 && c.watermark == 1);
-    CHECK(rf_pump(&f) == RENDER_OK);
-    render_stats(f.r, &c);
-    CHECK(c.state == RENDER_UNBOUND && !c.watermark && !c.queued);
-    CHECK(notice(&f, lost, RENDER_NOTICE_RELEASED, RENDER_UNTIMED, 0) == RENDER_STALE);
-
-    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
-    CHECK(rf_pump(&f) == RENDER_MORE);
-    render_stats(f.r, &c);
-    CHECK(c.recovery_inspections == 1 && c.queued == 1);
-    render_image_changed(f.r, f.binding.font, f.tiles[0].image.slot);
-    CHECK(rf_pump(&f) == RENDER_MORE && rf_pump(&f) == RENDER_OK);
-    render_stats(f.r, &c);
-    CHECK(c.recovery_inspections == RF_SLOTS && c.queued == 2);
-    rf_offer(&f, RENDER_FULL);
-    f.offer.tile_descriptors = 1;
-    f.offer.tile_bytes = RF_TILE;
-    render_frame_id replay;
-    CHECK(rf_submit(&f, &replay, NULL) == RENDER_OK && replay.epoch != lost.epoch && replay.frame == 1);
-    CHECK(notice(&f, lost, RENDER_NOTICE_DEVICE_DONE, RENDER_SYNTHETIC, 1) == RENDER_STALE);
-    CHECK(rf_pump(&f) == RENDER_WAIT && rf_pump(&f) == RENDER_MORE && rf_finish(&f) == RENDER_OK);
-    render_stats(f.r, &c);
-    CHECK(c.draw.samples[0].coverage[0] == 31 && !c.draw.samples[RF_ROWS * RF_COLS].coverage);
-
+    CHECK(c.state == RENDER_RETIRING && c.t5 && c.t6);
+    CHECK(render_pending(f.r, &wake) && wake.waiting && wake.wake == &f.wake);
     rf_offer(&f, RENDER_PATCH);
-    f.offer.tile_descriptors = 1;
-    f.offer.tile_bytes = RF_TILE;
-    CHECK(rf_submit(&f, &replay, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
-    render_stats(f.r, &c);
-    CHECK(c.draw.samples[RF_ROWS * RF_COLS].coverage[0] == 32 && !c.queued &&
-          c.draw.damage.y == (RF_ROWS - 1) * RF_H - 1 && c.draw.damage.height == 1);
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_WAIT && f.stamp_reads == 0);
+    d->hold = false;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
 
-    rf_offer(&f, RENDER_PATCH);
-    CHECK(rf_submit(&f, &replay, NULL) == RENDER_OK && rf_pump(&f) == RENDER_MORE && rf_pump(&f) == RENDER_MORE);
-    CHECK(notice(&f, replay, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_LOST);
+    d->hold = true;
+    CHECK(notice(&f, id, RENDER_NOTICE_PRESENTED, RENDER_SYNTHETIC, 1) == RENDER_OK);
+    CHECK(notice(&f, id, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) == RENDER_LOST);
     render_stats(f.r, &c);
-    CHECK(c.t4 && !c.t5 && !c.t6);
-    CHECK(rf_pump(&f) == RENDER_WAIT && rf_pump(&f) == RENDER_OK);
+    CHECK(c.state == RENDER_QUIESCING && !c.t4 && !c.t5 && !c.t6);
+    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_WAIT);
+    CHECK(notice(&f, id, RENDER_NOTICE_DEVICE_DONE, RENDER_SYNTHETIC, 1) == RENDER_STALE);
+    d->hold = false;
     CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
-    rf_offer(&f, RENDER_FULL);
-    CHECK(rf_submit(&f, &replay, NULL) == RENDER_OK);
-    CHECK(rf_pump(&f) == RENDER_WAIT && rf_pump(&f) == RENDER_MORE && rf_pump(&f) == RENDER_MORE);
+
+    d->hold = true;
     CHECK(render_close(f.r) == RENDER_WAIT && render_pending(f.r, &wake) && wake.waiting);
     CHECK(base_arena_mark(&f.arena) != 0);
-    CHECK(notice(&f, replay, RENDER_NOTICE_RELEASED, RENDER_UNTIMED, 0) == RENDER_STALE);
-    render_stats(f.r, &c);
-    CHECK(c.state == RENDER_CLOSING && !c.t4 && !c.t5 && !c.t6);
+    d->hold = false;
     return stop(&f);
 }
-
 static int bounds(void)
 {
     render_fixture f;
@@ -381,7 +447,7 @@ static int bounds(void)
     b = f.binding;
     b.client_width = 0;
     CHECK(render_bind(f.r, &b, &f.sheet, &need) == RENDER_WAIT);
-    CHECK(render_submit(f.r, NULL, NULL, NULL, NULL) == RENDER_BUSY);
+    CHECK(render_submit(f.r, NULL, NULL, NULL, NULL) == RENDER_WAIT);
     CHECK(render_bind(f.r, &f.binding, &f.sheet, &need) == RENDER_OK);
     l.cells--;
     CHECK(render_measure(&f.binding, &l, &caps, &need) == RENDER_CAPACITY && need.field == RENDER_FIELD_CELLS);
@@ -414,7 +480,7 @@ static int bounds(void)
     f.cells[0][0].bg = RENDER_RGB_MASK + 1u;
     CHECK(rf_submit(&f, &id, &need) == RENDER_INVALID && need.field == RENDER_FIELD_CELL);
     f.cells[0][0] = rf_blank();
-    f.cells[0][0].atlas_slot = RF_FIRST;
+    f.cells[0][0].atlas_slot = RF_FIRST + RF_SLOTS;
     f.cells[0][0].glyph_index = 3;
     CHECK(rf_submit(&f, &id, &need) == RENDER_INVALID && need.field == RENDER_FIELD_CELL);
     f.cells[0][0] = rf_blank();
@@ -446,36 +512,68 @@ static int bounds(void)
     f.runs[1] = (render_strip){1, 1};
     CHECK(rf_submit(&f, &id, &need) == RENDER_INVALID && need.field == RENDER_FIELD_RUNS && !f.row_reads);
     f.runs[1].first_row = 2;
-    CHECK(rf_submit(&f, &id, &need) == RENDER_OK && id.frame == 2 && rf_finish(&f) == RENDER_OK);
+    f.cells[0][0].bg = 0x0a0a0a;
+    f.cells[2][0].bg = 0x0b0b0b;
+    f.cells[RF_ROWS][0].bg = 0x0c0c0c;
+    f.overscan_count = 1;
+    f.offer.overscan_dirty = true;
+    CHECK(rf_submit(&f, &id, &need) == RENDER_OK && id.frame == 2);
+    render_test_owner owner = render_test_owner_get(f.r);
+    const render_packet *p = rf_take(owner);
+    CHECK(p && !p->sheet && p->overscan_count == 1 && p->cells[0].bg == 0x0a0a0a &&
+          p->cells[RF_COLS].bg == 0x0b0b0b && p->cells[2 * RF_COLS].bg == 0x0c0c0c);
+    CHECK(rf_dispatch(owner, p) == RENDER_OK && finish_notices(&f, owner) == RENDER_OK);
     render_counters c;
     render_stats(f.r, &c);
-    CHECK(c.cells == 2 * RF_COLS && c.runs == 2 && !c.draw.scan_cells && !c.tile_inspections &&
-          f.row_reads == 2 && f.identity_reads == 0);
+    CHECK(c.cells == 2 * RF_COLS + 1 && c.runs == 2 && !render_test_inspect(f.r).scan_cells && !c.tile_inspections &&
+          f.row_reads == 3 && f.identity_reads == 0);
 
     rf_offer(&f, RENDER_PATCH);
     f.offer.overscan_dirty = true;
     f.overscan_count = 1;
     CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(c.cells == 1 && !c.draw.scan_cells && c.draw.drawn_rows == 1);
+    CHECK(c.cells == 1 && !render_test_inspect(f.r).scan_cells && render_test_inspect(f.r).drawn_rows == 1);
     rf_offer(&f, RENDER_PATCH);
     f.offer.background = 0x123456;
     CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish(&f) == RENDER_OK);
     render_stats(f.r, &c);
-    CHECK(!c.cells && c.draw.samples[RF_ROWS * RF_COLS + 1].cell.bg == 0x123456 &&
-          !c.draw.scan_cells);
+    CHECK(!c.cells && rf_sample(&f, RF_ROWS * RF_COLS + 1).cell.bg == 0x123456 &&
+          !render_test_inspect(f.r).scan_cells);
     CHECK(stop(&f) == 0);
 
     /* A borrowed reservation smaller than the allocations must roll back. */
+    f.r = NULL;
+    CHECK(os_wake_init(&f.wake) == OS_OK);
     CHECK(base_arena_init(&f.arena, os_page_size()) == 0);
     CHECK(base_arena_alloc(&f.arena, os_page_size() - 1u, 1) != NULL);
     size_t mark = base_arena_mark(&f.arena);
     CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_CAPACITY && base_arena_mark(&f.arena) == mark);
     base_arena_free(&f.arena);
+    os_wake_close(&f.wake);
     return 0;
+}
+
+static int verify_identity_policy(void)
+{
+    render_fixture f;
+    CHECK(start(&f) == 0);
+    rf_notify(&f, 0, 13);
+    rf_wide(&f, 0, f.tiles[0].image);
+    ++f.cells[0][0].glyph_index;
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id = {0};
+#ifdef RENDER_ASSERT_IDENTITIES
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_INVALID && !id.frame && f.identity_reads == 1);
+#else
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && id.frame == 1 && !f.identity_reads);
+    CHECK(rf_finish(&f) == RENDER_OK && !rf_sample(&f, 0).coverage);
+#endif
+    return stop(&f);
 }
 
 int main(void)
 {
-    return lifecycle() || delivery() || restart() || bounds();
+    return lifecycle() || staged_binding() || delivery() || physical_retirement() || bounds() ||
+        verify_identity_policy();
 }

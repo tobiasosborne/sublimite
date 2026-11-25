@@ -2,16 +2,17 @@
 #define RENDER_FIXTURE_H
 
 #include <string.h>
-#include "render/render.h"
+#include "render/render_test.h"
 
 /* Three columns accommodate a wide pair plus an independent cell.
  * Three visible rows allow two disjoint runs. The extra row exercises Q8. */
-enum { RF_COLS = 3, RF_ROWS = 3, RF_W = 2, RF_H = 2, RF_SLOTS = 3, RF_FIRST = 10,
-       RF_SHEET = 2, RF_TILE = RENDER_TILE_MAX_SPAN * RF_W * RF_H,
+enum { RF_COLS = 3, RF_ROWS = 3, RF_W = 2, RF_H = 2, RF_SLOTS = 3, RF_SHEET = RENDER_ASCII_COUNT + RENDER_TILE_MAX_SPAN,
+       RF_FIRST = RF_SHEET + 1, RF_TILE = RENDER_TILE_MAX_SPAN * RF_W * RF_H,
        RF_PAGE_STRIDE = 6, RF_PAGE_ROWS = 3 };
 
 typedef struct render_fixture {
     base_arena arena;
+    os_wake wake;
     render *r;
     render_binding binding;
     render_setup setup;
@@ -27,14 +28,15 @@ typedef struct render_fixture {
     render_region_view region;
     size_t overscan_count;
     size_t stamp_reads, run_reads, row_reads, region_reads, identity_reads, tile_reads, directory_reads;
-    bool stale_on_recheck;
+    bool stale_stamp;
 } render_fixture;
 
 static inline render_stamp rf_current(void *ctx)
 {
     render_fixture *f = ctx;
     render_stamp s = f->offer.stamp;
-    if (++f->stamp_reads == 2 && f->stale_on_recheck) ++s.paint;
+    ++f->stamp_reads;
+    if (f->stale_stamp) ++s.paint;
     return s;
 }
 static inline render_rc rf_run(void *ctx, size_t index, render_strip *out)
@@ -62,6 +64,10 @@ static inline render_rc rf_region(void *ctx, render_region_view *out)
 }
 static inline render_image_state rf_lookup(render_fixture *f, uint32_t slot, render_image_id *out)
 {
+    if (render_has_slot(f->binding.sheet, slot)) {
+        *out = f->sheet_tiles[slot - f->binding.sheet.first].image;
+        return RENDER_IMAGE_INK;
+    }
     if (slot < RF_FIRST || slot >= RF_FIRST + RF_SLOTS) return RENDER_IMAGE_VACANT;
     size_t i = slot - RF_FIRST;
     *out = f->tiles[i].image;
@@ -126,7 +132,7 @@ static inline void rf_init(render_fixture *f)
         .sheet = {1, RF_SHEET}, .runtime = {RF_FIRST, RF_SLOTS}, .overscan = 1
     };
     f->setup = (render_setup){
-        .driver = render_driver_null(), .directory_ctx = f, .directory = rf_directory,
+        .driver = render_driver_null(), .wake = &f->wake, .directory_ctx = f, .directory = rf_directory,
         .recovery_slots = 1, /* deliberate one-slot replay steps */
         .limits = {.client_width = f->binding.client_width, .client_height = f->binding.client_height,
             .cols = RF_COLS, .rows = RF_ROWS, .cell_width = RF_W, .cell_height = RF_H,
@@ -143,13 +149,14 @@ static inline void rf_init(render_fixture *f)
             .page_height = RF_PAGE_ROWS, .span = RENDER_TILE_MAX_SPAN,
             .rect = {1, 1, RENDER_TILE_MAX_SPAN * RF_W, RF_H}};
     }
-    f->sheet = (render_sheet){.tiles = f->sheet_tiles, .count = RF_SHEET};
+    f->sheet = (render_sheet){.tiles = f->sheet_tiles, .count = RF_SHEET, .ascii_count = RENDER_ASCII_COUNT};
     for (uint32_t i = 0; i < RF_SHEET; ++i) {
-        f->sheet_tiles[i] = f->tiles[i];
-        f->sheet_tiles[i].image = (render_image_id){f->binding.sheet.first + i, 1};
-        f->sheet_tiles[i].span = i + 1u;
-        f->sheet_tiles[i].rect.width = RF_W * (i + 1u);
-        f->sheet.marker[i] = f->sheet_tiles[i].image;
+        render_tile_view v = f->tiles[0];
+        v.image = (render_image_id){f->binding.sheet.first + i, 1};
+        v.span = i < RENDER_ASCII_COUNT ? 1u : i - RENDER_ASCII_COUNT + 1u;
+        v.rect.width = RF_W * v.span;
+        f->sheet_tiles[i] = v;
+        if (i >= RENDER_ASCII_COUNT) f->sheet.marker[v.span - 1u] = v.image;
     }
     f->region = (render_region_view){.rect = {1, 1, 2, 2}, .pixels = f->rgb,
         .stride = 3, .capacity = sizeof f->rgb / sizeof f->rgb[0], .mode = RENDER_REPLACE};
@@ -174,16 +181,36 @@ static inline void rf_offer(render_fixture *f, render_mode mode)
     f->runs[0] = (render_strip){0, RF_ROWS};
     f->stamp_reads = f->run_reads = f->row_reads = f->region_reads = f->identity_reads = f->tile_reads = 0;
 }
-static inline render_rc rf_pump(render_fixture *f)
+static inline const render_packet *rf_take(render_test_owner owner)
 {
-    return render_event(f->r, &(render_notice){.kind = RENDER_PUMP});
+    os_wake_drain(owner.port->wake);
+    return render_driver_take(owner.port);
+}
+static inline render_rc rf_dispatch(render_test_owner owner, const render_packet *packet)
+{
+    if (!packet) return RENDER_WAIT;
+    if (packet->sheet) {
+        render_rc rc = owner.driver.ops->bind(owner.state, &packet->binding, packet->sheet);
+        if (rc != RENDER_OK) return rc;
+    }
+    return owner.driver.ops->consume(owner.state, packet);
 }
 static inline render_rc rf_finish(render_fixture *f)
 {
-    /* Null has one consume and four typed notices to retire each frame. */
-    render_rc rc = RENDER_MORE;
-    for (unsigned i = 0; i < 1u + 4u && rc == RENDER_MORE; ++i) rc = rf_pump(f);
-    return rc;
+    render_test_owner owner = render_test_owner_get(f->r);
+    render_rc rc = rf_dispatch(owner, rf_take(owner));
+    if (rc != RENDER_OK) return rc;
+    render_notice n;
+    while ((rc = owner.driver.ops->poll(owner.state, &n)) == RENDER_OK) {
+        rc = render_event(f->r, &n);
+        if (rc != RENDER_OK && rc != RENDER_STALE) return rc;
+    }
+    return rc == RENDER_WAIT ? RENDER_OK : rc;
+}
+static inline render_sample rf_sample(render_fixture *f, size_t index)
+{
+    render_test_owner owner = render_test_owner_get(f->r);
+    return render_test_sample(render_test_inspect(f->r), render_test_atlas(owner.state), index);
 }
 static inline render_rc rf_submit(render_fixture *f, render_frame_id *id, render_need *need)
 {

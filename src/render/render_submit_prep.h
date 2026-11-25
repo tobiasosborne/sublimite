@@ -18,16 +18,11 @@ static bool render_same_stamp(render_stamp a, render_stamp b)
         a.input_last == b.input_last;
 }
 
-static bool render_stamp_current(const render *r, const render_offer *o, const render_source *src)
+static bool render_matches(const render_bank *bank, render_stamp s)
 {
-    const render_binding *b = &r->binding;
-    render_stamp s = o->stamp;
-    return s.surface == b->surface && s.geometry == b->geometry &&
-        render_same_generation(s.font, b->font) && render_same_frame(s.base, r->stats.accepted) &&
-        s.buffer && s.layout_owner && s.layout_serial && s.paint &&
-        s.composition > r->stats.stamp.composition &&
-        (!!s.input_first == !!s.input_last) && s.input_first <= s.input_last &&
-        render_same_stamp(s, src->current(src->ctx));
+    const render_binding *b = &bank->binding;
+    return bank->epoch && s.surface == b->surface && s.geometry == b->geometry &&
+        render_same_generation(s.font, b->font);
 }
 
 static bool render_scroll_valid(const render_binding *b, render_scroll s)
@@ -49,45 +44,44 @@ static bool render_scroll_valid(const render_binding *b, render_scroll s)
 
 static bool render_scroll_changed(render_scroll a, render_scroll b)
 {
-    return !render_same_rect(a.clip, b.clip) || a.first_source_row != b.first_source_row ||
+    return a.clip.x != b.clip.x || a.clip.y != b.clip.y || a.clip.width != b.clip.width ||
+        a.clip.height != b.clip.height || a.first_source_row != b.first_source_row ||
         a.source_rows != b.source_rows || a.overscan_row != b.overscan_row ||
         a.origin_y_q8 != b.origin_y_q8;
 }
 
-static bool render_cell_image(const render *r, const render_source *src, render_cell c)
+static bool render_copy_cells(const render_binding *b, const render_source *src,
+                              render_cell_span span, render_cell *dst)
 {
-    uint32_t slot = c.atlas_slot;
-    if (slot == RENDER_NO_SLOT) return c.glyph_index == 0;
-    if (!c.glyph_index || (c.attrs & RENDER_ATTR_WIDE_RIGHT)) return false;
-    if (render_has_slot(r->binding.sheet, slot))
-        return r->sheet_versions[slot - r->binding.sheet.first] == c.glyph_index;
-    render_image_id current = {0};
-    return render_has_slot(r->binding.runtime, slot) &&
-        src->get_identity(src->ctx, slot, &current) == RENDER_IMAGE_INK &&
-        current.slot == slot && current.version == c.glyph_index;
-}
-
-static bool render_copy_cells(const render *r, const render_source *src, render_cell_span span,
-                              render_cell *dst)
-{
-    render_cell left = {0};
+    (void)src;
     for (size_t i = 0; i < span.count; ++i) {
         render_cell c = span.cells[i];
-        uint16_t width = c.attrs & RENDER_ATTR_WIDTH;
-        if ((c.fg | c.bg) > RENDER_RGB_MASK || c.reserved || (c.attrs & ~RENDER_ATTR_MASK) ||
-            width == RENDER_ATTR_WIDTH || !render_cell_image(r, src, c))
+        uint32_t slot = c.atlas_slot;
+        if ((c.fg | c.bg) > RENDER_RGB_MASK || c.reserved ||
+            (c.attrs & (~RENDER_ATTR_MASK | RENDER_ATTR_WIDE_RIGHT)))
             return false;
-        if (left.attrs & RENDER_ATTR_WIDE_LEFT) {
-            if (c.attrs != ((left.attrs & ~RENDER_ATTR_WIDTH) | RENDER_ATTR_WIDE_RIGHT) ||
-                c.fg != left.fg || c.bg != left.bg)
+        if (slot == RENDER_NO_SLOT) {
+            if (c.glyph_index) return false;
+        } else {
+            if (!c.glyph_index || (!render_has_slot(b->sheet, slot) && !render_has_slot(b->runtime, slot)))
                 return false;
-        } else if (width == RENDER_ATTR_WIDE_RIGHT) {
-            return false;
+#ifdef RENDER_ASSERT_IDENTITIES
+            render_image_id id = {0};
+            if (src->get_identity(src->ctx, slot, &id) != RENDER_IMAGE_INK ||
+                id.slot != slot || id.version != c.glyph_index)
+                return false;
+#endif
         }
         dst[i] = c;
-        left = c;
+        if (!(c.attrs & RENDER_ATTR_WIDE_LEFT)) continue;
+        if (++i == span.count) return false;
+        render_cell right = span.cells[i];
+        if (right.attrs != ((c.attrs & ~RENDER_ATTR_WIDTH) | RENDER_ATTR_WIDE_RIGHT) ||
+            right.fg != c.fg || right.bg != c.bg || right.reserved ||
+            right.atlas_slot != RENDER_NO_SLOT || right.glyph_index) return false;
+        dst[i] = right;
     }
-    return !(left.attrs & RENDER_ATTR_WIDE_LEFT);
+    return true;
 }
 
 static render_rc render_copy_row(render *r, const render_source *src, uint32_t row,
@@ -96,10 +90,10 @@ static render_rc render_copy_row(render *r, const render_source *src, uint32_t r
     render_cell_span span = {0};
     render_rc rc = src->get_row(src->ctx, row, &span);
     if (rc != RENDER_OK) return render_reason(need, RENDER_FIELD_CELL, rc, row, 0);
-    bool overscan = row == r->binding.rows;
-    const size_t cols = r->binding.cols;
+    bool overscan = row == r->packet.binding.rows;
+    const size_t cols = r->packet.binding.cols;
     if ((span.count && !span.cells) || span.count > cols || (!overscan && span.count != cols) ||
-        !render_copy_cells(r, src, span, r->buffers.cells + stage->cells))
+        !render_copy_cells(&r->packet.binding, src, span, RENDER_WRITE(render_cell, r->packet.cells) + stage->cells))
         return render_reason(need, RENDER_FIELD_CELL, RENDER_INVALID, row, 0);
     stage->cells += span.count;
     if (overscan) r->packet.overscan_count = span.count;
@@ -111,12 +105,13 @@ static render_rc render_copy_region(render *r, const render_offer *o, const rend
                                     render_stage *stage, render_need *need)
 {
     render_packet *p = &r->packet;
-    p->region = o->region == RENDER_KEEP ? r->region : (render_rect){0};
+    render_rect prior = o->mode == RENDER_FULL ? (render_rect){0} : r->region;
+    p->region = o->region == RENDER_KEEP ? prior : (render_rect){0};
     switch (o->region) {
     case RENDER_KEEP:
         return RENDER_OK;
     case RENDER_REMOVE:
-        p->damage = render_damage_union(p->damage, r->region);
+        p->damage = render_damage_union(p->damage, prior);
         return RENDER_OK;
     case RENDER_REPLACE:
         break;
@@ -128,8 +123,8 @@ static render_rc render_copy_region(render *r, const render_offer *o, const rend
     const render_limits *l = &r->setup.limits;
     size_t last;
     if (v.mode != RENDER_REPLACE || !v.pixels || !rect.width || !rect.height ||
-        !render_inside(rect, r->binding.client_width, r->binding.client_height) ||
-        v.stride < rect.width || !render_product(rect.height - 1u, v.stride, &last) ||
+        !render_inside(rect, p->binding.client_width, p->binding.client_height) ||
+        v.stride < rect.width || __builtin_mul_overflow((size_t)(rect.height - 1u), v.stride, &last) ||
         last > v.capacity || rect.width > v.capacity - last ||
         (last + rect.width) > SIZE_MAX / sizeof(uint32_t))
         return render_reason(need, RENDER_FIELD_REGION, RENDER_INVALID, 0, 0);
@@ -142,7 +137,7 @@ static render_rc render_copy_region(render *r, const render_offer *o, const rend
         return render_reason(need, RENDER_FIELD_REGION_PIXELS, RENDER_CAPACITY, pixels, l->region_pixels);
     for (uint32_t y = 0; y < rect.height; ++y) {
         const uint32_t *row = v.pixels + y * v.stride;
-        uint32_t *dst = r->buffers.region_rgb + (size_t)y * rect.width;
+        uint32_t *dst = RENDER_WRITE(uint32_t, p->region_rgb) + (size_t)y * rect.width;
         for (uint32_t x = 0; x < rect.width; ++x) {
             if (row[x] > RENDER_RGB_MASK)
                 return render_reason(need, RENDER_FIELD_REGION, RENDER_INVALID, 0, 0);
@@ -151,33 +146,33 @@ static render_rc render_copy_region(render *r, const render_offer *o, const rend
     }
     stage->region_pixels = pixels;
     p->region = rect;
-    p->damage = render_damage_union(render_damage_union(p->damage, r->region), rect);
+    p->damage = render_damage_union(render_damage_union(p->damage, prior), rect);
     return RENDER_OK;
 }
 
-static render_rc render_copy_tiles(render *r, const render_offer *o, const render_source *src,
-                                   render_stage *stage, render_need *need)
+static render_rc render_copy_tiles(render_packet *p, const render_bank *bank,
+                                   const render_source *src, render_stage *stage, render_need *need)
 {
-    render_packet *p = &r->packet;
-    const render_slot_range runtime = r->binding.runtime;
-    for (uint32_t i = r->delivery.head; i != RENDER_LIST_END &&
-         stage->tiles < o->tile_descriptors && stage->bytes < o->tile_bytes;
-         i = r->delivery.nodes[i].next) {
-        const render_node *node = &r->delivery.nodes[i];
-        render_image_id id = {runtime.first + i, node->version}, current = {0};
+    const render_offer *o = &p->offer;
+    for (uint32_t i = bank->head; i != RENDER_LIST_END &&
+         stage->tiles < o->tile_descriptors && stage->bytes < o->tile_bytes; i = bank->nodes[i].next) {
+        render_image_id id = {bank->binding.runtime.first + i, bank->nodes[i].version}, current = {0};
         ++stage->inspections;
-        if (src->get_identity(src->ctx, id.slot, &current) != RENDER_IMAGE_INK ||
-            current.slot != id.slot || current.version != id.version)
-            return render_reason(need, RENDER_FIELD_TILE, RENDER_STALE, id.slot, 0);
         render_tile_view view = {0};
         size_t length;
         render_rc rc = src->get_tile(src->ctx, id, &view);
         if (rc != RENDER_OK) return render_reason(need, RENDER_FIELD_TILE, rc, id.slot, 0);
-        if (!render_tile_size(&r->binding, &view, id, &length))
+        if (!render_tile_extent(&p->binding, &view, &length))
             return render_reason(need, RENDER_FIELD_TILE, RENDER_INVALID, id.slot, 0);
         if (length > o->tile_bytes - stage->bytes) break;
-        r->buffers.deltas[stage->tiles++] = (render_delta){id, view.rect.width, view.rect.height, stage->bytes};
-        render_copy_tile(r->buffers.r8 + stage->bytes, &view);
+        if (src->get_identity(src->ctx, id.slot, &current) != RENDER_IMAGE_INK ||
+            current.slot != id.slot || current.version != id.version)
+            return render_reason(need, RENDER_FIELD_TILE, RENDER_STALE, id.slot, 0);
+        if (!render_tile_page(&view, id))
+            return render_reason(need, RENDER_FIELD_TILE, RENDER_INVALID, id.slot, 0);
+        RENDER_WRITE(render_delta, p->deltas)[stage->tiles++] =
+            (render_delta){id, view.rect.width, view.rect.height, stage->bytes};
+        render_copy_tile(RENDER_WRITE(uint8_t, p->r8) + stage->bytes, &view);
         stage->bytes += length;
         stage->endpoint = i;
     }
@@ -185,15 +180,19 @@ static render_rc render_copy_tiles(render *r, const render_offer *o, const rende
     return RENDER_OK;
 }
 
-static render_rc render_prepare(render *r, const render_offer *o, const render_source *src,
+static render_rc render_prepare(render *r, const render_bank *bank, const render_offer *o, const render_source *src,
                                 render_stage *stage, render_need *need)
 {
-    const render_binding *b = &r->binding;
+    const render_binding *b = &bank->binding;
     const render_limits *l = &r->setup.limits;
     render_packet *p = &r->packet;
     bool full = o->mode == RENDER_FULL;
-    if (!render_stamp_current(r, o, src) ||
-        (!full && (r->stats.state == RENDER_IDLE_FULL || o->stamp.buffer != r->stats.stamp.buffer)))
+    render_stamp s = o->stamp;
+    if (!render_matches(bank, s) || !render_same_frame(s.base, r->stats.accepted) ||
+        !s.buffer || !s.layout_owner || !s.layout_serial || !s.paint ||
+        s.composition <= r->stats.stamp.composition || (!!s.input_first != !!s.input_last) ||
+        s.input_first > s.input_last || !render_same_stamp(s, src->current(src->ctx)) ||
+        (!full && (bank != &r->active || s.buffer != r->stats.stamp.buffer)))
         return render_reason(need, RENDER_FIELD_STAMP, RENDER_STALE, 0, 0);
     if ((!full && o->mode != RENDER_PATCH) || o->rows != b->rows || o->cols != b->cols ||
         o->background > RENDER_RGB_MASK || !render_scroll_valid(b, o->scroll) ||
@@ -222,16 +221,17 @@ static render_rc render_prepare(render *r, const render_offer *o, const render_s
         if (!run.row_count || run.first_row >= b->rows || run.row_count > b->rows - run.first_row ||
             (i && run.first_row <= end) || (full && (run.first_row || run.row_count != b->rows)))
             return render_reason(need, RENDER_FIELD_RUNS, RENDER_INVALID, i, 0);
-        r->buffers.runs[i] = run;
+        RENDER_WRITE(render_strip, p->runs)[i] = run;
         end = run.first_row + run.row_count;
     }
 
     p->offer = *o;
+    p->binding = *b;
     p->overscan_count = 0;
     p->damage = o->layer_damage;
     if (full || o->background != r->background)
         p->damage = (render_rect){0, 0, b->client_width, b->client_height};
-    if (render_scroll_changed(o->scroll, r->scroll))
+    if (!full && render_scroll_changed(o->scroll, r->scroll))
         p->damage = render_damage_union(render_damage_union(p->damage, o->scroll.clip), r->scroll.clip);
     stage->runs = o->run_count;
     for (size_t i = 0; i < stage->runs; ++i) {
@@ -247,6 +247,6 @@ static render_rc render_prepare(render *r, const render_offer *o, const render_s
     }
     render_rc rc = render_copy_region(r, o, src, stage, need);
     if (rc != RENDER_OK) return rc;
-    return render_copy_tiles(r, o, src, stage, need);
+    return render_copy_tiles(p, bank, src, stage, need);
 }
 #endif

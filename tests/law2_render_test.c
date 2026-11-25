@@ -6,6 +6,7 @@ int main(void)
     render_fixture f;
     rf_init(&f);
     ASSERT(base_arena_init(&f.arena, (RF_ROWS + 1u) * os_page_size()) == 0);
+    ASSERT(os_wake_init(&f.wake) == OS_OK);
     ASSERT(render_open(&f.arena, &f.setup, &f.r) == RENDER_OK);
     ASSERT(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
     ASSERT(base_malloc_guard_active());
@@ -33,6 +34,7 @@ int main(void)
     ASSERT(rf_finish(&f) == RENDER_OK);
 
     ASSERT(render_close(f.r) == RENDER_OK);
+    os_wake_close(&f.wake);
     base_arena_free(&f.arena);
     puts("render Law 2: live guard, zero allocations for full tile/region and resident row submits");
     return 0;

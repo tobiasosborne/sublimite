@@ -5,6 +5,7 @@ typedef struct render_model {
     uint8_t coverage[RF_SLOTS], source[RF_SLOTS];
     uint32_t fifo[RF_SLOTS];
     size_t count;
+    uint32_t cursor;
     render_image_id scene[RF_ROWS + 1];
 } render_model;
 
@@ -39,10 +40,10 @@ static void model_frame(render_fixture *f, render_model *m, uint8_t arg)
     }
     if (full)
         for (uint32_t i = 0; i <= RF_ROWS; ++i) rf_wide(f, i, proposed);
-    f->stale_on_recheck = (arg & 0x80u) != 0;
+    f->stale_stamp = (arg & 0x80u) != 0;
     render_frame_id id = {0};
     render_rc rc = rf_submit(f, &id, NULL);
-    if (f->stale_on_recheck) {
+    if (f->stale_stamp) {
         render_stats(f->r, &after);
         ASSERT(rc == RENDER_STALE && !id.frame && before.accepted.frame == after.accepted.frame);
         ASSERT(before.watermark == after.watermark && before.queued == after.queued);
@@ -60,6 +61,12 @@ static void model_frame(render_fixture *f, render_model *m, uint8_t arg)
     }
     m->count -= sent;
     memmove(m->fifo, m->fifo + sent, m->count * sizeof *m->fifo);
+    /* Accepted input-free offers replay exactly the fixture's one-slot grant. */
+    if (m->cursor < RF_SLOTS) {
+        uint32_t i = m->cursor++;
+        if (f->states[i] == RENDER_IMAGE_INK && m->installed[i] != f->tiles[i].image.version)
+            model_publish(m, i);
+    }
     if (full)
         for (uint32_t i = 0; i <= RF_ROWS; ++i) m->scene[i] = proposed;
     else if (patch) m->scene[row] = proposed;
@@ -67,14 +74,15 @@ static void model_frame(render_fixture *f, render_model *m, uint8_t arg)
     render_stats(f->r, &after);
     ASSERT(after.tiles == sent && after.tile_bytes == sent * RF_TILE && after.queued == m->count);
     ASSERT(after.tile_inspections <= sent + 1u);
-    ASSERT(after.draw.scan_cells == (sent ? RF_COLS * (RF_ROWS + 1u) : 0u));
+    render_test_view view = render_test_inspect(f->r);
+    ASSERT(view.scan_cells == (sent ? RF_COLS * (RF_ROWS + 1u) : 0u));
     for (size_t i = 0; i <= RF_ROWS; ++i) {
         render_image_id image = m->scene[i];
-        const render_sample *s = after.draw.samples + i * RF_COLS;
+        render_sample left = rf_sample(f, i * RF_COLS), right = rf_sample(f, i * RF_COLS + 1);
         bool ink = image.slot != RENDER_NO_SLOT && m->installed[image.slot - RF_FIRST] == image.version;
-        ASSERT(s[0].cell.glyph_index == image.version && s[0].cell.atlas_slot == image.slot);
-        ASSERT((s[0].coverage != NULL) == ink && (s[1].coverage != NULL) == ink);
-        if (ink) ASSERT(s[0].coverage[0] == m->coverage[image.slot - RF_FIRST]);
+        ASSERT(left.cell.glyph_index == image.version && left.cell.atlas_slot == image.slot);
+        ASSERT((left.coverage != NULL) == ink && (right.coverage != NULL) == ink);
+        if (ink) ASSERT(left.coverage[0] == m->coverage[image.slot - RF_FIRST]);
     }
 }
 
@@ -87,19 +95,16 @@ static void model_restart(render_fixture *f, render_model *m)
         for (uint32_t i = 0; i <= RF_ROWS; ++i)
             rf_wide(f, i, (render_image_id){RENDER_NO_SLOT, 0});
     }
-    f->stale_on_recheck = false;
+    f->stale_stamp = false;
     render_frame_id id;
     ASSERT(rf_submit(f, &id, NULL) == RENDER_OK);
-    ASSERT(rf_pump(f) == RENDER_MORE);
+    render_test_owner owner = render_test_owner_get(f->r);
+    ASSERT(rf_dispatch(owner, rf_take(owner)) == RENDER_OK);
     ASSERT(render_event(f->r, &(render_notice){.kind = RENDER_NOTICE_LOST, .id = id}) == RENDER_LOST);
-    ASSERT(rf_pump(f) == RENDER_OK);
     ASSERT(render_bind(f->r, &f->binding, &f->sheet, NULL) == RENDER_OK);
+    m->cursor = 0;
     m->count = 0;
     memset(m->installed, 0, sizeof m->installed);
-    for (uint32_t i = 0; i < RF_SLOTS; ++i) {
-        ASSERT(rf_pump(f) == (i + 1u == RF_SLOTS ? RENDER_OK : RENDER_MORE));
-        if (f->states[i] == RENDER_IMAGE_INK) model_publish(m, i);
-    }
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
@@ -108,6 +113,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     render_model m = {0};
     rf_init(&f);
     if (base_arena_init(&f.arena, (RF_ROWS + 1u) * os_page_size()) != 0) return 0;
+    ASSERT(os_wake_init(&f.wake) == OS_OK);
     ASSERT(render_open(&f.arena, &f.setup, &f.r) == RENDER_OK);
     ASSERT(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
     for (size_t i = 0; i < size / 2u; ++i) {
@@ -135,6 +141,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
     }
     ASSERT(render_close(f.r) == RENDER_OK);
+    os_wake_close(&f.wake);
     base_arena_free(&f.arena);
     return 0;
 }

@@ -1,25 +1,27 @@
-#include "render/render.h"
+#include "render/render_driver.h"
 #include "trace/trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Geometry and sample count from the signed spec's v1 witnesses. W=10/H=20
- * is the same spec's font send-back sizing example. Three tiles distinguish
- * the one-tile scan from a many-tile scan with the smallest useful batch
- * including an interior queue entry. */
+ * is the same spec's font send-back sizing example. Three runtime slots
+ * match the render fixture reserve. The resident runtime case uses one. */
 enum { COLS = 360, ORDINARY_ROWS = 120, MAX_ROWS = 300, SAMPLES = 10000,
-       W = 10, H = 20, TILES = 3, SHEET = 2, TILE = RENDER_TILE_MAX_SPAN * W * H };
+       W = 10, H = 20, TILES = 3, SHEET = RENDER_ASCII_COUNT + RENDER_TILE_MAX_SPAN, TILE = RENDER_TILE_MAX_SPAN * W * H };
 typedef struct bench_view {
     render_offer offer;
     render_strip run;
     render_cell *cells;
     render_tile_view runtime[TILES];
     uint8_t pixels[TILE];
+    render_driver_port *port;
+    void *backend;
 } bench_view;
 
-typedef enum bench_case { BENCH_ROW, BENCH_FULL, BENCH_RUNTIME, BENCH_ONE_TILE, BENCH_MANY_TILES } bench_case;
+typedef enum bench_case { BENCH_ROW, BENCH_FULL, BENCH_RUNTIME } bench_case;
 
 static render_stamp current(void *ctx) { return ((bench_view *)ctx)->offer.stamp; }
 static render_rc run_view(void *ctx, size_t index, render_strip *out)
@@ -80,12 +82,34 @@ static void pair(const char *label, uint64_t *samples, size_t count)
     printf(" %s=%.3f/%.3f us", label, (double)p50 / 1000.0, (double)p99 / 1000.0);
 }
 
-static void finish(render *r)
+static render_rc bench_open(void **state, base_arena *a, const render_setup *s, render_driver_port *p)
 {
-    const render_notice pump = {.kind = RENDER_PUMP};
-    render_rc rc;
-    do rc = render_event(r, &pump); while (rc == RENDER_MORE);
-    ASSERT(rc == RENDER_OK);
+    bench_view *b = s->directory_ctx;
+    render_rc rc = render_driver_null().ops->open(state, a, s, p);
+    if (rc == RENDER_OK) {
+        b->port = p;
+        b->backend = *state;
+    }
+    return rc;
+}
+
+static void finish(bench_view *b, render *r)
+{
+    const render_driver_ops *ops = render_driver_null().ops;
+    os_wake_drain(b->port->wake);
+    const render_packet *p = render_driver_take(b->port);
+    ASSERT(p);
+    if (p->sheet) ASSERT(ops->bind(b->backend, &p->binding, p->sheet) == RENDER_OK);
+    ASSERT(ops->consume(b->backend, p) == RENDER_OK);
+    render_notice n;
+    while (ops->poll(b->backend, &n) == RENDER_OK) ASSERT(render_event(r, &n) == RENDER_OK);
+}
+
+static uint64_t cpu_now(void)
+{
+    struct timespec t;
+    ASSERT(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) == 0);
+    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
 }
 
 static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
@@ -96,10 +120,11 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
     const char *supply = power();
     size_t cells = (size_t)COLS * (rows + 1u);
     base_arena arena;
-    /* Two retained/packet cell copies, null's sample records, fixture and
-     * memcpy output. Page slack covers atlas, slots, rows and setup. */
-    size_t bytes = cells * (4u * sizeof(render_cell) + sizeof(render_sample)) +
-        4u * count * sizeof(uint64_t) + 4u * os_page_size();
+    /* Packet, retained cells, producer grid and memcpy destination.
+     * Pay for the two atlas allocations, descriptors, row tags and setup. */
+    size_t bytes = cells * 4u * sizeof(render_cell) + 4u * count * sizeof(uint64_t) +
+        SHEET * sizeof(render_tile_view) + (SHEET + TILES) * (2u * TILE + sizeof(render_resident)) +
+        ((size_t)rows + 1u) * sizeof(uint32_t) + 4u * os_page_size();
     ASSERT(base_arena_init(&arena, bytes) == 0);
     bench_view b = {0};
     b.cells = base_arena_alloc(&arena, cells * sizeof *b.cells, _Alignof(render_cell));
@@ -109,18 +134,18 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
     memset(copy, 0, cells * sizeof *copy);
     bool runtime = kind == BENCH_RUNTIME;
     bool full = kind == BENCH_FULL || runtime;
-    size_t tiles = kind == BENCH_ONE_TILE ? 1u : kind == BENCH_MANY_TILES ? TILES : 0u;
     for (size_t i = 0; i < cells; ++i) b.cells[i] = (render_cell){1, runtime ? SHEET : 0, RENDER_RGB_MASK, 0, 0, 0};
     render_tile_view markers[SHEET];
-    render_sheet sheet = {.tiles = markers, .count = SHEET};
+    render_sheet sheet = {.tiles = markers, .count = SHEET, .ascii_count = RENDER_ASCII_COUNT};
     for (uint32_t i = 0; i < SHEET; ++i) {
+        uint32_t span = i < RENDER_ASCII_COUNT ? 1u : i - RENDER_ASCII_COUNT + 1u;
         markers[i] = (render_tile_view){.image = {i, 1}, .page = b.pixels, .length = TILE,
             .stride = RENDER_TILE_MAX_SPAN * W, .page_width = RENDER_TILE_MAX_SPAN * W,
-            .page_height = H, .span = i + 1u, .rect = {0, 0, (i + 1u) * W, H}};
-        sheet.marker[i] = markers[i].image;
+            .page_height = H, .span = span, .rect = {0, 0, span * W, H}};
+        if (i >= RENDER_ASCII_COUNT) sheet.marker[span - 1u] = markers[i].image;
     }
     for (uint32_t i = 0; i < TILES; ++i) {
-        b.runtime[i] = markers[1];
+        b.runtime[i] = markers[SHEET - 1u];
         b.runtime[i].image = (render_image_id){SHEET + i, 1};
         if (runtime) {
             b.runtime[i].span = 1;
@@ -131,7 +156,12 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
         .client_width = COLS * W, .client_height = rows * H, .cols = COLS, .rows = rows,
         .cell_width = W, .cell_height = H, .target_stride = COLS * W * sizeof(uint32_t),
         .sheet = {0, SHEET}, .runtime = {SHEET, TILES}, .overscan = 1};
-    render_setup setup = {.driver = render_driver_null(), .recovery_slots = TILES,
+    const render_driver_ops *null = render_driver_null().ops;
+    render_driver_ops ops = *null;
+    ops.open = bench_open;
+    os_wake wake;
+    ASSERT(os_wake_init(&wake) == OS_OK);
+    render_setup setup = {.driver = {&ops}, .wake = &wake, .recovery_slots = TILES,
         .directory_ctx = &b, .directory = directory,
         .limits = {.client_width = binding.client_width, .client_height = binding.client_height,
             .cols = COLS, .rows = rows, .cell_width = W, .cell_height = H, .cells = cells,
@@ -139,7 +169,7 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
             .sheet_slots = SHEET, .runtime_slots = TILES, .atlas_bytes = (SHEET + TILES) * TILE,
             .tile_descriptors = TILES, .tile_bytes = TILES * TILE}};
     render_source src = {&b, current, run_view, row_view, region_view, identity, tile_view};
-    render *r;
+    render *r = NULL;
     ASSERT(render_open(&arena, &setup, &r) == RENDER_OK);
     ASSERT(render_bind(r, &binding, &sheet, NULL) == RENDER_OK);
     b.offer = (render_offer){
@@ -157,52 +187,45 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
     }
     render_frame_id id;
     ASSERT(render_submit(r, &b.offer, &src, &id, NULL) == RENDER_OK);
-    finish(r);
+    finish(&b, r);
     b.offer.mode = full ? RENDER_FULL : RENDER_PATCH;
-    b.offer.run_count = tiles ? 0u : 1u;
     b.offer.overscan_dirty = full;
     b.offer.region = full ? RENDER_REMOVE : RENDER_KEEP;
-    b.offer.tile_descriptors = tiles;
-    b.offer.tile_bytes = tiles * TILE;
+    b.offer.tile_descriptors = 0;
+    b.offer.tile_bytes = 0;
     if (!full) b.run.row_count = 1;
-    size_t payload = (tiles ? 0u : full ? cells : COLS) * sizeof(render_cell);
-    render_counters stats;
+    size_t payload = (full ? cells : COLS) * sizeof(render_cell);
     for (size_t i = 0; i < count; ++i) {
         b.offer.stamp.base = id;
         ++b.offer.stamp.composition;
-        for (uint32_t k = 0; k < tiles; ++k) {
-            ++b.runtime[k].image.version;
-            render_image_changed(r, binding.font, b.runtime[k].image.slot);
-        }
         if (idle_ns) os_sleep_ns(idle_ns);
-        uint64_t t0 = os_now_ns();
+        uint64_t t0 = os_now_ns(), c0 = cpu_now();
         ASSERT(render_submit(r, &b.offer, &src, &id, NULL) == RENDER_OK);
-        uint64_t t1 = os_now_ns();
-        finish(r);
+        uint64_t c1 = cpu_now(), t1 = os_now_ns();
+        finish(&b, r);
         uint64_t t2 = os_now_ns();
-        render_stats(r, &stats);
-        if (payload) {
-            uint64_t t3 = os_now_ns();
-            memcpy(copy, b.cells, payload);
-            __asm__ volatile("" : : "r"(copy) : "memory");
-            samples[3u * count + i] = os_now_ns() - t3;
-        }
+        uint64_t t3 = os_now_ns();
+        memcpy(copy, b.cells, payload);
+        __asm__ volatile("" : : "r"(copy) : "memory");
         samples[i] = t1 - t0;
-        samples[count + i] = t2 - t0;
-        samples[2u * count + i] = stats.draw.scan_ns;
+        samples[count + i] = c1 - c0;
+        samples[2u * count + i] = t2 - t0;
+        samples[3u * count + i] = os_now_ns() - t3;
     }
-    const char *name = full ? (runtime ? "full-runtime" : "full-sheet") :
-        (tiles ? "tile-only" : "one-row");
-    printf("%ux%u+overscan %s tiles=%zu cells=%zu scan=%zu copies=%zu B n=%zu idle_ns=%llu [%s]",
-           COLS, rows, name, tiles, stats.cells, stats.draw.scan_cells, payload + stats.tile_bytes,
+    double end_load = 0;
+    int have_end_load = getloadavg(&end_load, 1);
+    printf("%ux%u+overscan %s copies=%zu B n=%zu idle_ns=%llu [%s]",
+           COLS, rows, full ? (runtime ? "full-runtime" : "full-sheet") : "one-row", payload,
            count, (unsigned long long)idle_ns, supply);
-    if (have_load == 1) printf(" load1=%.2f", load);
-    pair("submit", samples, count);
-    pair("submit+null-retire", samples + count, count);
-    pair("scan", samples + 2u * count, count);
-    if (payload) pair("memcpy", samples + 3u * count, count);
+    if (have_load == 1 && have_end_load == 1) printf(" load1=%.2f->%.2f", load, end_load);
+    if (have_load != 1 || have_end_load != 1 || load >= 2.0 || end_load >= 2.0) printf(" non-probative");
+    pair("submit-wall", samples, count);
+    pair("submit-cpu", samples + count, count);
+    pair("submit+null-retire-wall", samples + 2u * count, count);
+    pair("memcpy-wall", samples + 3u * count, count);
     putchar('\n');
     ASSERT(render_close(r) == RENDER_OK);
+    os_wake_close(&wake);
     base_arena_free(&arena);
 }
 
@@ -221,8 +244,6 @@ int main(int argc, char **argv)
         exercise(fixtures[i], BENCH_ROW, idle_ns);
         exercise(fixtures[i], BENCH_FULL, idle_ns);
         exercise(fixtures[i], BENCH_RUNTIME, idle_ns);
-        exercise(fixtures[i], BENCH_ONE_TILE, idle_ns);
-        exercise(fixtures[i], BENCH_MANY_TILES, idle_ns);
     }
     return 0;
 }

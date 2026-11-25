@@ -8,7 +8,7 @@
 
 typedef struct render render;
 struct work_pool;
-struct plat_native;
+typedef struct plat_native_binding plat_native_binding;
 struct render_driver_ops;
 typedef struct render_driver { const struct render_driver_ops *ops; } render_driver;
 
@@ -61,12 +61,14 @@ typedef struct render_source {
 /* The persistent UI identity reader is used by image_changed and recovery.
  * It reads the same directory as the offer adapter. It never lends pixels.
  * The caller retains ctx, native binding, wake and workers through close.
- * recovery_slots is a positive per-pump inspection grant if runtime slots
- * are reserved. Owner-thread operations that can wait use wake. */
+ * wake is required and is signalled by the driver on UI progress. The
+ * command wake in render_driver.h is separate and owned by the service.
+ * recovery_slots is the positive directory inspection grant per accepted
+ * input-free offer, when runtime slots are reserved. */
 typedef struct render_setup {
     render_limits limits;
     render_driver driver;
-    const struct plat_native *native;
+    plat_native_binding *native;
     struct work_pool *workers;
     const os_wake *wake;
     size_t recovery_slots;
@@ -74,12 +76,14 @@ typedef struct render_setup {
     render_image_state (*directory)(void *, render_generation, uint32_t, render_image_id *);
 } render_setup;
 
-/* Exactly one checked view for each sheet slot, in slot order. The two
- * marker IDs designate settled artwork for each span. Bind copies the sheet
- * into backend storage. Keep it alive and immutable through any retry. */
+/* Slot-ordered views. The first ascii_count entries identify printable
+ * ASCII directly in code order. A valid settled marker for each cell span
+ * follows that range. Bind borrows these descriptors and pixels only for
+ * its call and copies the checked sheet into prepaid candidate storage. */
+#define RENDER_ASCII_COUNT (0x7eu - 0x20u + 1u)
 typedef struct render_sheet {
     const render_tile_view *tiles;
-    size_t count;
+    size_t count, ascii_count;
     render_image_id marker[RENDER_TILE_MAX_SPAN];
 } render_sheet;
 
@@ -103,47 +107,26 @@ typedef struct render_offer {
 } render_offer;
 
 typedef enum render_state {
-    RENDER_CLOSED, RENDER_OPENING, RENDER_UNBOUND, RENDER_BINDING, RENDER_IDLE_FULL,
-    RENDER_IDLE, RENDER_ACCEPTED, RENDER_ISSUED, RENDER_QUIESCING, RENDER_CLOSING
+    RENDER_CLOSED, RENDER_OPENING, RENDER_UNBOUND, RENDER_IDLE_FULL, RENDER_IDLE,
+    RENDER_ACCEPTED, RENDER_ISSUED, RENDER_RETIRING, RENDER_QUIESCING, RENDER_CLOSING
 } render_state;
 typedef enum render_device { RENDER_WAIT_FENCE, RENDER_DEVICE_DONE } render_device;
-typedef enum render_presentation {
-    RENDER_WAIT_DISPLAY, RENDER_PRESENTED, RENDER_DISCARDED
-} render_presentation;
+typedef enum render_presentation { RENDER_WAIT_DISPLAY, RENDER_PRESENTED, RENDER_DISCARDED } render_presentation;
 typedef enum render_clock { RENDER_UNTIMED, RENDER_MONOTONIC, RENDER_SYNTHETIC } render_clock;
 typedef enum render_notice_kind {
-    RENDER_PUMP, RENDER_NOTICE_ISSUED, RENDER_NOTICE_DEVICE_DONE, RENDER_NOTICE_PRESENTED,
-    RENDER_NOTICE_DISCARDED, RENDER_NOTICE_RELEASED, RENDER_NOTICE_LOST
+    RENDER_NOTICE_ISSUED, RENDER_NOTICE_DEVICE_DONE, RENDER_NOTICE_PRESENTED,
+    RENDER_NOTICE_DISCARDED, RENDER_NOTICE_LOST
 } render_notice_kind;
 
-/* Null oracle reads. Each sample owns its original cell footprint and the
- * coverage it would fetch (NULL for a version mismatch or inkless cell).
- * Wide right reads the left image at x_offset. Extents are for the whole
- * packed image, with reads clipped to extents. Borrow through the next
- * driver operation or close. Output damage conservatively bounds redraw. */
-typedef struct render_sample {
-    render_cell cell;
-    const uint8_t *coverage;
-    uint32_t width, height, x_offset;
-} render_sample;
-typedef struct render_draw_report {
-    size_t scan_cells, drawn_cells, drawn_rows, copied_tile_bytes;
-    uint64_t scan_ns; /* null-only elapsed R-A scan, before drawing */
-    render_rect damage, region;
-    const render_sample *samples; /* row-major, includes reserved overscan */
-    const uint32_t *region_rgb;  /* tight, current region */
-} render_draw_report;
-
-/* Platform/worker adapter authenticates native cookie, surface/window,
- * epoch/frame and clock before forwarding. RELEASED proves physical
- * completion of every job using the packet. Early terminal evidence is
- * retained privately until issue succeeds. Null timestamps are synthetic. */
+/* Platform/worker adapter authenticates cookie, surface/window, epoch/frame
+ * and clock. A LOST with frame zero is a device/epoch disconnect from the live
+ * owner, including between flights. All other evidence names the live flight.
+ * Early evidence is private until issue. Null timings are synthetic. */
 typedef struct render_notice {
     render_notice_kind kind;
     render_frame_id id;
     render_clock clock;
     uint64_t ns;
-    render_draw_report draw; /* ISSUED only */
 } render_notice;
 
 typedef struct render_wake {
@@ -160,7 +143,8 @@ typedef struct render_counters {
     uint64_t t4, t5, t6, watermark;
     size_t queued, recovery_inspections;
     size_t rows, runs, cells, region_pixels, tile_inspections, tiles, tile_bytes;
-    render_draw_report draw;
+    render_rc rejected;
+    render_need rejection;
 } render_counters;
 
 /* Setup and all service functions are serialized by the UI owner. No call
@@ -176,66 +160,56 @@ typedef struct render_counters {
  * actual target stride, and include both banks if reprovision overlaps. */
 render_rc render_measure(const render_binding *, const render_limits *,
                          const render_backend_caps *, render_need *);
-/* Open prepays and touches both packet and backend storage. MORE/WAIT gives
- * a handle advanced by PUMP. A failed initial open restores the arena mark.
- * The arena interval belongs exclusively to this service through close. */
+/* Open prepays/touches storage. Set *out=NULL for first open. MORE/WAIT
+ * returns an OPENING handle. Retry with the same inputs after progress or
+ * close it. A terminal initial error restores the arena mark and clears
+ * the handle. The arena interval belongs exclusively to the service. */
 render_rc render_open(base_arena *, const render_setup *, render **);
-/* Bind only at idle or unbound. Retry the same binding and sheet on
- * MORE/WAIT from the driver. A zero client suspends admission and returns
- * WAIT until the caller supplies a drawable binding. Success starts a
- * fresh epoch and requires a complete next frame. */
+/* A valid candidate is staged alongside the last accepted active binding.
+ * Only its first accepted full packet adopts it. A rejected bind/submit
+ * preserves active ancestry and tiles. A zero client waits for configure.
+ * During loss, retry bind after quiescence wakes the UI. */
 render_rc render_bind(render *, const render_binding *, const render_sheet *, render_need *);
-/* Notify at each UI settlement, replacement or removal. A generation
- * mismatch or non-runtime slot is ignored. An owed replacement keeps its
- * FIFO ordinal. Vacant/QUEUED/EMPTY unlinks it. Delivery credit uses the
- * accepted watermark, so committing a prefix never visits old nodes.
- * PUMP checks at most recovery_slots directory indices per idle step,
- * once per epoch. Notifications deduplicate with replay and with credit.
- * The front end schedules positive-grant repairs while delivery is owed. */
+/* At a UI boundary notify every settlement, reassignment or removal.
+ * A matching active or staged generation records one FIFO node per slot.
+ * Replacement of an owed tile preserves its ordinal. Non-INK unlinks it.
+ * Watermark credit excludes an accepted prefix without a node walk. */
 void render_image_changed(render *, render_generation, uint32_t slot);
-/* One bounded check/validate/copy/commit. BUSY precedes staging. Any
- * refusal preserves the prior scene, stamps, output ID and delivery queue.
- * The UI may immediately reuse source cells, descriptors, RGB and R8 bytes
- * on success. The sealed backing survives until both terminal axes and
- * physical release, or quiescence on LOST. Apply layout_present for the
- * exact accepted publication in this same UI step. The caller keeps its
- * pending change marks across refusals and supplies full initialization
- * for a new tab, binding or unknown ancestor. It pairs pointer events
- * with the accepted publication and its saved transform/geometry serial.
- * The last accepted frame is the damage base, even after discard.
+/* One bounded structural validation and copy, with a single publication
+ * stamp check and BUSY before staging. Sanitizer and RENDER_ASSERT_IDENTITIES
+ * builds also verify current slot/version per changed ink cell. An in-range
+ * stale image in release samples background on a residency mismatch.
+ * One refusal may record diagnostics but spends no frame/input/credit.
+ * Keep producer marks across refusals. Publish layout_present and the saved
+ * pointer transform for this exact accepted candidate in the same UI step.
+ * A first, rebind, tab or unknown-ancestry picture needs a full offer.
  *
- * Copy 20Z + 4U + L bytes for Z changed cells, U changed region elements
- * and L tight R8 bytes, plus runs and selected descriptors. Validate only
- * the indicated rows and tiles. Inspect at most N+1 FIFO nodes for N
- * copied tiles. The grant may leave owed cells background-only until a
- * tile-only repair. A stable zero-tile edit needs no directory sweep.
- * Source current is read before prep and again at seal. Its paint serial
- * covers eviction and regeneration of even inherited rows. */
+ * Copy 20Z + 4U + L bytes for changed cells, region and tight R8 deltas.
+ * Inspect at most N+1 FIFO candidates for N deltas. Read only declared
+ * dimensions for the first candidate past the byte grant. An accepted
+ * input-free offer also queues up to recovery_slots directory entries for
+ * subsequent delivery. Pending schedules positive-grant repair. */
 render_rc render_submit(render *, const render_offer *, const render_source *,
                         render_frame_id *out, render_need *);
-/* PUMP advances opening, quiescence, bounded directory recovery or one
- * driver step. Re-drive while runnable. On loss stop admission, quiesce,
- * discard credits, then bind and rebuild with a full current picture.
- * T5=max(T4,fence), T6=max(T4,matched display); discard is untimed.
- * A matching presented result with no correlated time is also untimed.
- * Frame callbacks and ordinary wakes only allow progress. Device done
- * alone and presentation alone cannot retire a frame. Physically released
- * work may still wait on either. ID exhaustion forces quiescence before
- * reuse. In QUIESCING/CLOSING, late evidence cannot release resources. */
+/* Deliver authenticated notices on UI. Device and presentation independently
+ * reach terminal states. T5=max(T4,fence), T6=max(T4,display) with a correlated
+ * timestamp. Discard and uncorrelated presentation are untimed. Quiesce must
+ * acknowledge physical retirement before reuse. No time is synthesized on loss.
+ * Frame numbers increase across epochs and exhaustion retires the service. */
 render_rc render_event(render *, const render_notice *);
-/* A waiting service needs its wake. A runnable bind or close is retried
- * with its original arguments. Delivery means a repair can be offered. */
+/* WAIT uses the setup wake. Retry open, submit, bind or close as applicable.
+ * Delivery/recovery at idle requests an input-free repair. */
 bool render_pending(const render *, render_wake *);
-/* Counts refer to the last accepted frame, except delivery/recovery fields
- * which describe the current epoch. Refusals are reported through need/rc.
- * Keep the service live for borrowed draw records. stats(NULL) is CLOSED. */
+/* Counts describe the last accepted frame and current delivery directory.
+ * Rejected/rejection describe the most recent refusal independently.
+ * stats(NULL) is CLOSED. */
 void render_stats(const render *, render_counters *);
-/* Stop admission and retire physical work. Retry on MORE/WAIT. Final OK
- * releases the arena interval and invalidates the handle. NULL is fine. */
+/* Retry MORE/WAIT until the owner is physically quiescent. Final OK releases
+ * the arena interval and invalidates the handle. NULL is fine. */
 render_rc render_close(render *);
 
 /* XShm and GL factories are implemented by their respective backend modules.
- * Null owns a private R8 atlas and runs only when pumped. */
+ * Null owns a private R8 atlas and consumes on its owner. */
 render_driver render_driver_null(void);
 render_driver render_driver_xshm(void);
 render_driver render_driver_gl33(void);
