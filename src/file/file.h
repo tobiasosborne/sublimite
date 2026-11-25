@@ -102,12 +102,18 @@ typedef enum file_err {
     FILE_ERR_BUSY,     /* a job of that kind is in flight */
     FILE_ERR_CHANGED,  /* observed identity differs from the expectation */
     FILE_ERR_CANCELLED,
-    FILE_ERR_STATE,    /* not ready, already attached, no temp in custody */
+    FILE_ERR_STATE,    /* not ready, already attached, no temp in custody,
+                        * or a mapped snapshot file did not create */
     FILE_ERR_POOL,     /* work_submit refused */
     FILE_ERR_DIRSYNC,  /* installed, but the directory barrier failed */
     FILE_ERR_NOSPC,    /* fault-registry slots exhausted (Q12) */
     FILE_ERR_NOTSUP,   /* atomic NOREPLACE unavailable for an absent target */
-    FILE_ERR_CONFLICT  /* post-rename foreign or unverifiable identity */
+    FILE_ERR_CONFLICT, /* the DESTINATION is foreign or unverifiable after
+                        * the rename */
+    FILE_ERR_SOURCE    /* the SOURCE changed: the mapped original the
+                        * snapshot reads moved before or around the rename
+                        * (savectl takes another road than for the
+                        * destination; review N-C) */
 } file_err;
 
 /* Path diagnosis (A15: a name never reaches an ASSERT). An empty path is
@@ -228,8 +234,11 @@ uint32_t file_crc32c(uint32_t crc, const uint8_t *data, size_t len);
 /* ---- backing source lease --------------------------------------------- */
 
 /* The nullable owned-backing type (erratum 3): a reference to one
- * acquisition's descriptor and, for a mapped file, mapping and fault
- * registration. */
+ * acquisition. A mapped backing holds the original's descriptor, mapping
+ * and fault registration. A copy backing holds only its private bytes:
+ * it closes the original's descriptor at the end of acquisition, since
+ * nothing reads it afterwards, and it would pin a displaced original's
+ * blocks (review R5-B; owner read O2). */
 typedef struct file_backing_impl file_source;
 
 /* Retain the file's actual opened original independently of the file
@@ -243,9 +252,11 @@ void file_source_release(file_source *source);
  * the ctime our own rename moved it to (the one re-baselining point). */
 os_stat file_source_stat(const file_source *source);
 file_mode file_source_mode(const file_source *source);
-/* Off-path full check (any thread): the held fd still matches the
- * baseline in every compared field (ctime included) and the
- * registration is pristine. FILE_OK, or FILE_ERR_CHANGED / FILE_ERR_IO. */
+/* Off-path full check (any thread): a mapped backing's held fd still
+ * matches the baseline in every compared field (ctime included) and the
+ * registration is pristine. A copy backing holds no original, so nothing
+ * it holds can drift: FILE_OK. FILE_OK, or FILE_ERR_CHANGED /
+ * FILE_ERR_IO. */
 int file_source_validate(file_source *source, os_err *oserr);
 
 /* The live backing-identity validator undo requires for a mutable
@@ -326,7 +337,8 @@ typedef struct file_temp {
     os_stat fd_stat;         /* the temp fd's stat after the sync: the
                               * rename moves only its ctime, so size and
                               * mtime still match at verification */
-    file_source *source;     /* retained; NULL for private text */
+    file_source *source;     /* retained from the snapshot's mapped backing;
+                              * NULL for a copy or private text */
     file_source_pair pair;
     unsigned flags;          /* FILE_SAVE_FORCE */
 } file_temp;
@@ -342,29 +354,37 @@ typedef struct file_temp {
  * 0666 & ~os_creation_mask(), sync, and capture the fd stat. The temp is
  * created 0600 & ~mask, so it is never wider than a new file's result
  * (P: (0600 & ~m) is a subset of (0666 & ~m)) and grants group and other
- * nothing an existing destination's mode lacks. source (nullable,
- * borrowed for the call) is the original the snapshot reads; custody
- * retains it for publish. It is validated after the write only when the
- * snapshot reads a mapped backing: a copy's bytes are private. Source
- * validation protects bytes read from the source; destination
- * expectation protects what is overwritten. On
+ * nothing an existing destination's mode lacks. The source is the
+ * snapshot's own: when S reads a mapped backing, its piece_backing.ctx
+ * is the file_source of that file-created mapping (erratum 5); custody
+ * retains it for publish, and it is validated after the write. A mapped
+ * backing file did not create is refused (FILE_ERR_STATE) before any
+ * temp exists. A copy or private text has no source: its bytes are
+ * private. Source validation protects bytes read from the source;
+ * destination expectation protects what is overwritten. A changed source
+ * is FILE_ERR_SOURCE, a changed destination FILE_ERR_CHANGED. On
  * FILE_OK the temp is SYNCED and nothing has been renamed. A fault, a
  * changed source or a cancel discards the temp. Any thread, one at a
  * time per temp. snap is borrowed for the call. */
 int file_temp_prepare(file_temp *t, const char *dest_path,
-                      const piece_snapshot *snap, file_source *source,
+                      const piece_snapshot *snap,
                       const file_expectation *expect, unsigned flags,
                       os_err *oserr);
 /* Publish a SYNCED temp: re-observe the destination against the stored
  * expectation (unless FORCE), rename once (NOREPLACE when the
  * expectation is ABSENT and not FORCE), sync the directory, verify the
- * path against the written fd. When the custody's source is the
- * displaced inode, its fd is stat'ed immediately before and after the
- * rename: a pair differing in ctime and a falling link count only
+ * path against the written fd. When the custody's source (only a MAPPED
+ * snapshot has one: its own backing) is the displaced inode, its fd is
+ * stat'ed immediately before and after the rename. A copy has no source,
+ * so a foreign write into the destination during our own rename is not
+ * reported for it (review R5-A, a sub-window of N1). A pair differing in
+ * ctime and a falling link count only
  * re-baselines that backing (so it keeps validating its intact bytes);
- * any other difference is FILE_PUB_CONFLICT. Fills *out on every path
- * after the state check; the return is FILE_OK only for
- * FILE_PUB_VERIFIED. Custody afterwards: DONE on PRE_RENAME,
+ * any other difference is FILE_PUB_CONFLICT with FILE_ERR_SOURCE. A
+ * foreign or unverifiable destination is FILE_PUB_CONFLICT with
+ * FILE_ERR_CONFLICT; a changed destination before the rename is
+ * PRE_RENAME with FILE_ERR_CHANGED. Fills *out on every path after the
+ * state check; the return is FILE_OK only for FILE_PUB_VERIFIED. Custody afterwards: DONE on PRE_RENAME,
  * INSTALLED_UNSYNCED on a failed barrier, HELD otherwise. */
 int file_temp_publish(file_temp *t, file_save_outcome *out);
 /* Barrier-only retry: sync the original directory again and re-verify;
@@ -378,8 +398,11 @@ int file_temp_retry_barrier(file_temp *t, file_save_outcome *out);
  * the fd) on a stable observation: the fd stat and the path's identity
  * are re-taken after the read and must be unchanged. On success return
  * the post-rename fd expectation and the CRC32C over the first
- * min(size, FILE_WIRE_PREFIX_BYTES) bytes. A mismatch reports
- * FILE_ERR_CHANGED, an observation failure its actual error. Failure
+ * min(size, FILE_WIRE_PREFIX_BYTES) bytes. A destination mismatch
+ * reports FILE_ERR_CHANGED, an observation failure its actual error. A
+ * verified destination whose custody's displaced source moved beyond our
+ * own rename (a FOREIGN pair) reports FILE_ERR_SOURCE, with the outputs
+ * filled: the destination side is fine, the source side is not. Failure
  * preserves custody. INSTALLED_UNSYNCED or HELD only (FILE_ERR_STATE);
  * off the input path (it reads the whole file). */
 int file_temp_verify(const file_temp *t, file_expectation *installed,
@@ -390,10 +413,13 @@ int file_temp_verify(const file_temp *t, file_expectation *installed,
  * witness, transfer the descriptors, destination name and witness to
  * the temp in INSTALLED_UNSYNCED. Finish with file_temp_retry_barrier.
  * On mismatch or I/O failure release every partial acquisition and
- * leave the temp EMPTY. Opening the name, NOENT, NOTDIR and ACCESS mean
- * the named file is gone or unreadable (FILE_ERR_CHANGED), LOOP and
- * ISDIR mean it is not a regular file (FILE_ERR_NOTREG), and every other
- * error is FILE_ERR_IO, which keeps the recovery obligation. */
+ * leave the temp EMPTY. The class is decided by the os_err the open
+ * reports, nothing finer: OS_E_NOENT, OS_E_NOTDIR and OS_E_ACCESS mean the
+ * named file is gone or unreadable (FILE_ERR_CHANGED); OS_E_LOOP and
+ * OS_E_ISDIR mean it is not a regular file (FILE_ERR_NOTREG); every other
+ * os_err (OS_E_IO, which also carries EMFILE and ENFILE, OS_E_NOMEM,
+ * OS_E_AGAIN, OS_E_BUSY, OS_E_NOSPC, ...) is FILE_ERR_IO, which keeps the
+ * recovery obligation. */
 int file_temp_recover(file_temp *t, const char *path,
                       const file_witness *prepared, os_err *oserr);
 /* Release custody and reach DONE. A SYNCED temp is still ours and
@@ -408,11 +434,10 @@ void file_temp_forget(file_temp *t);
 /* One-shot synchronous save: prepare, then publish, then discard the
  * retained custody before returning. *witness (optional) receives the
  * temp's witness once preparation succeeds, whatever publication then
- * does. source as for file_temp_prepare. */
+ * does. The source is the snapshot's own, as for file_temp_prepare. */
 int file_save_write(const char *dest_path, const piece_snapshot *snap,
-                    file_source *source, const file_expectation *expect,
-                    unsigned flags, file_witness *witness,
-                    file_save_outcome *out);
+                    const file_expectation *expect, unsigned flags,
+                    file_witness *witness, file_save_outcome *out);
 
 /* ---- the file object ---------------------------------------------------- */
 
@@ -548,7 +573,6 @@ struct file {
     file_save_phase save_phase;
     file_save_op save_op;
     piece_snapshot *save_snap;     /* retained until the prepare settles */
-    file_source *save_source;      /* same lifetime; custody keeps its own */
     char save_dest[OS_PATH_MAX];
     file_expectation save_expect;
     unsigned save_flags;

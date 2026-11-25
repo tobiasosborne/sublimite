@@ -135,7 +135,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             ASSERT(file_expectation_observe_path(FPATH, &exp, &oe) == FILE_OK);
             file_witness w;
             file_save_outcome out;
-            int rc = file_save_write(FPATH, snap, NULL, &exp, FILE_SAVE_FORCE, &w, &out);
+            int rc = file_save_write(FPATH, snap, &exp, FILE_SAVE_FORCE, &w, &out);
             if (rc == FILE_OK) {
                 ASSERT(out.pub == FILE_PUB_VERIFIED);
                 ASSERT(read_all(FPATH, disk, MODEL_MAX) == mlen);

@@ -81,7 +81,15 @@ os_err __wrap_os_fault_register(const os_map *v, os_fault_id *o)
  * and EIO is returned, so neither name proves anything (a true
  * uncertain outcome). */
 enum { RENAME_PASS = 0, RENAME_EIO, RENAME_EISDIR, RENAME_AWAY, RENAME_AWAY_BLOCK,
-       RENAME_FOREIGN, RENAME_BACK, RENAME_EACCES, RENAME_DONE_EIO, RENAME_SWAP };
+       RENAME_FOREIGN, RENAME_BACK, RENAME_EACCES, RENAME_DONE_EIO, RENAME_SWAP,
+       RENAME_LINK, RENAME_MUTATE };
+/* v2-4xk: RENAME_LINK hard-links the temp onto the destination (both
+ * names then name our fd); RENAME_MUTATE changes the destination as
+ * rename_mutate_op says and renames nothing. Both report EIO. Paths:
+ * rename_tmp_path, rename_foreign_path (the destination). */
+enum { MUTATE_REPLACE = 1, MUTATE_APPEND, MUTATE_CHMOD };
+static int rename_mutate_op;
+static char rename_tmp_path[4096];
 #define UNCERTAIN_AWAY "uncertain.away"
 static _Atomic int rename_inject;
 static _Atomic unsigned calls_rename;
@@ -109,6 +117,29 @@ os_err __wrap_os_rename_at(const os_dir *a, const char *b, const os_dir *c,
         if (rename(p, rename_foreign_path) != 0) _exit(95);
         return OS_E_IO;
     }
+    case RENAME_LINK:
+        if (unlink(rename_foreign_path) != 0 || link(rename_tmp_path, rename_foreign_path) != 0)
+            _exit(96);
+        return OS_E_IO;
+    case RENAME_MUTATE:
+        switch (rename_mutate_op) {
+        case MUTATE_REPLACE: {
+            char p[4096];
+            if (snprintf(p, sizeof p, "%s.new", rename_foreign_path) >= (int)sizeof p) _exit(97);
+            put_file(p, "another!", 8);
+            if (rename(p, rename_foreign_path) != 0) _exit(97);
+            break;
+        }
+        case MUTATE_APPEND: {
+            int fd = open(rename_foreign_path, O_WRONLY | O_APPEND);
+            if (fd < 0 || write(fd, "+", 1) != 1 || close(fd) != 0) _exit(98);
+            break;
+        }
+        case MUTATE_CHMOD:
+            if (chmod(rename_foreign_path, 0640) != 0) _exit(99);
+            break;
+        }
+        return OS_E_IO;
     case RENAME_DONE_EIO: {
         os_err e = __real_os_rename_at(a, b, c, d, m);
         return e != OS_OK ? e : OS_E_IO;
@@ -141,9 +172,15 @@ os_err __wrap_os_rename_at(const os_dir *a, const char *b, const os_dir *c,
 /* Round 3: a stat of a name that lies once (MF-D, X13), and a read-back
  * during which the file's times move without its bytes (X7). */
 static _Atomic int stat_at_lie_on; /* lie on the Nth call from now (1-based) */
+static _Atomic int stat_at_fail_on; /* v2-4xk: fail (EIO) on the Nth call from now */
 os_err __real_os_stat_at(const os_dir *dir, const char *name, unsigned flags, os_stat *st);
 os_err __wrap_os_stat_at(const os_dir *dir, const char *name, unsigned flags, os_stat *st)
 {
+    int nf = atomic_load(&stat_at_fail_on);
+    if (nf > 0) {
+        atomic_store(&stat_at_fail_on, nf - 1);
+        if (nf == 1) return OS_E_IO;
+    }
     os_err e = __real_os_stat_at(dir, name, flags, st);
     int n = atomic_load(&stat_at_lie_on);
     if (n > 0) {
@@ -168,6 +205,7 @@ os_err __wrap_os_file_pread(os_file *f, void *buf, size_t n, uint64_t off, size_
 /* The /proc/self/status read behind os_creation_mask, refused on demand
  * (the child "mask_fallback" arms it before the first read). */
 static int openat_refuse_status;
+static char status_fixture[4096]; /* v2-4xk: served as /proc/self/status */
 /* Round 5 (R4l): one transient open failure of a named leaf. */
 static char openat_fail_leaf[OS_NAME_MAX];
 static int openat_fail_errno;
@@ -185,6 +223,8 @@ int __wrap_openat(int dirfd, const char *path, int flags, ...)
         errno = EACCES;
         return -1;
     }
+    if (status_fixture[0] != '\0' && strcmp(path, "/proc/self/status") == 0)
+        return __real_openat(AT_FDCWD, status_fixture, flags, mode);
     if (openat_fail_errno != 0 && strcmp(path, openat_fail_leaf) == 0) {
         errno = openat_fail_errno;
         openat_fail_errno = 0;
@@ -665,7 +705,7 @@ static void t_save_sync(void)
     CHECK(piece_replace(t, 0, 0, (const uint8_t *)"XX", 2) == PIECE_OK);
     file_witness w;
     file_save_outcome out;
-    CHECK(file_save_write(path, s, NULL, &exp, 0, &w, &out) == FILE_OK);
+    CHECK(file_save_write(path, s, &exp, 0, &w, &out) == FILE_OK);
     CHECK(out.pub == FILE_PUB_VERIFIED);
     CHECK(file_eq(path, "after the save", 14));
     for (int step = 1; step <= 6; step++) CHECK(steps_seen[step] == 1);
@@ -697,7 +737,7 @@ static void t_save_absent_race(void)
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
     file_test_set_step_hook(NULL, NULL, NULL);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     CHECK(tmp.state == FILE_TEMP_SYNCED);
     put_file(path, "foreign", 7); /* created between check and rename */
     file_save_outcome out;
@@ -712,7 +752,7 @@ static void t_save_absent_race(void)
     t = text_tree("fresh");
     s = snap_of(t);
     CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
-    CHECK(file_save_write(path, s, NULL, &exp, 0, NULL, &out) == FILE_OK);
+    CHECK(file_save_write(path, s, &exp, 0, NULL, &out) == FILE_OK);
     CHECK(out.pub == FILE_PUB_VERIFIED && file_eq(path, "fresh", 5));
     piece_snapshot_release(s);
     piece_close(t);
@@ -729,11 +769,11 @@ static void t_save_changed_refused(void)
     piece_tree *t = text_tree("mine");
     piece_snapshot *s = snap_of(t);
     file_save_outcome out;
-    CHECK(file_save_write(path, s, NULL, &exp, 0, NULL, &out) == FILE_ERR_CHANGED);
+    CHECK(file_save_write(path, s, &exp, 0, NULL, &out) == FILE_ERR_CHANGED);
     CHECK(out.pub == FILE_PUB_PRE_RENAME);
     CHECK(file_eq(path, "someone else", 12));
     /* FORCE publishes over the change. */
-    CHECK(file_save_write(path, s, NULL, &exp, FILE_SAVE_FORCE, NULL, &out) == FILE_OK);
+    CHECK(file_save_write(path, s, &exp, FILE_SAVE_FORCE, NULL, &out) == FILE_OK);
     CHECK(file_eq(path, "mine", 4));
     piece_snapshot_release(s);
     piece_close(t);
@@ -751,7 +791,7 @@ static void t_save_fsync_fails(void)
     fail_file_sync = 1;
     calls_file_sync = 0;
     file_save_outcome out;
-    CHECK(file_save_write(path, s, NULL, &exp, 0, NULL, &out) == FILE_ERR_IO);
+    CHECK(file_save_write(path, s, &exp, 0, NULL, &out) == FILE_ERR_IO);
     CHECK(out.pub == FILE_PUB_PRE_RENAME);
     CHECK(calls_file_sync >= 1);
     FIRED();
@@ -774,7 +814,7 @@ static void t_save_dirsync_retry(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     fail_dir_sync = 1;
     calls_dir_sync = 0;
     unsigned renames = atomic_load(&calls_rename);
@@ -821,7 +861,7 @@ static void t_save_foreign_after_rename(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     file_test_set_step_hook(NULL, foreign_after_rename, (void *)path);
     file_save_outcome out;
     CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_CONFLICT);
@@ -845,7 +885,7 @@ static void t_temp_custody_discard(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp, moved;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     moved = tmp;
     file_temp_forget(&tmp);
     /* The temp name exists beside the destination while in custody. */
@@ -872,7 +912,7 @@ static void t_save_metadata_xattr(void)
     piece_tree *t = text_tree("new body");
     piece_snapshot *s = snap_of(t);
     file_save_outcome out;
-    CHECK(file_save_write(path, s, NULL, &exp, 0, NULL, &out) == FILE_OK);
+    CHECK(file_save_write(path, s, &exp, 0, NULL, &out) == FILE_OK);
     char val[8] = {0};
     CHECK(getxattr(path, "user.sublimite_test", val, sizeof val) == 2);
     CHECK(memcmp(val, "v1", 2) == 0);
@@ -1173,7 +1213,7 @@ static void t_r2_uncertain_rename(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     atomic_store(&rename_inject, RENAME_AWAY);
     file_save_outcome out;
     CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
@@ -1464,7 +1504,7 @@ static void t_r2_exist_race(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     strcpy(rename_foreign_path, path);
     atomic_store(&rename_inject, RENAME_FOREIGN); /* between recheck and rename */
     file_save_outcome out;
@@ -1491,13 +1531,13 @@ static void t_r2_cleanup_paths(void)
     file_save_outcome out;
     /* temp fsync failure */
     fail_file_sync = 1;
-    CHECK(file_save_write(path, s, NULL, &exp, 0, NULL, &out) == FILE_ERR_IO);
+    CHECK(file_save_write(path, s, &exp, 0, NULL, &out) == FILE_ERR_IO);
     FIRED();
     CHECK(count_temps(dir) == 0 && count_fds() == fds0);
     /* pre-rename CHANGED */
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     put_file(path, "changed", 7);
     CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_CHANGED && out.pub == FILE_PUB_PRE_RENAME);
     file_temp_discard(&tmp);
@@ -1605,7 +1645,7 @@ static void t_r2_source_validation(void)
     os_err oe;
     CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
     save_prepare(&f1, s, file_path(&f1), &exp, FILE_SAVE_FORCE);
-    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE && last_msg.status == FILE_ERR_CHANGED);
+    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE && last_msg.status == FILE_ERR_SOURCE);
     CHECK(file_eq(path, "FOREIGN-BYTE", 12));
     piece_snapshot_release(s);
     piece_close(t);
@@ -1673,7 +1713,7 @@ static void t_r3_unreadable_dest(void)
         os_err oe;
         CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
         file_save_outcome out;
-        CHECK(file_save_write(path, s, NULL, &exp, flags, NULL, &out) == FILE_OK);
+        CHECK(file_save_write(path, s, &exp, flags, NULL, &out) == FILE_OK);
         struct stat st;
         CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0060);
         CHECK(chmod(path, 0600) == 0);
@@ -1696,7 +1736,7 @@ static void r3_install(const char *path, file_temp *tmp, piece_tree **t, piece_s
     os_err oe;
     CHECK(file_expectation_observe_path(path, &absent, &oe) == FILE_OK);
     memset(tmp, 0, sizeof *tmp);
-    CHECK(file_temp_prepare(tmp, path, *s, NULL, &absent, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(tmp, path, *s, &absent, 0, &oe) == FILE_OK);
     file_save_outcome out;
     CHECK(file_temp_publish(tmp, &out) == FILE_OK && tmp->state == FILE_TEMP_HELD);
 }
@@ -1803,7 +1843,7 @@ static void t_r3_held_retry_proof(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     atomic_store(&rename_inject, RENAME_AWAY);
     file_save_outcome out;
     CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO && tmp.state == FILE_TEMP_HELD);
@@ -1838,7 +1878,7 @@ static void t_r3_rename_not_performed(void)
         CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
         file_temp tmp;
         memset(&tmp, 0, sizeof tmp);
-        CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+        CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
         atomic_store(&rename_inject, injects[i]);
         file_save_outcome out;
         CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
@@ -1917,7 +1957,7 @@ static void t_r3_source_conflict(void)
         CHECK(file_save_publish(&f1) == FILE_OK);
         PUMP_UNTIL(&pool, save_done, &f1);
         file_test_set_step_hook(&f1, NULL, NULL);
-        CHECK(last_msg.status == FILE_ERR_CONFLICT && last_msg.mode == FILE_PUB_CONFLICT);
+        CHECK(last_msg.status == FILE_ERR_SOURCE && last_msg.mode == FILE_PUB_CONFLICT);
         CHECK(calls_dir_sync == syncs + 1); /* the barrier was not skipped */
         CHECK(file_save_phase_of(&f1) == FILE_SAVE_HELD);
         CHECK(!file_backing_validate(&f1, bk));
@@ -2065,7 +2105,7 @@ static void t_r3_unlink_identity(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     char tp[4096], fp[4096];
     CHECK(snprintf(tp, sizeof tp, "%s/%s", dir, tmp.tmp) < (int)sizeof tp);
     CHECK(snprintf(fp, sizeof fp, "%s/foreign.x", dir) < (int)sizeof fp);
@@ -2117,7 +2157,7 @@ static void t_r3_installed_touched(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     r3_hook_link = path;
     r3_hook_op = R3_TOUCH_DEST;
     file_test_set_step_hook(NULL, r3_renamed_hook, NULL);
@@ -2242,7 +2282,7 @@ static void t_r4_mapped_still_refuses(void)
     os_err oe;
     CHECK(file_expectation_observe_path(as, &absent, &oe) == FILE_OK);
     save_prepare(&f1, s, as, &absent, 0);
-    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE && last_msg.status == FILE_ERR_CHANGED);
+    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE && last_msg.status == FILE_ERR_SOURCE);
     CHECK(!exists(as));
     piece_snapshot_release(s);
     piece_close(t);
@@ -2265,7 +2305,7 @@ static void t_r4_rename_back(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     char tp[4096];
     CHECK(snprintf(tp, sizeof tp, "%s/%s", dir, tmp.tmp) < (int)sizeof tp);
     atomic_store(&rename_inject, RENAME_BACK);
@@ -2385,7 +2425,7 @@ static void t_r5_force_not_renamed(void)
         r4_foreign_atomic_save(path, "foreign now"); /* the expectation goes stale */
         file_temp tmp;
         memset(&tmp, 0, sizeof tmp);
-        CHECK(file_temp_prepare(&tmp, path, s, NULL, &stale, FILE_SAVE_FORCE, &oe) == FILE_OK);
+        CHECK(file_temp_prepare(&tmp, path, s, &stale, FILE_SAVE_FORCE, &oe) == FILE_OK);
         if (i == 2) CHECK(unlink(path) == 0 && mkdir(path, 0700) == 0);
         atomic_store(&rename_inject, injects[i]);
         file_save_outcome out;
@@ -2577,7 +2617,7 @@ static void t_r5_renamed_despite_eio(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     atomic_store(&rename_inject, RENAME_DONE_EIO);
     file_save_outcome out;
     CHECK(file_temp_publish(&tmp, &out) == FILE_OK && out.pub == FILE_PUB_VERIFIED);
@@ -2602,7 +2642,7 @@ static void t_r5_temp_name_swapped(void)
     piece_snapshot *s = snap_of(t);
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
-    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, path, s, &exp, 0, &oe) == FILE_OK);
     CHECK(snprintf(rename_foreign_path, sizeof rename_foreign_path, "%s/%s", dir, tmp.tmp) <
           (int)sizeof rename_foreign_path);
     atomic_store(&rename_inject, RENAME_SWAP);
@@ -2636,6 +2676,490 @@ static void t_r5_check_unobservable(void)
     close_file(&f1);
 }
 
+/* ---- v2-4xk: the file follow-up (owner read "L2-1 landed") ------------- */
+
+/* O1: no caller can lend "no source" for a mapped snapshot any more: a
+ * same-size in-place rewrite of the original (mtime restored) refuses
+ * the one-shot save, whose source comes from the snapshot's backing. */
+static void t_x_mapped_snapshot_source(void)
+{
+    const char *path = ROOT "/x/hole.txt";
+    put_file(path, "MAPPEDBYTES", 11);
+    open_file(&f1, path, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 0, 0, (const uint8_t *)">", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    struct stat st;
+    CHECK(stat(path, &st) == 0);
+    int fd = open(path, O_WRONLY);
+    CHECK(fd >= 0 && write(fd, "FOREIGNBYTE", 11) == 11 && close(fd) == 0);
+    restore_mtime(path, &st);
+    file_expectation now;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &now, &oe) == FILE_OK);
+    file_save_outcome out;
+    int rc = file_save_write(path, s, &now, FILE_SAVE_FORCE, NULL, &out);
+    CHECK(rc == FILE_ERR_SOURCE && out.pub == FILE_PUB_PRE_RENAME);
+    CHECK(file_eq(path, "FOREIGNBYTE", 11)); /* no mixed file written */
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* O1: a mapped backing file did not create cannot be validated, so
+ * prepare refuses it. */
+static int x_foreign_refs;
+static void x_acquire(void *ctx) { (void)ctx; x_foreign_refs++; }
+static void x_release(void *ctx) { (void)ctx; x_foreign_refs--; }
+static void t_x_foreign_mapped_backing(void)
+{
+    const char *src = ROOT "/x/foreign-src.txt", *dest = ROOT "/x/foreign-dest.txt";
+    put_file(src, "not file's mapping", 18);
+    (void)unlink(dest);
+    os_dir d = OS_DIR_INIT;
+    CHECK(os_dir_open(&d, ROOT "/x") == OS_OK);
+    os_file fd = OS_FILE_INIT;
+    CHECK(os_file_open_at(&fd, &d, "foreign-src.txt", OS_OPEN_READ) == OS_OK);
+    os_map view;
+    CHECK(os_map_file(&view, &fd, 0, 18) == OS_OK);
+    os_fault_id fid;
+    CHECK(os_fault_register(&view, &fid) == OS_OK);
+    piece_backing pb = { .bytes = view.addr, .len = view.len, .fault = fid, .ctx = &x_foreign_refs,
+                         .acquire = x_acquire, .release = x_release };
+    piece_tree *t;
+    CHECK(piece_open_mapped(reserve, &pb, &t) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    file_expectation absent;
+    os_err oe;
+    CHECK(file_expectation_observe_path(dest, &absent, &oe) == FILE_OK);
+    file_save_outcome out;
+    int rc = file_save_write(dest, s, &absent, 0, NULL, &out);
+    CHECK(rc == FILE_ERR_STATE && out.pub == FILE_PUB_PRE_RENAME && !exists(dest));
+    piece_snapshot_release(s);
+    piece_close(t);
+    CHECK(x_foreign_refs == 0);
+    os_fault_retire(fid);
+    os_unmap(&view);
+    os_file_close(&fd);
+    os_dir_close(&d);
+}
+
+/* O2: a copy backing holds no descriptor after acquisition (a mapped one
+ * holds exactly one), and the public validator clears for a copy. */
+static void t_x_copy_holds_no_fd(void)
+{
+    const char *path = ROOT "/x/copyfd.txt";
+    put_file(path, "copy", 4);
+    int fds0 = count_fds();
+    open_file(&f1, path, 0);
+    CHECK(file_open_mode(&f1) == FILE_MODE_COPY);
+    CHECK(count_fds() == fds0);
+    file_source *src;
+    CHECK(file_source_acquire(&f1, &src) == FILE_OK);
+    r4_foreign_atomic_save(path, "foreign");
+    os_err oe = OS_OK;
+    CHECK(file_source_validate(src, &oe) == FILE_OK); /* nothing it holds can drift */
+    file_source_release(src);
+    close_file(&f1);
+    CHECK(count_fds() == fds0);
+    open_file(&f1, path, 1);
+    CHECK(file_open_mode(&f1) == FILE_MODE_MMAP && count_fds() == fds0 + 1);
+    close_file(&f1);
+}
+
+/* N-C: publish, prepare and verify name the side that changed: the
+ * SOURCE (before or around the rename) or the DESTINATION. */
+static void t_x_sides(void)
+{
+    /* publish, source side: the displaced mapped source grows in the window */
+    const char *a = ROOT "/x/sides/a.txt", *b = ROOT "/x/sides/b.txt";
+    r3_linked_pair(a, b);
+    open_file(&f1, a, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 10, 0, (const uint8_t *)"+", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    save_prepare(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+    CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
+    r3_hook_link = b;
+    r3_hook_op = R3_GROW;
+    file_test_set_step_hook(&f1, r3_renamed_hook, NULL);
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_publish(&f1) == FILE_OK);
+    PUMP_UNTIL(&pool, save_done, &f1);
+    file_test_set_step_hook(&f1, NULL, NULL);
+    int pub_source = last_msg.status;
+    CHECK(last_msg.mode == FILE_PUB_CONFLICT);
+    /* verify, source side: the destination is ours, the source is not */
+    file_expectation inst;
+    uint32_t pcrc = 0;
+    os_err oe = OS_OK;
+    memset(&inst, 0, sizeof inst);
+    int verify_source = file_temp_verify(&f1.save_temp, &inst, &pcrc, &oe);
+    CHECK(inst.presence == FILE_PRESENT); /* the destination side verified */
+    file_save_abandon(&f1);
+    /* prepare, source side: the mapped original rewritten in place */
+    struct stat st;
+    CHECK(stat(a, &st) == 0);
+    int fd = open(a, O_WRONLY);
+    CHECK(fd >= 0 && write(fd, "Z", 1) == 1 && close(fd) == 0);
+    restore_mtime(a, &st);
+    piece_snapshot_release(s);
+    s = snap_of(t);
+    file_expectation now;
+    CHECK(file_expectation_observe_path(a, &now, &oe) == FILE_OK);
+    save_prepare(&f1, s, a, &now, FILE_SAVE_FORCE);
+    CHECK(last_msg.kind == FILE_MSG_SAVE_DONE);
+    int prepare_source = last_msg.status;
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+    /* the destination side: a foreign rename over our installed file,
+     * a destination changed before prepare, a verify mismatch */
+    const char *dpath = ROOT "/x/sides/d.txt";
+    put_file(dpath, "before", 6);
+    file_expectation exp;
+    CHECK(file_expectation_observe_path(dpath, &exp, &oe) == FILE_OK);
+    piece_tree *t2 = text_tree("our save");
+    piece_snapshot *s2 = snap_of(t2);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, dpath, s2, &exp, 0, &oe) == FILE_OK);
+    file_test_set_step_hook(NULL, foreign_after_rename, (void *)dpath);
+    file_save_outcome out;
+    int pub_dest = file_temp_publish(&tmp, &out);
+    file_test_set_step_hook(NULL, NULL, NULL);
+    CHECK(out.pub == FILE_PUB_CONFLICT);
+    int verify_dest = file_temp_verify(&tmp, &inst, &pcrc, &oe);
+    file_temp_discard(&tmp);
+    r4_foreign_atomic_save(dpath, "foreign again");
+    memset(&tmp, 0, sizeof tmp);
+    int prepare_dest = file_temp_prepare(&tmp, dpath, s2, &exp, 0, &oe);
+    file_temp_discard(&tmp);
+    piece_snapshot_release(s2);
+    piece_close(t2);
+    CHECK(pub_source == FILE_ERR_SOURCE && pub_dest == FILE_ERR_CONFLICT);
+    CHECK(verify_source == FILE_ERR_SOURCE && verify_dest == FILE_ERR_CHANGED);
+    CHECK(prepare_source == FILE_ERR_SOURCE && prepare_dest == FILE_ERR_CHANGED);
+}
+
+/* ---- v2-4xk survivor pins ---------------------------------------------- */
+
+static void x_publish_with(const char *dir, const char *path, int inject, int mutate_op,
+                           unsigned flags, int *rc, file_save_outcome *out, file_temp *tmp)
+{
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("ours!");
+    piece_snapshot *s = snap_of(t);
+    memset(tmp, 0, sizeof *tmp);
+    CHECK(file_temp_prepare(tmp, path, s, &exp, flags, &oe) == FILE_OK);
+    CHECK(snprintf(rename_tmp_path, sizeof rename_tmp_path, "%s/%s", dir, tmp->tmp) <
+          (int)sizeof rename_tmp_path);
+    strcpy(rename_foreign_path, path);
+    rename_mutate_op = mutate_op;
+    atomic_store(&rename_inject, inject);
+    *rc = file_temp_publish(tmp, out);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* N1: both names naming our fd (a hard link) proves nothing: UNCERTAIN,
+ * and neither name is unlinked. */
+static void t_x_both_names_ours(void)
+{
+    const char *dir = ROOT "/x/both", *path = ROOT "/x/both/b.txt";
+    put_file(path, "old", 3);
+    unlink_temps(dir);
+    int rc;
+    file_save_outcome out;
+    file_temp tmp;
+    x_publish_with(dir, path, RENAME_LINK, 0, 0, &rc, &out, &tmp);
+    CHECK(rc == FILE_ERR_IO && out.pub == FILE_PUB_RENAME_UNCERTAIN && tmp.state == FILE_TEMP_HELD);
+    file_temp_discard(&tmp);
+    CHECK(file_eq(path, "ours!", 5) && file_eq(rename_tmp_path, "ours!", 5));
+    CHECK(unlink(rename_tmp_path) == 0);
+}
+
+/* N7: a name that cannot be observed after the failed rename proves
+ * nothing: UNCERTAIN, the temp kept. */
+static void t_x_unobservable_after_rename(void)
+{
+    const char *dir = ROOT "/x/unobs", *path = ROOT "/x/unobs/u.txt";
+    put_file(path, "old", 3);
+    unlink_temps(dir);
+    atomic_store(&stat_at_fail_on, 2); /* 1: the pre-rename look; 2: the temp's */
+    int rc;
+    file_save_outcome out;
+    file_temp tmp;
+    x_publish_with(dir, path, RENAME_EIO, 0, 0, &rc, &out, &tmp);
+    CHECK(atomic_load(&stat_at_fail_on) == 0);
+    CHECK(rc == FILE_ERR_IO && out.pub == FILE_PUB_RENAME_UNCERTAIN && tmp.state == FILE_TEMP_HELD);
+    file_temp_discard(&tmp);
+    CHECK(file_eq(rename_tmp_path, "ours!", 5) && file_eq(path, "old", 3));
+    CHECK(unlink(rename_tmp_path) == 0);
+}
+
+/* R4b, R4c, R4d: a destination that is no longer exactly what it was
+ * before the rename (another file, another size, another mode) proves
+ * nothing: UNCERTAIN, the temp kept. */
+static void t_x_destination_moved(void)
+{
+    const char *dir = ROOT "/x/moved", *path = ROOT "/x/moved/m.txt";
+    for (int op = MUTATE_REPLACE; op <= MUTATE_CHMOD; op++) {
+        put_file(path, "old", 3);
+        CHECK(chmod(path, 0600) == 0);
+        unlink_temps(dir);
+        int rc;
+        file_save_outcome out;
+        file_temp tmp;
+        x_publish_with(dir, path, RENAME_MUTATE, op, 0, &rc, &out, &tmp);
+        CHECK(rc == FILE_ERR_IO && out.pub == FILE_PUB_RENAME_UNCERTAIN);
+        CHECK(tmp.state == FILE_TEMP_HELD);
+        file_temp_discard(&tmp);
+        CHECK(file_eq(rename_tmp_path, "ours!", 5));
+        CHECK(unlink(rename_tmp_path) == 0);
+    }
+}
+
+/* R5f: under FORCE a failed pre-rename observation refuses before the
+ * rename; R5h: an ABSENT destination still observed absent proves
+ * "not renamed", and only our own temp is removed. */
+static void t_x_pre_observation(void)
+{
+    const char *dir = ROOT "/x/pre", *path = ROOT "/x/pre/p.txt";
+    put_file(path, "old", 3);
+    unlink_temps(dir);
+    atomic_store(&stat_at_fail_on, 1);
+    int rc;
+    file_save_outcome out;
+    file_temp tmp;
+    x_publish_with(dir, path, RENAME_PASS, 0, FILE_SAVE_FORCE, &rc, &out, &tmp);
+    CHECK(rc == FILE_ERR_IO && out.pub == FILE_PUB_PRE_RENAME && out.oserr == OS_E_IO);
+    CHECK(tmp.state == FILE_TEMP_DONE && count_temps(dir) == 0 && file_eq(path, "old", 3));
+    CHECK(unlink(path) == 0);
+    x_publish_with(dir, path, RENAME_EIO, 0, 0, &rc, &out, &tmp);
+    CHECK(rc == FILE_ERR_IO && out.pub == FILE_PUB_PRE_RENAME);
+    CHECK(tmp.state == FILE_TEMP_DONE && count_temps(dir) == 0 && !exists(path));
+}
+
+/* N10b, N11: a FOREIGN pair survives a failed barrier and its retry, and
+ * dies with its custody: the next save is VERIFIED. */
+static void t_x_pair_lifetime(void)
+{
+    const char *a = ROOT "/x/life/a.txt", *b = ROOT "/x/life/b.txt";
+    r3_linked_pair(a, b);
+    open_file(&f1, a, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 10, 0, (const uint8_t *)"+", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    save_prepare(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+    CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
+    r3_hook_link = b;
+    r3_hook_op = R3_GROW;
+    file_test_set_step_hook(&f1, r3_renamed_hook, NULL);
+    fail_dir_sync = 1;
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_publish(&f1) == FILE_OK);
+    PUMP_UNTIL(&pool, save_done, &f1);
+    file_test_set_step_hook(&f1, NULL, NULL);
+    FIRED();
+    CHECK(last_msg.mode == FILE_PUB_INSTALLED_UNSYNCED);
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_retry_barrier(&f1) == FILE_OK);
+    PUMP_UNTIL(&pool, save_done, &f1);
+    CHECK(last_msg.mode == FILE_PUB_CONFLICT); /* the verdict outlived the barrier */
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+    /* a fresh custody of a fresh open: no stale verdict */
+    open_file(&f1, a, 1);
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 0, 0, (const uint8_t *)"!", 1) == PIECE_OK);
+    s = snap_of(t);
+    save_async(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* N13, N14: the own-path test compares canonical directories (an
+ * absolute spelling through a symlinked directory adopts), and never
+ * follows the leaf (a symlink leaf replaced by FORCE is another path). */
+static void t_x_canonical_spellings(void)
+{
+    const char *real = ROOT "/x/canon/real/c.txt";
+    put_file(real, "canon", 5);
+    char abs_link_dir[4096], abs_spelling[4096];
+    abs_path(ROOT "/x/canon/link", abs_link_dir, sizeof abs_link_dir);
+    (void)unlink(abs_link_dir);
+    CHECK(symlink("real", abs_link_dir) == 0);
+    CHECK(snprintf(abs_spelling, sizeof abs_spelling, "%s/c.txt", abs_link_dir) < (int)sizeof abs_spelling);
+    open_file(&f1, real, 0);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 5, 0, (const uint8_t *)"!", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    save_async(&f1, s, abs_spelling, file_baseline(&f1), 0);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(!file_check(&f1, NULL)); /* adopted */
+    file_save_abandon(&f1);
+    /* a symlink leaf naming file_path(f): FORCE replaces the link itself */
+    const char *leaf = ROOT "/x/canon/real/leaf.txt";
+    (void)unlink(leaf);
+    file_expectation absent;
+    os_err oe;
+    CHECK(file_expectation_observe_path(leaf, &absent, &oe) == FILE_OK && absent.presence == FILE_ABSENT);
+    CHECK(symlink("c.txt", leaf) == 0);
+    file_expectation before = *file_baseline(&f1);
+    save_async(&f1, s, leaf, &absent, FILE_SAVE_FORCE);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    struct stat st;
+    CHECK(lstat(leaf, &st) == 0 && S_ISREG(st.st_mode));
+    CHECK(file_eq(real, "canon!", 6));
+    CHECK(memcmp(file_baseline(&f1), &before, sizeof before) == 0); /* not adopted */
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+    CHECK(unlink(abs_link_dir) == 0);
+}
+
+/* N11: a custody's FOREIGN verdict dies with it: the same file_temp,
+ * reused for a save that displaces no source, is VERIFIED. */
+static void t_x_pair_reset(void)
+{
+    const char *a = ROOT "/x/reset/a.txt", *b = ROOT "/x/reset/b.txt";
+    const char *other = ROOT "/x/reset/other.txt";
+    r3_linked_pair(a, b);
+    (void)unlink(other);
+    open_file(&f1, a, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 10, 0, (const uint8_t *)"+", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    os_err oe;
+    CHECK(file_temp_prepare(&tmp, file_path(&f1), s, file_baseline(&f1), 0, &oe) == FILE_OK);
+    r3_hook_link = b;
+    r3_hook_op = R3_GROW;
+    file_test_set_step_hook(NULL, r3_renamed_hook, NULL);
+    file_save_outcome out;
+    CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_SOURCE && tmp.pair == FILE_PAIR_FOREIGN);
+    file_test_set_step_hook(NULL, NULL, NULL);
+    file_temp_discard(&tmp);
+    piece_tree *t2 = text_tree("private text");
+    piece_snapshot *s2 = snap_of(t2);
+    file_expectation absent;
+    CHECK(file_expectation_observe_path(other, &absent, &oe) == FILE_OK);
+    CHECK(file_temp_prepare(&tmp, other, s2, &absent, 0, &oe) == FILE_OK);
+    CHECK(file_temp_publish(&tmp, &out) == FILE_OK && out.pub == FILE_PUB_VERIFIED);
+    file_temp_discard(&tmp);
+    piece_snapshot_release(s2);
+    piece_close(t2);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* N16, N17, N18: the mode when no metadata is copied. */
+static void t_x_fallback_modes(void)
+{
+    const char *path = ROOT "/x/modes/m.txt";
+    piece_tree *t = text_tree("moded");
+    piece_snapshot *s = snap_of(t);
+    file_expectation exp;
+    os_err oe;
+    file_save_outcome out;
+    struct stat st;
+    (void)unlink(path); /* a failed earlier run may have left it unwritable */
+    /* N16: FORCE over another inode keeps that inode's mode */
+    put_file(path, "first", 5);
+    CHECK(chmod(path, 0600) == 0);
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    r4_foreign_atomic_save(path, "second");
+    CHECK(chmod(path, 0604) == 0);
+    CHECK(file_save_write(path, s, &exp, FILE_SAVE_FORCE, NULL, &out) == FILE_OK);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0604);
+    /* N17: special bits never travel on the unreadable path */
+    put_file(path, "special", 7);
+    CHECK(chmod(path, 04060) == 0);
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    CHECK(file_save_write(path, s, &exp, 0, NULL, &out) == FILE_OK);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0060);
+    CHECK(chmod(path, 0600) == 0);
+    /* N18: a destination gone by prepare gets the new-file mode */
+    put_file(path, "gone", 4);
+    CHECK(chmod(path, 0640) == 0);
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    CHECK(unlink(path) == 0);
+    CHECK(file_save_write(path, s, &exp, FILE_SAVE_FORCE, NULL, &out) == FILE_OK);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == (0666u & ~os_creation_mask()));
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* R5i/j: every open error os reports that is not NOENT, NOTDIR, ACCESS,
+ * LOOP or ISDIR keeps the obligation; one per os_err class. */
+static void t_x_recover_classes(void)
+{
+    const char *path = ROOT "/x/rclass.txt";
+    file_temp tmp;
+    piece_tree *t;
+    piece_snapshot *s;
+    r3_install(path, &tmp, &t, &s);
+    file_witness w = tmp.witness;
+    file_temp_discard(&tmp);
+    /* EINTR is absent on purpose: os restarts an interrupted open, so it
+     * never reaches file. */
+    int errnos[] = { ENOMEM, EAGAIN, EBUSY, ENOSPC };
+    os_err want[] = { OS_E_NOMEM, OS_E_AGAIN, OS_E_BUSY, OS_E_NOSPC };
+    for (size_t i = 0; i < sizeof errnos / sizeof errnos[0]; i++) {
+        file_temp rec;
+        memset(&rec, 0, sizeof rec);
+        os_err oe = OS_OK;
+        strcpy(openat_fail_leaf, "rclass.txt");
+        openat_fail_errno = errnos[i];
+        CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_IO && oe == want[i]);
+        CHECK(rec.state == FILE_TEMP_EMPTY);
+        CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_OK);
+        file_temp_discard(&rec);
+    }
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* U2, U3, U5, U6: the status parser takes only a whole, terminated,
+ * octal "Umask:" line at a line start; anything else is 077. */
+static void x_status_case(const char *name, const char *text, const char *want)
+{
+    char fixture[4096], arg[4200];
+    abs_path(ROOT "/x/status", fixture, sizeof fixture);
+    strcat(fixture, "-");
+    strcat(fixture, name);
+    put_file(fixture, text, strlen(text));
+    CHECK(snprintf(arg, sizeof arg, "%s:%s", fixture, want) < (int)sizeof arg);
+    if (run_child("mask_fixture", arg, 022) != 0) {
+        fprintf(stderr, "file_test.c: status case %s\n", name);
+        CHECK(false);
+    }
+}
+static void t_x_status_parser(void)
+{
+    x_status_case("ok", "Name:\tx\nUmask:\t0027\nState:\tR\n", "027");
+    x_status_case("unterminated", "Name:\tx\nUmask:\t0027", "077");        /* U2 */
+    x_status_case("missing", "Name:\tx\nState:\tR\n", "077");              /* U3 */
+    x_status_case("empty", "Name:\tx\nUmask:\t\nState:\tR\n", "077");      /* U5 */
+    x_status_case("in-name", "Name:\tUmask:\t0222\nUmask:\t0027\n", "027"); /* U6 */
+}
+
 /* ---- children (file_test --child NAME ARG) ------------------------------- */
 static uint32_t child_result_perm;
 static const char *child_dir;
@@ -2659,6 +3183,15 @@ static void child_temp_mode(void *ctx, int step)
 }
 static int child_main(const char *name, const char *arg)
 {
+    if (strcmp(name, "mask_fixture") == 0) {
+        /* arg: "<fixture path>:<expected octal>" */
+        const char *colon = strrchr(arg, ':');
+        if (colon == NULL || (size_t)(colon - arg) >= sizeof status_fixture) return 11;
+        memcpy(status_fixture, arg, (size_t)(colon - arg));
+        status_fixture[colon - arg] = '\0';
+        uint32_t want = (uint32_t)strtoul(colon + 1, NULL, 8);
+        return os_creation_mask() == want ? 0 : 12;
+    }
     if (strcmp(name, "mask_proc") == 0 || strcmp(name, "mask_fallback") == 0) {
         /* Before anything in os can read the mask. */
         openat_refuse_status = strcmp(name, "mask_fallback") == 0;
@@ -2685,13 +3218,13 @@ static int child_main(const char *name, const char *arg)
         *strrchr(dirbuf, '/') = '\0';
         child_dir = dirbuf;
         file_test_set_step_hook(NULL, child_temp_mode, NULL);
-        CHECK(file_save_write(arg, s, NULL, &exp, 0, NULL, &out) == FILE_OK);
+        CHECK(file_save_write(arg, s, &exp, 0, NULL, &out) == FILE_OK);
         return child_wider ? 3 : 0;
     }
     if (strcmp(name, "name") == 0) {
         memset(&exp, 0, sizeof exp);
         exp.presence = FILE_ABSENT;
-        int rc = file_save_write(arg, s, NULL, &exp, 0, NULL, &out);
+        int rc = file_save_write(arg, s, &exp, 0, NULL, &out);
         if (rc == FILE_OK) return 4;
         if (out.pub != FILE_PUB_PRE_RENAME) return 5;
         return 0;
@@ -2723,7 +3256,7 @@ static int child_main(const char *name, const char *arg)
             CHECK(file_expectation_observe_path(arg, &exp, &oe) == FILE_OK);
         }
         alarm(10); /* (E) far above one stat and one open: a block dies here */
-        int rc = file_save_write(arg, s, NULL, &exp, 0, NULL, &out);
+        int rc = file_save_write(arg, s, &exp, 0, NULL, &out);
         alarm(0);
         char dirbuf[4096];
         strcpy(dirbuf, arg);
@@ -2773,7 +3306,7 @@ static void t_durability(void)
             kill_pipe_r = to_child[0];
             file_test_set_step_hook(NULL, kill_step, NULL);
             file_save_outcome out;
-            int rc = file_save_write(path, s, NULL, &exp, 0, NULL, &out);
+            int rc = file_save_write(path, s, &exp, 0, NULL, &out);
             _exit(rc == FILE_OK ? 0 : 2);
         }
         close(to_parent[1]);
@@ -2886,6 +3419,20 @@ int main(int argc, char **argv)
     RUN(t_r5_renamed_despite_eio);
     RUN(t_r5_temp_name_swapped);
     RUN(t_r5_check_unobservable);
+    RUN(t_x_mapped_snapshot_source);
+    RUN(t_x_foreign_mapped_backing);
+    RUN(t_x_copy_holds_no_fd);
+    RUN(t_x_sides);
+    RUN(t_x_both_names_ours);
+    RUN(t_x_unobservable_after_rename);
+    RUN(t_x_destination_moved);
+    RUN(t_x_pre_observation);
+    RUN(t_x_pair_lifetime);
+    RUN(t_x_pair_reset);
+    RUN(t_x_canonical_spellings);
+    RUN(t_x_fallback_modes);
+    RUN(t_x_recover_classes);
+    RUN(t_x_status_parser);
     RUN(t_durability);
     FIRED();
     piece_reserve_destroy(reserve);

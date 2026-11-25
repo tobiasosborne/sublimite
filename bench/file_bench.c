@@ -130,7 +130,7 @@ int main(void)
             return EXIT_SUCCESS;
         file_save_outcome out;
         uint64_t t0 = os_now_ns();
-        int rc = file_save_write(path, snap, NULL, &exp, 0, NULL, &out);
+        int rc = file_save_write(path, snap, &exp, 0, NULL, &out);
         times[i] = os_now_ns() - t0;
         if (rc != FILE_OK) { puts("file_bench (note: save failed)"); break; }
         if (i == SAMPLES - 1) report("file_bench save_1MiB", times);

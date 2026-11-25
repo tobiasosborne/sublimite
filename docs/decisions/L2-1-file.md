@@ -55,7 +55,9 @@ is kept: a symlink leaf is replaced, never followed, so it is another path.
   (MF6), plus TRUNCATED; a failed fd stat is a change (N3);
 - for a MAPPED backing only, one closing fault poll.
 
-A copy buffer's old inode backs nothing on screen, so it has no source leg (round 5, review MF-F). Before round 5 the
+A copy buffer's old inode backs nothing on screen, so it has no source leg (round 5, review MF-F). Since v2-4xk (owner
+read O2) that holds by construction: a copy backing closes its original's descriptor at the end of acquisition, so
+`file_check`, Keep and `file_source_validate` have nothing of a copy to observe. There is no mode test. Before round 5 the
 fd leg ran for copies too, and Keep re-baselines only the path. So after any foreign change of a copy's original, a
 chmod, an in-place rewrite or an atomic replace, every later check reported a change that no Keep could dismiss. The
 path leg alone still reports every later change at the path (`t_r5_copy_keep_sticks`, second change).
@@ -115,9 +117,13 @@ reused temp name (MF2, M18).
 1. It refuses a PRESENT expectation that is not a regular file, before any open (MF9).
 2. It creates the temp `RDWR | CREATE | EXCL`. RDWR is new: verification reads the file back.
 3. It writes S and computes the witness.
-4. When S reads a mapped backing, it does one closing poll and validates the retained source in full. A copy
-   buffer's bytes are private memory: its old inode backs nothing the save writes, so that inode's drift cannot
-   corrupt the output, and prepare does not validate it (round 4, review MF-E). The rule, also in file.h: source
+4. When S reads a mapped backing, it validates that backing's own source in full; the validation's poll is the
+   closing poll. Since v2-4xk (owner read O1) the source is the snapshot's own and is not a parameter. Its
+   `piece_backing.ctx` is the `file_source` of the file-created mapping (erratum 5); a mapped backing file did not
+   create is refused (FILE_ERR_STATE) before any temp exists. The former NULL form let a mapped snapshot lose the
+   in-place-rewrite check and write a mixed file with a valid witness (re-check 4, A5c). A changed source is
+   FILE_ERR_SOURCE (review N-C). A copy buffer's bytes are private memory: its old inode backs nothing the save
+   writes, so that inode's drift cannot corrupt the output, and a copy has no source (round 4, review MF-E). The rule, also in file.h: source
    validation protects bytes read from the source; destination expectation protects what is overwritten. Keep and the
    destination's own expectation remain the checks for what may be overwritten.
 5. It applies metadata. The destination opens `READ | NONBLOCK | NOFOLLOW`. When that open is still the expected
@@ -157,7 +163,7 @@ further would break the copy itself: setting a user xattr needs owner write on t
    - the destination names the held fd and the temp name is gone: the rename was performed despite the report, so
      publish continues;
    - anything else is RENAME_UNCERTAIN, and custody goes to HELD with nothing unlinked.
-4. It runs the rebaseline pair (§3), for a MAPPED displaced source only. The verdict, `file_source_pair` OURS or
+4. It runs the rebaseline pair (§3), for a MAPPED displaced source only (only a mapped snapshot has a source, O1). The verdict, `file_source_pair` OURS or
    FOREIGN, stays in custody. A copy's old inode is nobody's evidence: before round 5, a drift of it in the window
    turned our own installed text into CONFLICT (review R4-B, the third MF-E site, §14).
 5. It syncs the directory, a FOREIGN pair included (round 3: the rename happened, so the barrier is owed). On
@@ -586,31 +592,32 @@ are in `build/r2/lane-*.log`.
 - `nice make -j2 check-tsan`: exit 0. 13 threaded suites passed, `file_test: ok (41 tests)`.
 - `nice make -j2 fuzz-smoke`: exit 0. 16 fuzzers replayed their seeds, `file_fuzz` included.
 
-## 14. The enumeration: every source and destination check in file.c (round 5)
+## 14. The enumeration: every source and destination check in file.c (round 5; revised by v2-4xk)
 
 Method: every site in `src/file/file.c` that reads, compares or requires the identity or state of (a) the original
 source, the acquisition's inode, held fd or mapping; or (b) the destination, the name being saved to, recovered or
 watched. Each site gets one mutant (`build/r5/mutate5.py`) that removes or weakens it. The named test must fail; the
-results are in `build/r5/mutations-all.txt`. Lines are file.c as of this round. The rule from the MF-E ruling decides
-the kinds column: a source check applies only where bytes are read from the source, which means MAPPED. COPY appears
-for a source check only at acquisition, where the copy's bytes are read from that fd.
+results are in `build/r5/mutations-all.txt`, and the v2-4xk mutants are in `build/v4xk/mutations-all.txt`. Line
+numbers are file.c as of round 5, with v2-4xk's moved sites noted. The rule from the MF-E ruling decides the kinds
+column: a source check applies only where bytes are read from the source, which means MAPPED. Since v2-4xk (O1, O2)
+that is by construction. A copy has no source in custody and holds no original descriptor after acquisition, so
+COPY appears for a source check only at acquisition, where the copy's bytes are read from that fd.
 
 ### (a) The original source
 
 | # | file.c | Function | Kinds | What it reads or requires | Killed by (mutant) |
 |---|---|---|---|---|---|
 | A1 | 267 | `backing_poll_changed` | mapped (copy: none) | the fault epoch of the registration | `t_r2_check_fault_poll` (A1: never polls) |
-| A2 | 329 | `file_source_validate` | as called: mapped in file (prepare, Keep, validator); public for any | the held fd's stat equals the baseline (ctime included), and the poll is pristine | `t_change_in_place` (A2: fd stat ignored) |
+| A2 | 329 (v2-4xk: 326) | `file_source_validate` | mapped. A copy holds no original and validates by construction (O2). | the held fd's stat equals the baseline (ctime included), and the poll is pristine | `t_change_in_place` (A2: fd stat ignored); `t_x_copy_holds_no_fd` (O2b: a copy observed) |
 | A3 | 340–352 | `file_backing_validate` | mapped (copies have no piece backing) | the supplied backing is this acquisition: ctx, callbacks, bytes and len, fault id; then A2 | `t_r3_null_ctx_validator` (A3a ctx, A3b callbacks, A3c bytes/len, A3d fault id) |
-| A5 | 610–620 | `temp_prepare_core` | mapped (MF-E) | the closing poll and the lent source's full validation after the write | `t_r2_source_validation` (A5a: skipped); `t_r4_copy_after_foreign_save` (A5b: copy validated too). The poll alone (A5c) is equivalent, because A2 polls first; it goes to the backlog by ruling. |
-| A6 | 721–732 | `source_displaced` | mapped (round 5: third site) | the lent source is the displaced inode (identity equals the PRESENT expectation's) | `t_r5_copy_pair` (A6a: copy too); `t_r5_mapped_saveas_pair` (A6b: identity dropped) |
+| A5 | 610–620 (v2-4xk: 530, 539, 625) | `temp_prepare_core` | mapped (MF-E; O1) | the source is the snapshot's own: a file-created mapping, retained, validated in full after the write (its poll is the closing poll); a mapping file did not create is refused | `t_r2_source_validation` (A5a: skipped); `t_x_mapped_snapshot_source` (O1b: skipped); `t_x_foreign_mapped_backing` (O1a: foreign accepted). A5b (copy validated too) can no longer be expressed: a copy has no source. A5c is deleted in v2-4xk: with O1 every mapped snapshot has its source, whose validation polls the same fault id first, so the separate poll was unreachable-distinct. |
+| A6 | 721–732, 823–825 (v2-4xk: 732) | `source_displaced`, and the rename pair's before-stat in `temp_publish_core` | mapped, by construction since v2-4xk (a copy has no source; no mode test) | the custody's source is the displaced inode (identity equals the PRESENT expectation's). A copy is not checked, so a foreign write into the destination during our rename goes unreported (R5-A, a sub-window of N1) | `t_r5_copy_pair` (copy installs VERIFIED); `t_r5_mapped_saveas_pair` (A6b: identity dropped). A6a (the mode gate) is gone: there is no gate left to drop. |
 | A7 | 740–758 | `source_rebaseline` | mapped | the before/after fstat pair of the displaced source; before equals the baseline | `t_r2_validate_after_own_save` (A7a: never stores); `t_r3_source_conflict` (A7b any difference, A7c link count); `t_r3_rebaseline_needs_baseline` (A7d) |
-| A8 | 1908–1927 | `file_check` (source leg) | mapped (round 5: MF-F) | the held fd's stat against the baseline, TRUNCATED, the fault poll | `t_r5_copy_keep_sticks` (A8a: copy too); `t_r2_keep_hardlink` (A8b: ctime); `t_r2_check_fault_poll` (A8c: poll); `t_sigbus` (A8d: TRUNCATED) |
-| A9 | 1955–1960 | `file_resolve_keep` | mapped (copy keeps anything) | the mapped inode still validates in full (A2) | `t_change_in_place` (A9: skipped) |
+| A8 | 1908–1927 (v2-4xk: 1919) | `file_check` (source leg) | mapped, by construction since v2-4xk (the leg runs while the backing holds the original's descriptor; a copy closed its own) | the held fd's stat against the baseline, TRUNCATED, the fault poll | `t_r5_copy_keep_sticks` (copy Keep sticks); `t_r2_keep_hardlink` (A8b: ctime); `t_r2_check_fault_poll` (A8c: poll); `t_sigbus` (A8d: TRUNCATED); `t_x_copy_holds_no_fd` (O2a: a copy keeps its descriptor) |
+| A9 | 1955–1960 (v2-4xk: 1960) | `file_resolve_keep` | mapped; a copy validates by construction (A2) and keeps anything | the backing still validates in full (A2) | `t_change_in_place` (A9: skipped) |
 | A10 | 1224–1234 | `acquire_work` (before the read) | both | the opened fd is a regular file, and the canonical name names the opened inode | `t_r5_open_identity` (A10a identity, A10b kind) |
-| A11 | 1333–1340 | `acquire_work` (after the read or map) | both: a copy's bytes ARE read from this fd | the fd's stat is unchanged by the read, and the name still names the inode | `t_r5_open_identity` (A11a name, A11b fd stat) |
+| A11 | 1333–1340 (v2-4xk: 1333–1355) | `acquire_work` (after the read or map) | both: a copy's bytes ARE read from this fd | the fd's stat is unchanged by the read, and the name still names the inode. Then only a mapped backing keeps the descriptor (O2) | `t_r5_open_identity` (A11a name, A11b fd stat); `t_x_copy_holds_no_fd` (O2a) |
 | A12 | 1192 | `acquire_work` (canonicalization failed) | both | a plain stat of the requested name, for the diagnosis only (NOTREG versus IO) | not pinned. It is reached only when `realpath` fails on an existing non-regular name, which needs a race. Diagnosis only; backlog. |
-| — | `file_save_begin` | `file_save_begin` | both | lends a source reference (`file_source_acquire`); compares nothing | — (a copy's reference is now unused by prepare and publish) |
 
 ### (b) The destination
 
@@ -631,8 +638,10 @@ for a source check only at acquisition, where the copy's bytes are read from tha
 | B13 | 1943–1949 | `file_resolve_keep` | both | the path observed (a failure refuses), and a non-regular path refused | `t_r5_check_unobservable` (B13b: failure adopted); `t_r5_keep_kind` (B13) |
 | B14 | 2034 | `file_watch_poll` | both | an event for our leaf, the directory itself, or an overflow runs `file_check` | `t_watch` (B14: never matches) |
 | B15 | 418–419 | `temp_unlink_own` | both | the temp name still names our fd before any unlink | `t_r3_unlink_identity` (B15) |
+| B16 | 1155 | `read_exact` | both | a premature EOF while reading the source is an error, not a short text | not pinned (re-check 4: missing row) |
+| B17 | 1205, 1213 | `acquire_work` | both | ISDIR at the requested name classified NOTREG | not pinned (re-check 4: missing row) |
 
-59 mutants in all (P, the rows of `build/r5/mutations-all.txt`): 58 killed by their named test, and A5c is equivalent.
+57 mutants in all (P; re-check 4 corrected the count: `mutations-all.txt` plus `mutations.txt` hold 59 rows, two of which are reruns): 56 killed by their named test, and A5c is equivalent.
 Two early "kills" were fixture artefacts: B13b failed on a directory a failed B12b run had left closed, and a FIFO left
 by a failed B13 run hung the suite. Both tests now clear their fixtures first, and those mutants were re-run with
 genuine kills.
@@ -657,3 +666,134 @@ Comment-free, non-blank lines (`build/r2/ncloc.py`):
 |---|---|---|
 | `file.c` | 1,934 | 1,943 |
 | `file.h` | 292 | 292 |
+
+
+## 15. Landing (1.33, advisor's owner read, 2026-11-25)
+- MF-A is open (v2-hy8). MF-C is a stated limit until v2-hy8, which closes it.
+- Re-check 4 corrections are folded in above: the two missing rows B16 and B17, A6 extended to the rename pair's
+  before-stat, the A5c condition, and the mutant count 57.
+- The owner read's findings O1–O6 are recorded in docs/decisions/wave0-plan-amendments.md, "L2-1 landed".
+
+## 16. v2-4xk: the file follow-up (owner read "L2-1 landed")
+
+Input: the advisor's owner-read findings O1, O2 and N-C, and the survivors of re-checks 2, 3 and 4. Red runs on 1.33
+are in `build/v4xk/red-1.33.log`, green runs in `build/v4xk/green-items.log`, and the mutants in
+`build/v4xk/mutations-all.txt` (`build/v4xk/mutate_x.py`). Not in scope: O3 (v2-7ev), O4 (savectl's bead deletes the
+object's async pipeline; it is untouched here), O5 and O6.
+
+### Red and green per item
+
+| Item | Test | Red on 1.33 | Root cause | Green |
+|---|---|---|---|---|
+| O1 hole | `t_x_mapped_snapshot_source` | a mapped snapshot saved through the one-shot form with NULL, after a same-size in-place rewrite (mtime restored), WROTE (`:2703`) | The source was a caller's loan. NULL meant "no source", and for a mapped snapshot the closing poll alone cannot see a rewrite that raises no fault. | FILE_ERR_SOURCE, PRE_RENAME, nothing written. The parameter is gone; the source is the snapshot's own. |
+| O1 refusal | `t_x_foreign_mapped_backing` | a mapped backing the test created (not file) was saved (`:2738`) | Prepare could not tell a backing it can validate from one it cannot. | FILE_ERR_STATE before any temp; nothing created |
+| O2 | `t_x_copy_holds_no_fd` | a copy open held one descriptor; the public validator on a copy reported CHANGED after a foreign save (`:2757`) | The copy kept its original's fd for its whole life, though nothing reads it after acquisition. It pinned the displaced original's blocks and kept a meaningless comparison alive. | 0 descriptors for a copy (1 for a mapped open); the validator gives OK for a copy |
+| N-C | `t_x_sides` | publish 12/12, verify 0/5, prepare 5/5: source and destination indistinguishable (`:2842`) | One error code per verdict class, whatever the side. | FILE_ERR_SOURCE for a source drift (publish, verify, prepare) versus FILE_ERR_CONFLICT / FILE_ERR_CHANGED for the destination. A verify that finds the destination fine but the pair FOREIGN fills its outputs and names the source. |
+
+Also removed: `file_save_begin`'s loan of a copy source, the `save_source` field, and the separate closing poll in
+prepare (A5c: unreachable-distinct after O1, §14). savectl's custody and the async pipeline are otherwise untouched (O4).
+
+### Survivors and new-code mutants
+
+| # | Mutation | Killed by |
+|---|---|---|
+| N1 | the temp naming our fd alone gives NOT_DONE | `t_x_both_names_ours` (both names hard-linked to our fd) |
+| N4 | DONE treated as UNKNOWN | `t_r5_renamed_despite_eio` |
+| N5 | the temp's presence counts without identity | `t_r5_temp_name_swapped` |
+| N7 | an unobservable name gives NOT_DONE | `t_x_unobservable_after_rename` |
+| N10b | the INSTALLED_UNSYNCED retry clears the verdict | `t_x_pair_lifetime` |
+| N11 | the verdict survives `temp_reset` into the next save | `t_x_pair_reset` |
+| N13 | `canonical_dest` only for relative spellings | `t_x_canonical_spellings` (absolute, through a symlinked directory) |
+| N14 | `canonical_dest` follows the leaf too | `t_x_canonical_spellings` (a symlink leaf replaced under FORCE) |
+| N16 | FORCE over another inode gets the new-file mode | `t_x_fallback_modes` |
+| N17 | special bits travel on the unreadable path | `t_x_fallback_modes` |
+| N18 | a vanished destination keeps the old mode | `t_x_fallback_modes` |
+| U2 | umask: no newline terminator required | `t_x_status_parser` (a fixture served as /proc/self/status) |
+| U3 | umask: a missing line gives 0 | `t_x_status_parser` |
+| U5 | umask: an empty value gives 0 | `t_x_status_parser` |
+| U6 | umask: the key matches without its leading newline | `t_x_status_parser` ("Umask:" inside the Name line) |
+| R4b | destination check: presence only | `t_x_destination_moved` (another file at the name) |
+| R4c | destination check: identity only | `t_x_destination_moved` (the same inode appended to) |
+| R4d | destination check: metadata ignored | `t_x_destination_moved` (the same inode chmod'ed) |
+| R5f | FORCE: a failed pre-rename observation proceeds | `t_x_pre_observation` |
+| R5h | an absent pre never proves NOT_DONE | `t_x_pre_observation` (Save As, nothing renamed: only our temp is removed) |
+| R5i | recover classes NOMEM as CHANGED | `t_x_recover_classes` |
+| R5j | recover classes AGAIN and BUSY as CHANGED | `t_x_recover_classes` |
+| O1a | prepare accepts a mapped backing file did not create | `t_x_foreign_mapped_backing` (ASan: the foreign ctx read as a file_source) |
+| O1b | prepare skips the snapshot source's validation | `t_x_mapped_snapshot_source` |
+| O2a | a copy keeps its original's descriptor | `t_x_copy_holds_no_fd` |
+| O2b | the validator observes a copy that holds no original | `t_x_copy_holds_no_fd` |
+| NCa | publish names a FOREIGN pair as a destination conflict | `t_x_sides` |
+| NCb | verify ignores the FOREIGN pair | `t_x_sides` |
+| NCc | prepare names a source drift CHANGED | `t_x_sides` |
+
+29 of 29 were killed (P, the rows of `build/v4xk/mutations-all.txt`). The 15 round-3 survivors are N1, N4, N5, N7,
+N10b, N11, N13, N14, N16, N17, N18, U2, U3, U5 and U6; N4 and N5 had already been pinned in round 5. One early N18
+"kill" was a fixture artefact: a failed N17 run left the file unwritable. The test now clears it first, and N17 and
+N18 were re-run with genuine kills. Two of the round-5 survivors are gone by construction rather than pinned: R5n,
+the copy pair's verdict (a copy has no source now), and A5c, the closing poll (deleted).
+
+### The R5i/j decision: restate the rule in os terms; no os change
+
+The recover rule in file.h now classifies by the os_err the open reports, nothing finer:
+- OS_E_NOENT, OS_E_NOTDIR and OS_E_ACCESS are CHANGED;
+- OS_E_LOOP and OS_E_ISDIR are NOTREG;
+- every other os_err is FILE_ERR_IO and keeps the obligation. That includes OS_E_IO (which carries EMFILE and ENFILE
+  as well as EIO), OS_E_NOMEM, OS_E_AGAIN, OS_E_BUSY and OS_E_NOSPC.
+
+`t_x_recover_classes` pins one errno per class os can report: ENOMEM, EAGAIN, EBUSY and ENOSPC, beside
+`t_r5_recover_transient`'s EIO and EMFILE. EINTR cannot reach file: os restarts an interrupted open.
+
+Why not an os change:
+- file's decision has two outcomes, "the named file is not the candidate" and "try again later". EMFILE and EIO are
+  both the second. A distinct os_err for EMFILE would give file nothing to decide differently.
+- It would widen the L0 enum that every module's `-Wswitch-enum` switch on `os_err` must then handle.
+- The bead that needs to report descriptor exhaustion to the user adds that enumerator with its client.
+
+### Sizes
+
+Changed lines against 1.33 (`diff`, + added / − removed):
+
+| File | Added | Removed |
+|---|---|---|
+| `src/file/file.c` | 84 | 86 |
+| `src/file/file.h` | 56 | 34 |
+| `tests/file_test.c` | 579 | 32 |
+| `fuzz/file_fuzz.c` | 1 | 1 |
+| `bench/file_bench.c` | 1 | 1 |
+
+No os file changed.
+
+Comment-free, non-blank lines (`build/r2/ncloc.py`):
+
+| File | Before (1.33) | After |
+|---|---|---|
+| `file.c` | 1,943 | 1,923 |
+| `file.h` | 292 | 291 |
+| `os.h` | 244 | 244 |
+| `os_posix.c` | 1,332 | 1,332 |
+
+### Outside scope (report only)
+
+- **The worktree's Makefile predates v2.** v2's Makefile lists two more `os_waitset_*` symbols in an exports line, from
+  another bead's landing. This bead did not touch it; the coordinator's rebase will reconcile.
+- **Not done here, by ruling:**
+  - the async save pipeline (O4: savectl's bead deletes it);
+  - O3, the destination fstat pair (v2-7ev);
+  - O5, opacity;
+  - O6, the 64 KiB stack buffer.
+- **The bench was taken under load from other work on the box** (open_copy p50 4.7 ms, save p50 12.0 ms). These are
+  tracked numbers, not gates.
+
+### Lanes
+
+Stamp: BAT0 = Charging. load1 was 25.73 at the check start and 24.52 at the tsan start (M); other work was running on
+the box. 2026-11-25 21:34–21:43 CET. Logs are in `build/v4xk/lane-*.log`.
+- `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189`: exit 0, `check: ok`.
+  - check-layers: 6 isolated layer links;
+  - check-san: 33 binaries, `file_test: ok (85 tests)`, `os_test: ok`;
+  - check-law2: 9 release suites, `law2_file_test: ok`;
+  - contract: PASS 64.
+- `nice make -j2 check-tsan`: exit 0. 13 threaded suites passed, `file_test: ok (85 tests)`.
+- `nice make -j2 fuzz-smoke`: exit 0. 16 fuzzers replayed their seeds.
+
