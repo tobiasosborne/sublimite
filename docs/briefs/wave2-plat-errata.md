@@ -20,7 +20,7 @@ at any value.
 
 PL-1. READ AND CLAIM RESULTS ARE COMPLETIONS, NOT ORDERED EVENTS.
       The text sends a read result through the ordered FIFO, then adds an exception so the waiting app head can take it
-      early: plat_take_reply, a reply fd bound to a head id, an  receipt left in sequence, and a race
+      early: plat_take_reply, a reply fd bound to a head id, an `already_taken` receipt left in sequence, and a race
       between the two paths ("if ordinary poll won ... the direct lookup is stale"). But the position of a paste in the
       edit order is fixed by the Ctrl+V key that issued the read, not by when the bytes arrive; the same holds for a
       claim result.
@@ -30,7 +30,7 @@ PL-1. READ AND CLAIM RESULTS ARE COMPLETIONS, NOT ORDERED EVENTS.
         and one call returning the next completed transfer by id, routed by the app into the destination it reserved
         when it issued the request;
       - DROP and OWNER_LOST stay ordered events, because they are things that happen to the user.
-      That deletes , the head-id binding of the fd, the dual path, and two of the nine terminal cells'
+      That deletes `already_taken`, the head-id binding of the fd, the dual path, and two of the nine terminal cells'
       special handling.
 PL-2. THE ALLOCATION GUARD MUST NOT SHAPE PRODUCTION THREADING.
       The text requires native-library work on other threads to complete or yield "before the guarded step starts", by
