@@ -298,7 +298,7 @@ static bool failed(const undo_log *u)
     return u->phase == UNDO_FAILED || u->phase == UNDO_REPLAY_FAILED;
 }
 
-size_t undo_maintain(undo_log *u, size_t record_budget)
+static size_t maintain_retired(undo_log *u, size_t record_budget)
 {
     ASSERT(u && !failed(u));
     if (u->phase != UNDO_IDLE) return 0;
@@ -316,6 +316,11 @@ size_t undo_maintain(undo_log *u, size_t record_budget)
         slot_put(u, g);
     }
     return count;
+}
+
+size_t undo_maintain(undo_log *u, size_t record_budget)
+{
+    return maintain_retired(u, record_budget);
 }
 
 static void clear_redo(undo_log *u)
@@ -402,7 +407,7 @@ void undo_clear(undo_log *u)
     u->head = u->tail = u->applied = NULL;
     u->groups = u->applied_groups = u->records = u->applied_records = 0;
     u->bytes = u->applied_bytes = 0;
-    (void)undo_maintain(u, SIZE_MAX);
+    (void)maintain_retired(u, SIZE_MAX);
 }
 
 void undo_destroy(undo_log *u)
@@ -418,7 +423,7 @@ void undo_set_cap(undo_log *u, size_t cap_bytes)
     ASSERT(u && cap_bytes != 0 && u->phase == UNDO_IDLE);
     u->cap = cap_bytes;
     trim(u);
-    (void)undo_maintain(u, UNDO_RECLAIM_RECORDS);
+    (void)maintain_retired(u, UNDO_RECLAIM_RECORDS);
 }
 
 undo_history undo_get_history(const undo_log *u)
@@ -437,7 +442,7 @@ undo_stats undo_get_stats(const undo_log *u)
 undo_err undo_begin(undo_log *u, const undo_state *before, bool join)
 {
     ASSERT(u && before && u->phase == UNDO_IDLE);
-    (void)undo_maintain(u, UNDO_RECLAIM_RECORDS);
+    (void)maintain_retired(u, UNDO_RECLAIM_RECORDS);
     undo_err e = piece_result(piece_checkpoint_begin(u->tree));
     if (e != UNDO_OK) return e;
     undo_pending *p = &u->pending;

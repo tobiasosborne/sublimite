@@ -175,13 +175,13 @@ endif
 
 $(B)/rel/tests/%: $(B)/rel/tests/%.o $(call libs_desc,rel)
 	@mkdir -p $(@D)
-	$(CC_RELEASE) $(REL_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,rel) $(LDLIBS) -o $@
+	$(CC_RELEASE) $(REL_F) -pthread $< $(filter %_test_hooks.o %/edit_journal.o,$^) $(LDFLAGS_$*) $(call libs_desc,rel) $(LDLIBS) -o $@
 $(B)/san/tests/%: $(B)/san/tests/%.o $(call libs_desc,san)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(SAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,san) $(LDLIBS) -o $@
+	$(CC_SAN) $(SAN_F) -pthread $< $(filter %_test_hooks.o %/edit_journal.o,$^) $(LDFLAGS_$*) $(call libs_desc,san) $(LDLIBS) -o $@
 $(B)/tsan/tests/%: $(B)/tsan/tests/%.o $(call libs_desc,tsan)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(TSAN_F) -pthread $< $(filter %_test_hooks.o,$^) $(LDFLAGS_$*) $(call libs_desc,tsan) $(LDLIBS) -o $@
+	$(CC_SAN) $(TSAN_F) -pthread $< $(filter %_test_hooks.o %/edit_journal.o,$^) $(LDFLAGS_$*) $(call libs_desc,tsan) $(LDLIBS) -o $@
 # Work initialization faults are injected at the OS boundary in this suite.
 WORK_TEST_WRAPS := os_wake_init os_mutex_init os_mutex_destroy os_mutex_lock \
                    os_cond_init os_cond_destroy os_thread_start os_thread_join
@@ -233,6 +233,15 @@ $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/bench
 # it shares piece_harness.h, so it links the piece hooks object too.
 LDFLAGS_undo_test := -Wl,--wrap=os_vm_reserve,--wrap=os_vm_release,--wrap=os_fault_poll,--wrap=piece_replace_spans,--wrap=piece_replace,--wrap=piece_span_nl_join
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/undo_test: $(B)/$(c)/src/piece/piece_test_hooks.o))
+# EDIT-CORE links the flat runtime only into its suites and benchmark.
+EDIT_TEST_WRAPS := os_vm_reserve piece_snapshot_take piece_reclaim piece_lines_resolve piece_replenish undo_maintain
+LDFLAGS_edit_test := $(foreach s,$(EDIT_TEST_WRAPS),-Wl,--wrap=$(s))
+$(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/edit_test: $(B)/$(c)/tests/support/edit_journal.o $(B)/$(c)/src/piece/piece_test_hooks.o $(B)/$(c)/src/edit/edit_test_hooks.o))
+$(B)/rel/tests/law2_edit_test: $(B)/rel/tests/support/edit_journal.o
+$(B)/fuzz/edit_fuzz: $(B)/fuzz/tests/support/edit_journal.o
+$(B)/rel/bench/edit_bench: $(B)/rel/bench/edit_bench.o $(B)/rel/tests/support/edit_journal.o $(call libs_of,rel,L2 L1 L0)
+	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@
+
 # Local stream and wait-set faults are injected beneath os (v2-0fv.13).
 OS_ENDPOINT_TEST_WRAPS := recv send accept4 connect bind epoll_wait timerfd_settime
 $(foreach c,rel san tsan,$(B)/$(c)/tests/os_endpoint_test): private LDLIBS += $(foreach s,$(OS_ENDPOINT_TEST_WRAPS),-Wl,--wrap=$(s))
@@ -246,7 +255,7 @@ OS_WATCH_FUZZ_WRAPS := read inotify_add_watch inotify_rm_watch
 $(B)/fuzz/os_watch_fuzz: private LDLIBS += $(foreach s,$(OS_WATCH_FUZZ_WRAPS),-Wl,--wrap=$(s))
 $(B)/fuzz/%_fuzz: $(B)/fuzz/fuzz/%_fuzz.o $(call libs_desc,fuzz)
 	@mkdir -p $(@D)
-	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -pthread $< $(filter %_test_hooks.o,$^) $(call libs_desc,fuzz) $(LDLIBS) -o $@
+	$(CC_SAN) $(CLANG_GCC) -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -pthread $< $(filter %_test_hooks.o %/edit_journal.o,$^) $(call libs_desc,fuzz) $(LDLIBS) -o $@
 
 $(B)/rel/bench/base_bench: $(B)/rel/bench/base_bench.o $(call lib_of,rel,L0)
 	$(CC_RELEASE) $(REL_F) -pthread $^ $(LDLIBS) -o $@

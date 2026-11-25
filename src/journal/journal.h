@@ -933,4 +933,344 @@ journal_codec_err journal_plan_read(const uint8_t *image, size_t length,
 size_t journal_plan_workspace_size(size_t records, size_t buffers,
                                    size_t keys, size_t tokens);
 
+#include "os/os.h"
+#include "piece/piece.h"
+#include "work/work.h"
+
+typedef struct journal journal;
+typedef struct journal_command journal_command;
+typedef struct journal_cutoff journal_cutoff;
+typedef struct journal_request journal_request;
+
+/* All calls belong to the UI thread. A journal is the writer for one
+ * owned, named image. Recover opens or creates that image under the
+ * session's ownership. The shared pool and reserve outlive the writer.
+ * Opening schedules validation/replay before admission. The UI routes
+ * messages through receive and drives progress through service. Closing
+ * succeeds only after physical retirement and release of all requests,
+ * cutoffs and commands. A command owns a producer's reservations from
+ * begin through final or abort. A request identifies an admitted effect
+ * through completion and retirement. Diagnostics preserve the native OS failure.
+ *
+ * OK means this call succeeded. WAIT means service or a dependency must
+ * progress. SUPERSEDED identifies a retired checkpoint request. LIMIT
+ * covers checked capacity/sequence exhaustion, NOMEM a refused storage
+ * claim, SOURCE failed validation, DAMAGED preserved recovery evidence,
+ * and IO a storage failure. Accepted asynchronous operations return OK
+ * and an owned request. Inspect its result to distinguish completion.
+ * A refused admission transfers no ownership. Input views are borrowed
+ * for the call. An accepted job retains immutable inputs until retired.
+ */
+typedef enum journal_err {
+    JOURNAL_OK, JOURNAL_WAIT, JOURNAL_SUPERSEDED, JOURNAL_LIMIT,
+    JOURNAL_NOMEM, JOURNAL_SOURCE, JOURNAL_DAMAGED, JOURNAL_IO
+} journal_err;
+/* An image epoch identifies this writer's incarnation of a named image.
+ * A position pairs its last non-PAD sequence with the absolute file end
+ * after the record or sealed prefix. Compare coverage in the same epoch. */
+typedef struct journal_position {
+    uint64_t image_epoch, sequence, file_end;
+} journal_position;
+
+/* Recover returns the writer and an owned request on admission. Service
+ * finishes validation and materialization before exposing any items.
+ * Poll the recovery request until its status leaves WAIT. OK supplies
+ * the recovered session. DAMAGED or SOURCE also yields the usable prefix
+ * and diagnostic evidence. Other terminal errors yield an empty cursor.
+ * The session calls recovery_next on the completed recovery request.
+ * Each true result consumes one item. False means exhaustion and leaves
+ * the output untouched. Release disposes of any unclaimed trees.
+ *
+ * BUFFER transfers the owner's unlogged tree (NULL for unresolved text).
+ * The current id identifies its recovered text. Assign a fresh nonzero id
+ * past the retained identities if the suffix has no recorded id. Adopt a
+ * saved id only for a verified binding. Zero denotes unknown. Deliver the
+ * buffers before the controls that refer to them. CONTROL supplies each
+ * selected metadata or open-transaction frame in effective order.
+ * EVIDENCE supplies the preserved file name, immutable image bytes and
+ * diagnosis for damage or unresolved text, including closed-kept drafts.
+ * Names, image bytes and control payloads borrow the recovery request
+ * through release. The owner can copy them before then. Journal calls
+ * no consumer code while the session drains these items.
+ */
+typedef enum journal_recovery_kind {
+    JOURNAL_BUFFER, JOURNAL_CONTROL, JOURNAL_EVIDENCE
+} journal_recovery_kind;
+typedef struct journal_recovery_item {
+    journal_recovery_kind kind;
+    union {
+        struct { uint64_t owner, current_id, saved_id; piece_tree *tree; } buffer;
+        journal_frame control;
+        struct { journal_err reason; const char *name;
+                 const uint8_t *image; size_t size; } evidence;
+    } value;
+} journal_recovery_item;
+journal_err journal_recover(journal **out, const char *path, work_pool *pool,
+                            piece_reserve *reserve, journal_request **recovery);
+bool journal_recovery_next(journal_request *recovery, journal_recovery_item *out);
+/* Close returns WAIT and preserves the writer while any request lives,
+ * including a completed request held by its caller or an internally
+ * retained request awaiting physical retirement. It also waits for
+ * commands and cutoffs. Success consumes the writer. */
+journal_err journal_close(journal *j);
+
+/* A record argument supplies the known type, owner and encoded payload.
+ * The writer assigns sequence, offset and CRC only when it issues the
+ * record. append submits one independent control (including GENERATION
+ * and SAVE phases) and reports its publication through the returned
+ * request. SAVE identifies its reservation by owner/token and the
+ * installed declaration by captured new key. Their reserved close
+ * credits follow them across retries. A short, zero or uncertain write is an admitted request with
+ * retained bytes. Never submit the same logical effect as a fresh append.
+ */
+typedef struct journal_record {
+    journal_record_type type;
+    uint64_t owner;
+    const uint8_t *payload;
+    size_t payload_len;
+} journal_record;
+journal_err journal_append(journal *j, const journal_record *record,
+                           journal_request **out);
+
+/* The journal owns the literal slicing policy and the declaration/restore
+ * policy. Budget one wire page of bytes per literal write so a fair
+ * single-record service step submits at most one page for that producer
+ * (G, writer work per append: a waiting key waits for at most one
+ * page-sized write, and a torn frame is confined to one page's worth).
+ * Only the subtraction is physics. A full slice holds 4056 bytes
+ * (P, 4096 bytes per wire page less the 32-byte frame header and the
+ * 8-byte encoded destination). Short final slices use their actual size.
+ * This encoder policy applies to all journals. Readers use the wire
+ * maximum when decoding. range_allowed tests active, declared, unembargoed
+ * eligibility on this image. Source provenance and byte verification are
+ * additional caller obligations. A save capture must settle or abort and
+ * restage any provisional plan depending on its displaced generation.
+ */
+#define JOURNAL_LITERAL_LIMIT (JOURNAL_PAGE_BYTES - JOURNAL_HEADER_BYTES - 8u)
+bool journal_range_allowed(const journal *j, uint64_t generation);
+
+/* A command claim counts the exact typed members between its markers,
+ * their total framed bytes and the largest framed member. These are
+ * separate quantities: sequence credits, byte credits and scratch size.
+ * For a singleton all three are zero and final_type names its standalone
+ * text type. For a group final_type is the empty COMMAND_COMMIT. The
+ * final payload length funds the singleton or is zero for the marker.
+ * Begin reserves the final frame, one reusable record window, request,
+ * pins against rotation, and funds all bytes and sequences including both
+ * markers before issuing BEGIN. It returns the command and admits the
+ * claim atomically. A singleton writes nothing at begin. Its exact wire
+ * charge is its header plus final payload. A group's charge is the sum
+ * of framed member bytes plus both marker headers. Its sequence charge
+ * is member count plus both markers. The window is the maximum of one
+ * marker, the largest member and the final frame. Neither the typing
+ * path nor final retries allocate via libc, block on a worker, or sync.
+ * A possibly written BEGIN is admitted with a suspended
+ * writer. Other producers cannot spend these credits. They can append at
+ * intervening positions. No future physical offsets are booked.
+ */
+typedef struct journal_member_claim {
+    uint64_t count, framed_bytes;
+    size_t largest_frame;
+} journal_member_claim;
+journal_err journal_command_begin(journal *j, uint64_t owner,
+                                  journal_member_claim members,
+                                  journal_record_type final_type,
+                                  size_t final_payload_len,
+                                  journal_command **out);
+/* payload lends the payload area of the reserved record window. Fill it
+ * directly with encoded fields and validated literal bytes. Its writable
+ * size is the largest funded frame minus the header. Borrow it only
+ * while ready for a new record. payload returns NULL while a held frame
+ * occupies the window. The caller waits before filling the next record.
+ * For a group, member submits the filled window with the command's owner.
+ * OK consumes exactly one member and ends the loan, whether the frame
+ * was fully written or held for repair. Advance the caller's cursor on
+ * OK. WAIT consumes nothing and preserves the caller's loan and bytes.
+ * Retry that same member from the filled window when the writer can
+ * proceed. Reconciliation retries only frames already owned by journal.
+ * The owner can abort before finalization, releasing
+ * unused claims. The runtime retains storage for any held frame until
+ * repair or physical retirement, even after command abort.
+ */
+uint8_t *journal_command_payload(journal_command *command);
+journal_err journal_command_member(journal_command *command,
+                                   journal_record_type type,
+                                   size_t length);
+void journal_command_abort(journal_command *command);
+/* Once the singleton is filled or all members consumed, the caller reads
+ * journal_state. Only HEALTHY permits the RAM commit. In particular a
+ * consumed member held for repair still blocks commit. Health check,
+ * RAM commit and final share one UI dispatch without intervening writer
+ * actions. Under A15 final asserts that the grouped claim was consumed
+ * exactly or that the caller filled a well-formed singleton payload of
+ * the funded type and length. Only caller encoder or accounting bugs
+ * can violate these preconditions. Source and input errors must have
+ * been handled while the caller could still roll back.
+ * The caller closes its own provisional mutation after every preceding
+ * record has been accepted and before calling final. A conforming final
+ * is infallibly admitted. It consumes the command and returns the
+ * reserved request even on a failed physical write. Only framing from
+ * writer-owned scalars and one single-attempt write remain. There is
+ * no allocation, source load, submission or further member to emit.
+ * A final already issued survives reconciliation
+ * under its original request. Command publication invokes no caller hook.
+ */
+journal_request *journal_command_final(journal_command *command);
+
+/* A cutoff pins the current image and the saver's published boundary
+ * until its transaction has definitively settled. Capture returns that
+ * position, establishes the permanent by-value restore policy for the
+ * displaced key (zero means no displacement), and reserves close credits
+ * before a temp can start. It returns the unique token and fresh installed
+ * generation key from the journal's lineage allocators and the saver's
+ * prior origin key from its index. The destination byte length determines the
+ * path-dependent SAVE closing charge. Budget includes legal terminal,
+ * prerequisite declaration and seals; reserve independent checkpoints at
+ * their starts. Issue VALUE_ONLY before any durable dependency, and keep
+ * inherited keys of uncertain policy value-only on recovery. Release
+ * after definite pre-prepare failure or durable settlement, including
+ * a conflict checkpoint following an already complete FINISHED. On
+ * refusal leave both outputs unchanged and install no new embargo.
+ */
+typedef struct journal_capture_info {
+    journal_position position;
+    uint64_t prior_key, token, new_key;
+} journal_capture_info;
+journal_err journal_capture(journal *j, uint64_t owner, uint64_t displaced_key,
+                            size_t destination_bytes, journal_capture_info *info,
+                            journal_cutoff **out);
+void journal_cutoff_release(journal_cutoff *cutoff);
+
+/* A checkpoint rebuilds published text by value. The goal supplies the
+ * required minimum covered position (all zero when any independent
+ * boundary suffices) and current/saved content ids of the offered
+ * published snapshot (zero saved id means unknown). A nonempty minimum
+ * belongs to this image and owner. The writer derives the descriptor's
+ * actual coverage from the owner's last complete boundary and its length
+ * from the snapshot. It captures text, ids and optional TARGET together
+ * when BEGIN is accepted. The snapshot pins its backing. For mapped
+ * text the owner supplies validate and a context that outlives the
+ * request. Validate that backing and poll its fault registration after
+ * dependent reads and before checkpoint COMMIT. Failure leaves the slot
+ * uncommitted and reports SOURCE. Independently owned literal text may
+ * supply NULL. Supersession revokes write authority immediately. Keep
+ * the validating owner's reference and context until the request reports
+ * terminal status after its last physical delivery has retired. Owner
+ * close refuses while its validating request lives, including during
+ * supersession. A joined request continues using the original validator.
+ * The request copies borrowed metadata. Its owner must submit only a
+ * published snapshot with this coverage, ids and binding. A newer
+ * coverage satisfies an older requested minimum when a complete
+ * independent suffix and the required binding/saved decision still hold.
+ * Reuse a satisfying producer and give each caller an owned reference.
+ * Otherwise fund a new instance and emit fresh BEGIN, retiring stale
+ * deliveries by producer identity. Journal compares the binding and
+ * saved-decision epochs at completion. The session submits a replacement
+ * request when an external observation invalidates an in-flight binding
+ * decision before it appears in the journal. Revoke stale delivery
+ * authority on that notification even if funding the replacement fails.
+ * The old bytes then form an abandoned slot. A refused request leaves
+ * a still-valid producer usable for its original callers. Return the
+ * admission failure to the new caller without queuing its request.
+ * A physical gap must be reconciled before issuing another BEGIN.
+ */
+typedef struct journal_checkpoint_goal {
+    journal_position minimum;
+    uint64_t current_id, saved_id;
+} journal_checkpoint_goal;
+journal_err journal_checkpoint_request(journal *j, uint64_t owner,
+                                      piece_snapshot *text,
+                                      journal_checkpoint_goal goal,
+                                      const journal_target *target,
+                                      piece_validate_fn validate, void *ctx,
+                                      journal_request **out);
+
+/* A receipt is for one sealed image and the absolute end actually
+ * submitted on its held file descriptor. sync requests durability at
+ * least through a position returned by the writer. Seal the current
+ * prefix using canonical PAD if needed. A worker syncs only the pinned
+ * inode; the UI credits at most the submitted watermark, even when later
+ * appends share its fd. Journal keeps the receipt and descriptor pin
+ * private. It checks the receipt's epoch, inode and submitted end against
+ * the outstanding barrier before granting durability. Failed barriers keep the previous durable watermark.
+ * New-name durability additionally requires the journal-parent barrier.
+ */
+journal_err journal_sync(journal *j, journal_position through,
+                         journal_request **out);
+
+/* A request carries its producer identity across reuse of worker slots.
+ * ABSENT proves the effect did not reach the image, POSSIBLE requires
+ * reconciliation, VISIBLE identifies a complete accepted final, and
+ * DURABLE requires the matching barrier. In-flight requests report WAIT.
+ * The position is meaningful at VISIBLE or DURABLE. A DURABLE sync
+ * reports its credited position. The caller checks coverage of its
+ * required end in the same epoch. A recovery request conveys its read
+ * outcome through status and items. Its publication field is unused.
+ * native_error retains the OS diagnostic. The result call
+ * copies this observation without driving I/O. Release drops the
+ * caller's reference. Physical delivery owns a reference until retirement.
+ */
+typedef enum journal_publication {
+    JOURNAL_ABSENT_EFFECT, JOURNAL_POSSIBLE, JOURNAL_VISIBLE, JOURNAL_DURABLE
+} journal_publication;
+typedef struct journal_result {
+    journal_err status;
+    journal_publication publication;
+    journal_position position;
+    int native_error;
+} journal_result;
+journal_result journal_request_result(const journal_request *request);
+void journal_request_release(journal_request *request);
+
+/* A gap is the held frame at its intended file offset on the pinned
+ * inode. No following record can pass it. state reports the current
+ * writer condition, including a pending parent barrier or writeback
+ * loss. reconcile drives inspection and UI-owned retry of that exact
+ * frame; WAIT retains ownership. On OK the held append is accounted
+ * exactly once. An aborted producer's physically completed member
+ * stays inert. Callers use the original request or their own consumed
+ * member cursor after repair. After loss
+ * suspend ACKs, retain all evidence and require a fresh complete image
+ * and its barriers before restoring service. state projects the most
+ * urgent condition: writeback loss, uncertain name, incomplete frame,
+ * recovery in progress, pending parent barrier, then healthy. Clearing
+ * one obligation reveals any remaining obligation. A stale completion
+ * never clears a newer failure.
+ */
+typedef enum journal_condition {
+    JOURNAL_RECOVERING, JOURNAL_HEALTHY, JOURNAL_GAP, JOURNAL_WRITEBACK_LOST,
+    JOURNAL_NAME_UNCERTAIN, JOURNAL_PARENT_PENDING
+} journal_condition;
+journal_condition journal_state(const journal *j);
+journal_err journal_reconcile(journal *j);
+
+/* The shared dispatcher routes immutable messages here, including stale
+ * ones requiring retirement. Each turn serves input first, then advances
+ * at least one ready record of each producer class in rotation, rotating
+ * among ready instances, then ready barriers. This is a progress rule
+ * (G, fair service), conditional on storage and workers progressing.
+ * receive returns true for a message owned by this journal, including a
+ * stale delivery it retires. service runs the journal's share of that turn. Bounded mailbox credits
+ * protect held payloads through physical retirement. Only the UI issues
+ * single-attempt record writes or repairs/truncates the named inode.
+ */
+bool journal_receive(journal *j, const work_msg *msg);
+void journal_service(journal *j);
+
+/* rotate requests ordinary compaction. Defer while a cutoff, save token,
+ * command, checkpoint or old-inode durability promise is live. Build and
+ * sync a private replay-equivalent image from the indexed session. At
+ * switch compare source inode/epoch, complete physical watermark and
+ * membership/policy versions with the writer's current values. A miss
+ * discards or rebuilds the candidate. On exact match the UI alone renames
+ * and switches routing in one serialized action. Require journal-parent
+ * sync before crediting new durability. On admission return the owned
+ * rotation request. VISIBLE identifies the switched image and DURABLE
+ * credits its sealed position after the parent barrier. WAIT at admission
+ * leaves the compaction with the session to retry. Reconciliation of writeback loss
+ * while ACKs are suspended is exceptional recovery. A routine save,
+ * cancellation, Keep or conflict never requests an image switch.
+ */
+journal_err journal_rotate(journal *j, journal_request **out);
+
 #endif
