@@ -118,10 +118,15 @@ typedef enum render_notice_kind {
     RENDER_NOTICE_DISCARDED, RENDER_NOTICE_LOST
 } render_notice_kind;
 
-/* Platform/worker adapter authenticates cookie, surface/window, epoch/frame
- * and clock. A LOST with frame zero is a device/epoch disconnect from the live
- * owner, including between flights. All other evidence names the live flight.
- * Early evidence is private until issue. Null timings are synthetic. */
+/* Route only authenticated epoch/frame, native cookie and clock evidence.
+ * ISSUED and DEVICE_DONE require nonzero ns in MONOTONIC (native) or
+ * SYNTHETIC (headless), matching the driver's caps. Use the same domains
+ * for timed PRESENTED. Encode an unconvertible display time as PRESENTED
+ * with clock UNTIMED and ns exactly zero. For DISCARDED and LOST send
+ * UNTIMED and zero. Their timestamp fields are ignored. A LOST with frame
+ * zero identifies the live epoch, including between flights. Other notices
+ * identify the live flight. Early device/display evidence stays private
+ * until issue. A wake or Wayland frame callback supplies no evidence. */
 typedef struct render_notice {
     render_notice_kind kind;
     render_frame_id id;
@@ -129,8 +134,16 @@ typedef struct render_notice {
     uint64_t ns;
 } render_notice;
 
+/* Optional typed driver mailbox. Only UI calls take, which copies one
+ * notice on true, or returns false without evidence. Valid through close. */
+typedef struct render_feedback {
+    void *ctx;
+    bool (*take)(void *, render_notice *);
+} render_feedback;
+
 typedef struct render_wake {
     const os_wake *wake;
+    render_feedback feedback;
     bool runnable, waiting, recovery, delivery;
 } render_wake;
 typedef struct render_counters {
@@ -197,11 +210,14 @@ render_rc render_submit(render *, const render_offer *, const render_source *,
  * acknowledge physical retirement before reuse. No time is synthesized on loss.
  * Frame numbers increase across epochs and exhaustion retires the service. */
 render_rc render_event(render *, const render_notice *);
-/* WAIT uses the setup wake. Retry open, submit, bind or close as applicable.
+/* WAIT uses the setup UI wake. Drain that wake before taking all available
+ * feedback and route each typed notice through render_event on UI. Drivers
+ * without a feedback mailbox route notices through their native/work adapter.
+ * Recheck after each wake, retrying open, submit, bind or close as applicable.
  * Delivery/recovery at idle requests an input-free repair. */
 bool render_pending(const render *, render_wake *);
 /* Counts describe the last accepted frame and current delivery directory.
- * Rejected/rejection describe the most recent refusal independently.
+ * Rejected/rejection describe the most recent submit refusal independently.
  * stats(NULL) is CLOSED. */
 void render_stats(const render *, render_counters *);
 /* Retry MORE/WAIT until the owner is physically quiescent. Final OK releases

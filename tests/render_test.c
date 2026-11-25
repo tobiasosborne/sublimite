@@ -2,11 +2,12 @@
 #include "render/render_driver.h"
 #include <stdio.h>
 
-#define CHECK(c) do { if (!(c)) { fprintf(stderr, "render_test:%d: %s\n", __LINE__, #c); return 1; } } while (0)
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "render_test:%s:%d: %s\n", __func__, __LINE__, #c); return 1; } } while (0)
 
 static int start(render_fixture *f)
 {
     rf_init(f);
+    f->setup.driver = render_test_manual_null();
     /* One page per live fixture row is ample for the two tiny scene copies,
      * atlas, packet, metadata and setup. */
     CHECK(base_arena_init(&f->arena, (RF_ROWS + 1u) * os_page_size()) == 0);
@@ -52,7 +53,7 @@ static render_rc finish_notices(render_fixture *f, render_test_owner owner)
 
 typedef struct owner_job {
     render_test_owner owner;
-    const render_packet *packet;
+    bool had_sheet;
     render_notice issue;
     render_rc rc;
 } owner_job;
@@ -60,8 +61,9 @@ typedef struct owner_job {
 static void owner_consume(void *arg)
 {
     owner_job *job = arg;
-    job->packet = rf_take(job->owner);
-    job->rc = rf_dispatch(job->owner, job->packet);
+    const render_packet *packet = rf_take(job->owner);
+    job->had_sheet = packet && packet->sheet;
+    job->rc = rf_dispatch(job->owner, packet);
     if (job->rc == RENDER_OK)
         job->rc = job->owner.driver.ops->poll(job->owner.state, &job->issue);
 }
@@ -96,7 +98,7 @@ static int lifecycle(void)
     owner_job job = {.owner = render_test_owner_get(f.r)};
     os_thread thread;
     CHECK(os_thread_start(&thread, owner_consume, &job) == OS_OK);
-    CHECK(os_thread_join(&thread) == OS_OK && job.rc == RENDER_OK && job.packet && job.packet->sheet);
+    CHECK(os_thread_join(&thread) == OS_OK && job.rc == RENDER_OK && job.had_sheet);
     CHECK(job.issue.kind == RENDER_NOTICE_ISSUED && render_event(f.r, &job.issue) == RENDER_OK);
     CHECK(finish_notices(&f, job.owner) == RENDER_OK);
     render_stats(f.r, &c);
@@ -109,6 +111,8 @@ static int lifecycle(void)
     CHECK(rf_dispatch(job.owner, rf_take(job.owner)) == RENDER_OK);
     CHECK(job.owner.driver.ops->poll(job.owner.state, &job.issue) == RENDER_OK);
     CHECK(render_event(f.r, &job.issue) == RENDER_OK);
+    /* An unconvertible presentation uses UNTIMED and exactly zero ns. */
+    CHECK(notice(&f, id, RENDER_NOTICE_PRESENTED, RENDER_UNTIMED, 1) == RENDER_INVALID);
     CHECK(notice(&f, id, RENDER_NOTICE_PRESENTED, RENDER_UNTIMED, 0) == RENDER_OK);
     render_stats(f.r, &c);
     CHECK(c.state == RENDER_ISSUED && c.presentation == RENDER_PRESENTED && c.device == RENDER_WAIT_FENCE);
@@ -331,6 +335,7 @@ typedef struct delayed {
     const render_driver_ops *inner;
     void *state;
     bool hold;
+    unsigned polls;
 } delayed;
 
 static render_rc delayed_open(void **out, base_arena *arena, const render_setup *s, render_driver_port *port)
@@ -339,7 +344,7 @@ static render_rc delayed_open(void **out, base_arena *arena, const render_setup 
     if (d) return d->inner->open(&d->state, arena, s, port);
     d = base_arena_alloc(arena, sizeof *d, _Alignof(delayed));
     if (!d) return RENDER_CAPACITY;
-    *d = (delayed){.inner = render_driver_null().ops};
+    *d = (delayed){.inner = render_test_manual_null().ops};
     *out = d;
     return RENDER_WAIT;
 }
@@ -356,6 +361,7 @@ static render_rc delayed_consume(void *state, const render_packet *p)
 static render_rc delayed_poll(void *state, render_notice *n)
 {
     delayed *d = state;
+    ++d->polls;
     return d->inner->poll(d->state, n);
 }
 static render_rc delayed_quiesce(void *state, render_quiescence mode)
@@ -572,8 +578,170 @@ static int verify_identity_policy(void)
     return stop(&f);
 }
 
+static int backend_poll_stays_off_submit(void)
+{
+    render_fixture f;
+    rf_init(&f);
+    render_driver_ops ops = *f.setup.driver.ops;
+    ops.open = delayed_open;
+    ops.bind = delayed_bind;
+    ops.consume = delayed_consume;
+    ops.poll = delayed_poll;
+    ops.quiesce = delayed_quiesce;
+    ops.close = delayed_close;
+    f.setup.driver = (render_driver){&ops};
+    CHECK(base_arena_init(&f.arena, (RF_ROWS + 1u) * os_page_size()) == 0);
+    CHECK(os_wake_init(&f.wake) == OS_OK);
+    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_WAIT);
+    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_OK);
+    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
+    delayed *d = render_test_owner_get(f.r).state;
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    CHECK(d->polls == 0);
+    CHECK(rf_finish(&f) == RENDER_OK && d->polls > 0);
+    return stop(&f);
+}
+
+static int wide_right_reserved_refuses(void)
+{
+    render_fixture f;
+    CHECK(start(&f) == 0);
+    rf_wide(&f, 0, (render_image_id){RENDER_NO_SLOT, 0});
+    f.cells[0][1].reserved = 1;
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id = {0};
+    render_need need;
+    CHECK(rf_submit(&f, &id, &need) == RENDER_INVALID && need.field == RENDER_FIELD_CELL && !id.frame);
+    return stop(&f);
+}
+
+static int input_bearing_submit_skips_replay(void)
+{
+    render_fixture f;
+    CHECK(start(&f) == 0);
+    f.states[0] = RENDER_IMAGE_INK;
+    f.tiles[0].image.version = 1; /* pre-existing live font entry, owed through recovery */
+    rf_offer(&f, RENDER_FULL);
+    f.offer.stamp.input_first = f.offer.stamp.input_last = 1;
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    render_counters c;
+    render_stats(f.r, &c);
+    CHECK(!f.directory_reads && !c.recovery_inspections && !c.queued);
+    CHECK(rf_finish(&f) == RENDER_OK);
+    rf_offer(&f, RENDER_PATCH);
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    render_stats(f.r, &c);
+    CHECK(f.directory_reads == 1 && c.recovery_inspections == 1 && c.queued == 1);
+    CHECK(rf_finish(&f) == RENDER_OK);
+    return stop(&f);
+}
+
+static int command_owner_wake_is_signalled(void)
+{
+    render_fixture f;
+    CHECK(start(&f) == 0);
+    render_test_owner owner = render_test_owner_get(f.r);
+    os_waitset ws;
+    CHECK(os_waitset_init(&ws) == OS_OK);
+    CHECK(os_waitset_add(&ws, os_wake_fd(owner.port->wake), OS_WAIT_IN, 0) == OS_OK);
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    os_wait_event ev;
+    size_t count;
+    CHECK(os_waitset_wait(&ws, 0, &ev, 1, &count) == OS_OK && count == 1 && (ev.events & OS_WAIT_IN));
+    os_waitset_close(&ws);
+    CHECK(rf_finish(&f) == RENDER_OK);
+    return stop(&f);
+}
+
+typedef struct taken_gate {
+    os_wake taken;
+    os_mutex mutex;
+    os_cond cond;
+    bool resume;
+} taken_gate;
+
+static void park_null_owner(void *ctx)
+{
+    taken_gate *gate = ctx;
+    os_mutex_lock(&gate->mutex);
+    os_wake_signal(&gate->taken);
+    while (!gate->resume) os_cond_wait(&gate->cond, &gate->mutex);
+    os_mutex_unlock(&gate->mutex);
+}
+
+static int stop_with_taken_packet(bool loss)
+{
+    render_fixture f;
+    rf_init(&f);
+    CHECK(base_arena_init(&f.arena, (RF_ROWS + 1u) * os_page_size()) == 0);
+    CHECK(os_wake_init(&f.wake) == OS_OK);
+    CHECK(render_open(&f.arena, &f.setup, &f.r) == RENDER_OK);
+    CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
+
+    taken_gate gate = {0};
+    CHECK(os_wake_init(&gate.taken) == OS_OK);
+    CHECK(os_mutex_init(&gate.mutex) == OS_OK);
+    CHECK(os_cond_init(&gate.cond) == OS_OK);
+    void *state = render_test_owner_get(f.r).state;
+    render_test_null_on_take(state, park_null_owner, &gate);
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id first;
+    CHECK(rf_submit(&f, &first, NULL) == RENDER_OK);
+    CHECK(rf_wait_wake(&gate.taken, os_now_ns() + RF_OWNER_DEADLINE_NS));
+    size_t mark = base_arena_mark(&f.arena);
+
+    if (loss) {
+        CHECK(notice(&f, (render_frame_id){first.epoch, 0}, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) ==
+              RENDER_LOST);
+        render_counters c;
+        render_stats(f.r, &c);
+        CHECK(c.state == RENDER_QUIESCING && !c.t4 && !c.t5 && !c.t6);
+        CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_WAIT);
+    } else {
+        CHECK(render_close(f.r) == RENDER_WAIT);
+    }
+    render_wake wake;
+    CHECK(render_pending(f.r, &wake) && wake.waiting && wake.wake == &f.wake);
+    CHECK(mark && base_arena_mark(&f.arena) == mark);
+    CHECK(!rf_wait_wake(&f.wake, 0));
+
+    os_mutex_lock(&gate.mutex);
+    gate.resume = true;
+    os_cond_signal(&gate.cond);
+    os_mutex_unlock(&gate.mutex);
+    CHECK(rf_wait_wake(&f.wake, os_now_ns() + RF_OWNER_DEADLINE_NS));
+    os_wake_drain(&f.wake);
+    render_notice stale;
+    CHECK(!wake.feedback.take(wake.feedback.ctx, &stale));
+
+    if (loss) {
+        CHECK(render_bind(f.r, &f.binding, &f.sheet, NULL) == RENDER_OK);
+        render_test_null_on_take(state, NULL, NULL);
+        rf_offer(&f, RENDER_FULL);
+        render_frame_id next;
+        CHECK(rf_submit(&f, &next, NULL) == RENDER_OK && next.epoch != first.epoch &&
+              next.frame == first.frame + 1u);
+        CHECK(rf_finish_public(&f));
+    }
+    CHECK(stop(&f) == 0);
+    os_cond_destroy(&gate.cond);
+    os_mutex_destroy(&gate.mutex);
+    os_wake_close(&gate.taken);
+    return 0;
+}
+
+static int close_with_taken_packet(void) { return stop_with_taken_packet(false); }
+static int loss_with_taken_packet(void) { return stop_with_taken_packet(true); }
+
 int main(void)
 {
     return lifecycle() || staged_binding() || delivery() || physical_retirement() || bounds() ||
-        verify_identity_policy();
+        verify_identity_policy() || backend_poll_stays_off_submit() || wide_right_reserved_refuses() ||
+        input_bearing_submit_skips_replay() || command_owner_wake_is_signalled() ||
+        close_with_taken_packet() || loss_with_taken_packet();
 }

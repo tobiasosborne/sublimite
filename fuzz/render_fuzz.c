@@ -112,6 +112,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     render_fixture f;
     render_model m = {0};
     rf_init(&f);
+    f.setup.driver = render_test_manual_null();
     if (base_arena_init(&f.arena, (RF_ROWS + 1u) * os_page_size()) != 0) return 0;
     ASSERT(os_wake_init(&f.wake) == OS_OK);
     ASSERT(render_open(&f.arena, &f.setup, &f.r) == RENDER_OK);

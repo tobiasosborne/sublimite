@@ -231,7 +231,6 @@ LDFLAGS_journal_codec_test := -Wl,--wrap=base_cpu_has_sse42
 # Render probes inspect the real owner slot and retained scene.
 render_hooks = $(B)/$(1)/src/render/render_test_hooks.o $(B)/$(1)/src/render/render_null_test_hooks.o
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/render_test: $(call render_hooks,$(c))))
-$(B)/rel/tests/law2_render_test: $(call render_hooks,rel)
 $(B)/fuzz/render_fuzz: $(call render_hooks,fuzz)
 $(foreach c,san tsan fuzz,$(eval $(B)/$(c)/src/render/render.o $(B)/$(c)/src/render/render_test_hooks.o $(B)/$(c)/tests/render_test.o: private CF_$(c) += -DRENDER_ASSERT_IDENTITIES))
 # file (L2-1): sync-barrier and fault-registry failures are injected at the

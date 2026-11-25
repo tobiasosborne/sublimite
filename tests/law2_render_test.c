@@ -22,7 +22,7 @@ int main(void)
     render_rc rc = rf_submit(&f, &id, NULL);
     size_t allocations = base_malloc_guard_end();
     ASSERT(rc == RENDER_OK && allocations == 0);
-    ASSERT(rf_finish(&f) == RENDER_OK);
+    ASSERT(rf_finish_public(&f));
 
     rf_offer(&f, RENDER_PATCH);
     f.offer.run_count = 1;
@@ -31,7 +31,7 @@ int main(void)
     rc = rf_submit(&f, &id, NULL);
     allocations = base_malloc_guard_end();
     ASSERT(rc == RENDER_OK && allocations == 0);
-    ASSERT(rf_finish(&f) == RENDER_OK);
+    ASSERT(rf_finish_public(&f));
 
     ASSERT(render_close(f.r) == RENDER_OK);
     os_wake_close(&f.wake);

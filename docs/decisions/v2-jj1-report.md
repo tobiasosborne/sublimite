@@ -121,3 +121,32 @@ RV-1's 500 µs quiet-box thread-CPU determination remains outstanding. These tim
 | `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189` | Exit 2 at check-contract. The export gate, 31 lane fixtures, 6 isolated layer links, 34 sanitizer suites and 10 Law 2 suites passed. At load1 25.45 the harness had 62 PASS records, one 3 s Xvfb startup timeout and one 1 s shutdown timeout. An isolated check-contract follow-up at load1 23.72 produced 63 PASS records and repeated the shutdown timeout. Receipts are final-check.log and contract-followup.log under build/round2. |
 | `nice make -j2 check-tsan` | Green, exit 0. All 14 threaded suites passed. |
 | `nice make -j2 fuzz-smoke` | Green, exit 0. All 17 fuzzers replayed their seeds. |
+
+## Round 3 receipts
+
+| Item | Red | Green before final lanes |
+|---|---|---|
+| F1, stock owner | The unwrapped factory accepted a full but produced no UI wake in Astra's 100 ms observation. | The isolated L3 production link's `public_null_progress` routes the real owner's typed feedback through the UI wake, retires a full and then accepts and retires the next patch. |
+| F2, physical STOP | Taking a packet and parking its owner let close return OK with the arena reset. Epoch loss also left QUIESCING while the owner held the packet. | `close_with_taken_packet` and `loss_with_taken_packet` park the real null owner between take and consume. Close or rebind reports WAIT with the UI wake and retains the arena mark. After release the wake is readable, no stale evidence is delivered, close frees storage and loss permits a full in a fresh epoch. |
+| F3, implementor headers | Round 2 omitted the uncorrelated timestamp encoding, actual XShm fence distinction, Wayland pacing, WAIT resumption, cancellation and watchdog rules. | Header probes find those rules alongside the transport and operation contract. Lifecycle verifies that uncorrelated PRESENTED refuses nonzero ns and accepts zero. The stats comment now identifies the most recent submit refusal. |
+
+Release, ASan/UBSan and TSan render targets, the isolated L3 test, the live allocation guard and render seed replay passed before the final lanes. The guard uses the stock owner. The benchmark was adapted to the public wake interface and built. Round 3 takes no timing measurement.
+
+| Astra survivor | Named test | Mutant result |
+|---|---|---|
+| 18, UI poll during submit | `backend_poll_stays_off_submit` | Failed on a poll before owner dispatch. |
+| 22, skip the wide-right reserved field | `wide_right_reserved_refuses` | Failed on accepting the invalid pair. |
+| 25, replay during an input-bearing submit | `input_bearing_submit_skips_replay` | Failed on a directory read, cursor advance or queued tile. |
+| 26, omit the owner wake | `command_owner_wake_is_signalled` | Failed on an unreadable command wake after acceptance. |
+
+The four mutant binaries independently compiled and failed at their named assertions against both the baseline probes and the revised sources. Both pristine suites passed. The red and green receipts and the baseline snapshot are under `build/round3/`.
+
+The Round 3 diff adds 497 and removes 96 text lines for code, build and tests. Including decision and report edits it adds 536 and removes 96. The production size review and quiet-box timing determination remain with the advisor.
+
+### Final Round 3 lanes
+
+| Command | Result |
+|---|---|
+| `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189` | Passed, exit 0. Export gate, 31 lane fixtures, 6 isolated layer links, 34 sanitizer suites, 10 Law 2 suites and all 64 contract harness records passed. |
+| `nice make -j2 check-tsan` | Passed, exit 0. All 14 threaded suites passed. |
+| `nice make -j2 fuzz-smoke` | Passed, exit 0. All 17 fuzzers replayed their seeds. |

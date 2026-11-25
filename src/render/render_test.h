@@ -20,6 +20,9 @@ typedef struct render_test_view {
 
 render_test_owner render_test_owner_get(render *);
 render_test_view render_test_inspect(render *);
+render_driver render_test_manual_null(void);
+/* Test-only gate. Set while idle, before the next command is published. */
+void render_test_null_on_take(void *null_state, void (*fn)(void *), void *ctx);
 const uint8_t *render_test_atlas(void *null_state);
 
 typedef struct render_sample {

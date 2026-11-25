@@ -45,19 +45,44 @@ typedef struct render_scene_view {
 } render_scene_view;
 typedef render_rc (*render_install)(void *, size_t slot, render_delta, const uint8_t *);
 
+typedef enum render_command_state {
+    RENDER_COMMAND_EMPTY, RENDER_COMMAND_READY, RENDER_COMMAND_TAKEN
+} render_command_state;
+
 typedef struct render_driver_port {
-    _Atomic(const render_packet *) command;
-    const os_wake *wake;
+    _Atomic render_command_state command;
+    const render_packet *packet;
+    const os_wake *wake, *ui_wake;
     render_scene *scene;
     render_rc (*apply)(render_scene *, const render_packet *, render_install, void *, render_scene_view *);
+    render_feedback feedback; /* optional UI mailbox view, installed during open */
 } render_driver_port;
 
-/* The owner drains wake, then takes the command exactly once. Hold its
- * pointer over MORE/WAIT and check physical lease finish before reuse. A
- * wake is a scheduling hint. The slot publishes with release/acquire. */
+/* The owner drains the command wake, then claims READY once. Acquisition
+ * pins the packet before accessing it, including before bind/consume. UI
+ * cancellation can retract READY, while TAKEN belongs to the owner. Keep
+ * the claim across retries and until every worker using the packet has
+ * physically finished. Release exactly once and make no later packet
+ * reads. The UI wake requests a quiesce recheck and is not evidence. */
 static inline const render_packet *render_driver_take(render_driver_port *p)
 {
-    return atomic_exchange_explicit(&p->command, NULL, memory_order_acquire);
+    render_command_state expected = RENDER_COMMAND_READY;
+    if (!atomic_compare_exchange_strong_explicit(&p->command, &expected, RENDER_COMMAND_TAKEN,
+                                                  memory_order_acquire, memory_order_relaxed)) return NULL;
+    return p->packet;
+}
+
+static inline void render_driver_release(render_driver_port *p)
+{
+    const os_wake *wake = p->ui_wake;
+    ASSERT(atomic_load_explicit(&p->command, memory_order_relaxed) == RENDER_COMMAND_TAKEN);
+    atomic_store_explicit(&p->command, RENDER_COMMAND_EMPTY, memory_order_release);
+    os_wake_signal(wake);
+}
+
+static inline bool render_driver_borrowed(const render_driver_port *p)
+{
+    return atomic_load_explicit(&p->command, memory_order_acquire) == RENDER_COMMAND_TAKEN;
 }
 
 static inline bool render_has_slot(render_slot_range r, uint32_t slot)
@@ -88,23 +113,47 @@ static inline bool render_scene_ink(const render_scene_view *s, const render_bin
 
 typedef enum render_quiescence { RENDER_RETIRE_FRAME, RENDER_STOP_EPOCH } render_quiescence;
 
-/* Query/open are setup controls. Open installs the owner's port; a terminal
- * open error must first release any partial native resources. Bind/consume/
- * poll run on the presentation owner. Bind runs once to completion for the
- * first packet's sheet, then consume applies the common scene before draw
- * and issues present once. Failure on an accepted command is LOST.
+/* Query/open are setup controls. A terminal open error releases any partial
+ * native resources. MORE retries setup when runnable, WAIT after its UI wake.
+ * Bind/consume/poll run on the presentation owner. Bind completes the first
+ * packet's sheet before consume. Consume applies the common scene before
+ * drawing and issues present once. Keep the claimed command and current
+ * phase on MORE/WAIT. MORE resumes that phase when scheduled. WAIT resumes
+ * on the relevant native readiness, worker/mailbox-space or cancellation wake.
+ * Poll returns one typed notice on OK, MORE for runnable work, WAIT when no
+ * notice is ready. Never retake, re-upload or reissue completed work. A
+ * terminal failure after acceptance is LOST.
  *
- * Park an unpublished mailbox result with work_continue, retry publication
- * without repeating draw/issue and keep draining stale results. Quiesce is
- * a nonblocking UI control: RETIRE_FRAME waits for the packet's physical
- * leases, STOP_EPOCH also stops native use, unregisters and drains sources.
- * WAIT means the owner arranges a UI wake. Pool drivers check work_handle_finished
- * even without a message. Close follows STOP_EPOCH. A fresh epoch binds
- * again on the owner and may recreate native resources there.
+ * Park an unpublished mailbox result with work_continue and retry only
+ * publication. Preserve the leased argument until work_handle_finished,
+ * including cancellation, parked continuations and completion without a
+ * message. Recheck after wakes and drain stale results. Pool jobs check
+ * work_should_stop at least every 5 ms CPU, using the bound in work.h.
+ * Put command, cancellation and native readiness on the owner's root
+ * wait set. Use cancellable native waits and a bounded disconnect or
+ * missing-feedback path. After issue arm the platform contract's absolute
+ * monotonic completion watchdog for missing device or display evidence.
+ * A disconnect or expired obligation yields LOST. An elapsed deadline
+ * cannot authorize reuse before physical quiescence.
  *
- * Authenticate swap/fence identity, native serial/window and clock before
- * forwarding. X11 accepts matching PIXMAP/MSC and displayed mode, Wayland
- * the original feedback object. Driver/context calls run on the owner.
+ * Quiesce is a nonblocking UI control. RETIRE_FRAME waits for physical
+ * packet leases. STOP_EPOCH also halts native use, unregisters observers
+ * and drains stale sources. WAIT arranges a UI wake. OK means the owner
+ * has released the claim and stopped using the affected storage. Close
+ * follows STOP_EPOCH and joins any remaining owner thread before freeing
+ * its storage. A fresh epoch binds again on its owner.
+ *
+ * Authenticate the native cookie, epoch/frame, serial/window and clock.
+ * ISSUED means successful native present submission. For XShm DEVICE_DONE,
+ * observe the matched server device fence triggered after the drawable
+ * uploads on the presentation connection. Raster job completion or source
+ * reuse alone does not establish T5. For GL, observe the matched device sync.
+ * X11 display evidence needs matching
+ * PIXMAP/MSC and displayed mode, or a matched discard. A Wayland frame
+ * callback only schedules work. The original swap presentation feedback
+ * determines PRESENTED or DISCARDED. Encode notices with render.h's
+ * clock/ns rules, including UNTIMED and zero for unconvertible presentation
+ * times. Driver/context calls run on the owner.
  * Restore backing when swap-buffer age is unknown, including after discard.
  * GL R8 uses top-left source rows (account for upload orientation) and
  * unpack alignment 1. Match raster's integer RGB resolve, inverse after

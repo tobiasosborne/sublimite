@@ -189,11 +189,10 @@ static inline const render_packet *rf_take(render_test_owner owner)
 static inline render_rc rf_dispatch(render_test_owner owner, const render_packet *packet)
 {
     if (!packet) return RENDER_WAIT;
-    if (packet->sheet) {
-        render_rc rc = owner.driver.ops->bind(owner.state, &packet->binding, packet->sheet);
-        if (rc != RENDER_OK) return rc;
-    }
-    return owner.driver.ops->consume(owner.state, packet);
+    render_rc rc = packet->sheet ? owner.driver.ops->bind(owner.state, &packet->binding, packet->sheet) : RENDER_OK;
+    if (rc == RENDER_OK) rc = owner.driver.ops->consume(owner.state, packet);
+    if (rc != RENDER_MORE && rc != RENDER_WAIT) render_driver_release(owner.port);
+    return rc;
 }
 static inline render_rc rf_finish(render_fixture *f)
 {
@@ -207,6 +206,42 @@ static inline render_rc rf_finish(render_fixture *f)
     }
     return rc == RENDER_WAIT ? RENDER_OK : rc;
 }
+/* Same asynchronous progress guard as the work suite. */
+#define RF_OWNER_DEADLINE_NS UINT64_C(5000000000)
+
+static inline bool rf_wait_wake(const os_wake *wake, uint64_t deadline)
+{
+    os_waitset ws;
+    if (os_waitset_init(&ws) != OS_OK) return false;
+    os_wait_event event;
+    size_t count = 0;
+    bool ready = os_waitset_add(&ws, os_wake_fd(wake), OS_WAIT_IN, 0) == OS_OK &&
+        os_waitset_wait(&ws, deadline, &event, 1, &count) == OS_OK && count == 1 &&
+        (event.events & OS_WAIT_IN);
+    os_waitset_close(&ws);
+    return ready;
+}
+
+static inline bool rf_finish_public(render_fixture *f)
+{
+    uint64_t deadline = os_now_ns() + RF_OWNER_DEADLINE_NS;
+    render_counters c;
+    render_stats(f->r, &c);
+    while (c.state != RENDER_IDLE) {
+        render_wake pending;
+        if (!render_pending(f->r, &pending) || !pending.waiting || !pending.feedback.take ||
+            !rf_wait_wake(pending.wake, deadline)) return false;
+        os_wake_drain(pending.wake);
+        render_notice n;
+        while (pending.feedback.take(pending.feedback.ctx, &n))
+            if (render_event(f->r, &n) != RENDER_OK) return false;
+        render_stats(f->r, &c);
+    }
+    return c.device == RENDER_DEVICE_DONE && c.presentation == RENDER_PRESENTED &&
+        c.issue_clock == RENDER_SYNTHETIC && c.device_clock == RENDER_SYNTHETIC &&
+        c.presentation_clock == RENDER_SYNTHETIC && c.t4 && c.t5 >= c.t4 && c.t6 >= c.t4;
+}
+
 static inline render_sample rf_sample(render_fixture *f, size_t index)
 {
     render_test_owner owner = render_test_owner_get(f->r);

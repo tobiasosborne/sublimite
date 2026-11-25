@@ -128,8 +128,10 @@ render_rc render_open(base_arena *a, const render_setup *setup, render **out)
             base_arena_reset_to_mark(a, mark);
             return RENDER_CAPACITY;
         }
-        atomic_init(&r->port.command, NULL);
+        atomic_init(&r->port.command, RENDER_COMMAND_EMPTY);
+        r->port.packet = &r->packet;
         r->port.wake = &r->command_wake;
+        r->port.ui_wake = setup->wake;
         r->port.scene = &r->scene;
         r->port.apply = render_apply_scene;
         r->stats.state = RENDER_OPENING;
@@ -293,9 +295,16 @@ static void render_credit(render_bank *q, render_stage stage)
     else q->nodes[q->head].prev = RENDER_LIST_END;
 }
 
+static void render_retract_command(render_driver_port *port)
+{
+    render_command_state expected = RENDER_COMMAND_READY;
+    (void)atomic_compare_exchange_strong_explicit(&port->command, &expected, RENDER_COMMAND_EMPTY,
+                                                  memory_order_relaxed, memory_order_relaxed);
+}
+
 static render_rc render_lose(render *r)
 {
-    atomic_store_explicit(&r->port.command, NULL, memory_order_release);
+    render_retract_command(&r->port);
     r->stats.state = RENDER_QUIESCING;
     (void)render_idle(r);
     return RENDER_LOST;
@@ -350,7 +359,7 @@ render_rc render_submit(render *r, const render_offer *o, const render_source *s
         .region_pixels = stage.region_pixels, .tile_inspections = stage.inspections,
         .tiles = stage.tiles, .tile_bytes = stage.bytes,
         .rejected = r->stats.rejected, .rejection = r->stats.rejection};
-    atomic_store_explicit(&r->port.command, p, memory_order_release);
+    atomic_store_explicit(&r->port.command, RENDER_COMMAND_READY, memory_order_release);
     os_wake_signal(&r->command_wake);
     if (need) *need = (render_need){0};
     *out = p->id;
@@ -377,7 +386,8 @@ render_rc render_event(render *r, const render_notice *n)
     case RENDER_NOTICE_LOST:
         return render_lose(r);
     case RENDER_NOTICE_ISSUED:
-        if (c->state != RENDER_ACCEPTED || atomic_load_explicit(&r->port.command, memory_order_acquire))
+        if (c->state != RENDER_ACCEPTED ||
+            atomic_load_explicit(&r->port.command, memory_order_acquire) == RENDER_COMMAND_READY)
             return RENDER_STALE;
         if (!timed) return RENDER_INVALID;
         c->state = RENDER_ISSUED;
@@ -420,6 +430,7 @@ bool render_pending(const render *r, render_wake *out)
     render_wake w = {0};
     if (r) {
         w.wake = r->setup.wake;
+        w.feedback = r->port.feedback;
         switch (r->stats.state) {
         case RENDER_IDLE:
         case RENDER_IDLE_FULL:
@@ -471,7 +482,7 @@ render_rc render_close(render *r)
 {
     if (!r) return RENDER_OK;
     r->stats.state = RENDER_CLOSING;
-    atomic_store_explicit(&r->port.command, NULL, memory_order_release);
+    render_retract_command(&r->port);
     if (r->driver) {
         render_rc rc = render_quiesce(r, RENDER_STOP_EPOCH);
         if (rc != RENDER_OK) return rc;

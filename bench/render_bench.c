@@ -17,8 +17,6 @@ typedef struct bench_view {
     render_cell *cells;
     render_tile_view runtime[TILES];
     uint8_t pixels[TILE];
-    render_driver_port *port;
-    void *backend;
 } bench_view;
 
 typedef enum bench_case { BENCH_ROW, BENCH_FULL, BENCH_RUNTIME } bench_case;
@@ -82,27 +80,20 @@ static void pair(const char *label, uint64_t *samples, size_t count)
     printf(" %s=%.3f/%.3f us", label, (double)p50 / 1000.0, (double)p99 / 1000.0);
 }
 
-static render_rc bench_open(void **state, base_arena *a, const render_setup *s, render_driver_port *p)
+static void finish(render *r, os_waitset *waits)
 {
-    bench_view *b = s->directory_ctx;
-    render_rc rc = render_driver_null().ops->open(state, a, s, p);
-    if (rc == RENDER_OK) {
-        b->port = p;
-        b->backend = *state;
-    }
-    return rc;
-}
-
-static void finish(bench_view *b, render *r)
-{
-    const render_driver_ops *ops = render_driver_null().ops;
-    os_wake_drain(b->port->wake);
-    const render_packet *p = render_driver_take(b->port);
-    ASSERT(p);
-    if (p->sheet) ASSERT(ops->bind(b->backend, &p->binding, p->sheet) == RENDER_OK);
-    ASSERT(ops->consume(b->backend, p) == RENDER_OK);
-    render_notice n;
-    while (ops->poll(b->backend, &n) == RENDER_OK) ASSERT(render_event(r, &n) == RENDER_OK);
+    render_counters c;
+    do {
+        render_wake ready;
+        ASSERT(render_pending(r, &ready) && ready.waiting && ready.feedback.take);
+        os_wait_event event;
+        size_t count;
+        ASSERT(os_waitset_wait(waits, OS_DEADLINE_NEVER, &event, 1, &count) == OS_OK);
+        os_wake_drain(ready.wake);
+        render_notice n;
+        while (ready.feedback.take(ready.feedback.ctx, &n)) ASSERT(render_event(r, &n) == RENDER_OK);
+        render_stats(r, &c);
+    } while (c.state != RENDER_IDLE);
 }
 
 static uint64_t cpu_now(void)
@@ -156,12 +147,12 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
         .client_width = COLS * W, .client_height = rows * H, .cols = COLS, .rows = rows,
         .cell_width = W, .cell_height = H, .target_stride = COLS * W * sizeof(uint32_t),
         .sheet = {0, SHEET}, .runtime = {SHEET, TILES}, .overscan = 1};
-    const render_driver_ops *null = render_driver_null().ops;
-    render_driver_ops ops = *null;
-    ops.open = bench_open;
     os_wake wake;
+    os_waitset waits;
     ASSERT(os_wake_init(&wake) == OS_OK);
-    render_setup setup = {.driver = {&ops}, .wake = &wake, .recovery_slots = TILES,
+    ASSERT(os_waitset_init(&waits) == OS_OK);
+    ASSERT(os_waitset_add(&waits, os_wake_fd(&wake), OS_WAIT_IN, 0) == OS_OK);
+    render_setup setup = {.driver = render_driver_null(), .wake = &wake, .recovery_slots = TILES,
         .directory_ctx = &b, .directory = directory,
         .limits = {.client_width = binding.client_width, .client_height = binding.client_height,
             .cols = COLS, .rows = rows, .cell_width = W, .cell_height = H, .cells = cells,
@@ -187,7 +178,7 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
     }
     render_frame_id id;
     ASSERT(render_submit(r, &b.offer, &src, &id, NULL) == RENDER_OK);
-    finish(&b, r);
+    finish(r, &waits);
     b.offer.mode = full ? RENDER_FULL : RENDER_PATCH;
     b.offer.overscan_dirty = full;
     b.offer.region = full ? RENDER_REMOVE : RENDER_KEEP;
@@ -202,7 +193,7 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
         uint64_t t0 = os_now_ns(), c0 = cpu_now();
         ASSERT(render_submit(r, &b.offer, &src, &id, NULL) == RENDER_OK);
         uint64_t c1 = cpu_now(), t1 = os_now_ns();
-        finish(&b, r);
+        finish(r, &waits);
         uint64_t t2 = os_now_ns();
         uint64_t t3 = os_now_ns();
         memcpy(copy, b.cells, payload);
@@ -225,6 +216,7 @@ static void exercise(uint32_t rows, bench_case kind, uint64_t idle_ns)
     pair("memcpy-wall", samples + 3u * count, count);
     putchar('\n');
     ASSERT(render_close(r) == RENDER_OK);
+    os_waitset_close(&waits);
     os_wake_close(&wake);
     base_arena_free(&arena);
 }
