@@ -125,6 +125,10 @@ branches: push each at every pause or session end; delete the remote branch once
     and the null driver (v2-jj1, running); viewport round 4; (2) layout; (3) font and font_async; (4) plat; (5) the
     backends (after v2-ze1). Astra reviews
     each; the advisor reads the header in full, her review, and the diff of any send-back.
+    VIEWPORT ROUND 4 (318f5d2): Astra's re-check was CUT by the Codex filter. The advisor's own diff read replaces it,
+    done at Claude room after the v2-4xk F1 fix round. The mutant rerun goes to Sol after render round 2, as a run log,
+    and the coordinator spot-checks one row. The quiet-box three-fixture bench is rerun before landing. Viewport no
+    longer gates Sol: after render round 2, Sol starts LAYOUT on a branch on top of t3/w2-viewport.
     STANDING BENCH RULE (advisor, 2026-11-25): a bench figure that supports a MUST-FIX or a design decision is taken with
     load1 below 2 and no lane running, or it is labelled non-probative. Give the worker a quiet window and serialise
     lanes around it.
