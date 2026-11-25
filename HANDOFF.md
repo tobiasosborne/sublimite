@@ -125,6 +125,11 @@ branches: push each at every pause or session end; delete the remote branch once
     and the null driver (v2-jj1, running); viewport round 4; (2) layout; (3) font and font_async; (4) plat; (5) the
     backends (after v2-ze1). Astra reviews
     each; the advisor reads the header in full, her review, and the diff of any send-back.
+    STANDING BENCH RULE (advisor, 2026-11-25): a bench figure that supports a MUST-FIX or a design decision is taken with
+    load1 below 2 and no lane running, or it is labelled non-probative. Give the worker a quiet window and serialise
+    lanes around it.
+    RENDER: Astra returned v2-jj1 for revision (nine MUST-FIX). The advisor ruled RV-1..RV-5 (render spec errata) and a
+    size restructure. Sol's round 2 (docs/briefs/render-round2.md) runs after viewport round 4.
     EVERY WAVE 2 IMPLEMENTATION BRIEF carries three lines: (a) the header holds the whole contract as comments, so the
     next module's implementer never opens the .c file; (b) a rule another module also needs has one implementation
     and one public constant, never a second copy; (c) benches are per step and per whole operation, on an ordinary

@@ -198,3 +198,31 @@ Estimates (E) are comment-free production lines for this contract, from the prop
 **Report only.** The companion font revision (R-C and F3–F8), layout A29, platform queue/clipboard policy, tab close/session R14 and subsequent-wave panels remain with their respective proposals. Rendering supplies the F1 retention decision and uses the advisor's pending-art rule. Hardware upload choice, exact measured tile grants, maximum admitted client, live allocation/G1 results and real display witnesses require implementation and measurement. No implementation or measurement is part of this proposal.
 
 **Source record.** Wave 2 render brief, L3/L4 harvest (Q3–Q9, app_paint and integration witnesses), PLAN_V2 §§2, 4.5–4.7, CLAUDE laws 2/4, landed work/work.h and base/base.h. Producer contract from refs/remotes/origin/t3/wave2-viewport-layout-spec-r2, glyph proposal from t3/wave2-font-spec read with the advisor's font send-back. Pin evidence from render/render.h and render.c (render_backend_check/submit/deliver), raster/raster.c (cpu_submit/present), raster/raster_kernel.c (sample/raster_row_scrolled), gl/renderer.inc (gl_program_init/upload_pending/submit), perf/01-perf-target.md §0.2 and perf/00-hardware-profile.md after-idle memcpy measurement.
+
+## Errata after implementation review (advisor, 2026-11-25; Astra's v2-jj1 review)
+- RV-1 (release-path validation). In the release path, render_submit validates STRUCTURE only, fused with the copy:
+  reserved fields, attributes, wide-pair adjacency, and slot within the bound generation's range. It checks the offer's
+  paint serial and ancestry once. The full per-cell identity check against the directory runs in the sanitizer lane
+  and under ASSERT builds. Reason: a stale or non-current identity is already harmless (the backend draws background on
+  any slot/version mismatch), and an in-range identity that is current passes the directory check too, so that check
+  catches nothing the version check does not neutralise. Expected cost at the largest grid: the copy plus
+  108,360 x 1.89 ns = 205 µs (E, from Astra's (M) per-cell figure).
+  A quiet-box full submit at the largest admission that still exceeds 0.5 ms of thread CPU is a stated, measured
+  exception: a full frame at the largest grid is a resize, a tab switch or a first frame, governed by G3's 5 ms, not by
+  G1. Slicing returns only on lag Tobias observes, with a repro (Law 1).
+- RV-2 (recovery scheduling, Q2). There is no PUMP event and no tenth call. Recovery advances inside render_submit, in a
+  capped batch per repair offer, and render_pending tells L5 that a repair offer is wanted. render_event carries notices
+  from the driver and platform only. consume and poll are called by the driver's owner, never by the service on the UI.
+- RV-3 (two bindings, Q3). bind stages a candidate in the common service. The driver receives the new binding inside the
+  first accepted full packet. The active binding, picture and hit association are untouched until that accept.
+- RV-4 (frame ids, Q6). Frame ids are monotone for the life of the render service and do not restart at an epoch. The
+  epoch still qualifies the backend lifetime, and EDTRACE is unchanged. Exhausting the 32-bit counter takes 2^32 frames,
+  which is 414 days at 120 frames a second (2^32 / 120 / 86,400), and retires the service.
+- RV-5 (physical release, Q7). Physical release is never a message. It is the return of the driver's quiesce or close
+  operation: OK only after its owner has physically stopped, and WAIT with a wake otherwise. Pool jobs use
+  work_handle_finished. RELEASED as a notice is deleted.
+- Also ruled: Q4 (render_sheet declares its printable-ASCII count and the marker identity for each span; bind refuses a
+  sheet without them); Q5 (only a selected tile is validated; a head with invalid declared dimensions refuses INVALID;
+  a valid head that does not fit stays owed, and its other metadata is not examined until it is selectable); MUST-FIX 5
+  (the signed plat type governs: plat_native_binding *).
+
