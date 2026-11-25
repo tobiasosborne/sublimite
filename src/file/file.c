@@ -452,14 +452,17 @@ static int copy_metadata(file_temp *t, os_file *dst, os_err *oserr)
     return rc;
 }
 
-/* The temp's metadata, applied before the sync so the sync covers it:
- * the destination's own when it still is the expected regular file,
- * else the new-file mode 0666 & ~the startup creation mask (advisor
- * ruling, MF7). The destination opens non-blocking with the leaf not
- * followed, so a FIFO or device swapped in never waits (MF9). */
+/* The temp's metadata, applied before the sync so the sync covers it.
+ * When the destination still is the expected regular file, its own
+ * metadata is copied. Otherwise the mode is the destination's observed
+ * mode while one exists (an owner-unreadable 0060 stays 0060, review
+ * MF-B), and 0666 & ~the creation mask only for a name with no
+ * destination (advisor ruling, MF7). Special bits travel only with the
+ * owner, that is through the copy. The destination opens non-blocking
+ * with the leaf not followed, so a FIFO or device never waits (MF9). */
 static int temp_metadata(file_temp *t, const prepare_args *a, os_err *oserr)
 {
-    bool copied = false;
+    uint32_t perm = 0666u & ~os_creation_mask();
     if (a->expect->presence == FILE_PRESENT) {
         os_file dst = OS_FILE_INIT;
         os_err e = os_file_open_at(&dst, &t->dir, t->base,
@@ -474,22 +477,23 @@ static int temp_metadata(file_temp *t, const prepare_args *a, os_err *oserr)
             } else if (ds.kind == OS_KIND_FILE &&
                        identity_eq(&ds.id, &a->expect->stat.id)) {
                 rc = copy_metadata(t, &dst, oserr);
-                copied = rc == FILE_OK;
+                os_file_close(&dst);
+                return rc;
             } else if ((a->flags & FILE_SAVE_FORCE) == 0) {
                 rc = FILE_ERR_CHANGED; /* not the file we were told to replace */
+            } else {
+                perm = ds.perm & 0777u; /* FORCE over what is there now */
             }
             os_file_close(&dst);
             if (rc != FILE_OK) return rc;
+        } else if (e != OS_E_NOENT && e != OS_E_NOTDIR) {
+            perm = a->expect->stat.perm & 0777u; /* present, unreadable */
         }
-        /* An unopenable destination keeps the new-file mode; the
-         * pre-rename recheck still refuses a changed one. */
     }
-    if (!copied) {
-        os_err e = os_file_set_perm(&t->fd, 0666u & ~os_creation_mask());
-        if (e != OS_OK) {
-            if (oserr != NULL) *oserr = e;
-            return FILE_ERR_IO;
-        }
+    os_err e = os_file_set_perm(&t->fd, perm);
+    if (e != OS_OK) {
+        if (oserr != NULL) *oserr = e;
+        return FILE_ERR_IO;
     }
     return FILE_OK;
 }
@@ -642,21 +646,40 @@ static int temp_prepare_core(file_temp *t, const prepare_args *a, os_err *oserr)
     return FILE_OK;
 }
 
-/* The cheap post-rename check: the path names the written fd, whose
- * size and mtime are still those captured after the sync (the rename
- * moves only ctime), so a foreign in-place write into our installed
- * inode is a conflict too (review N2). */
+/* The proof of installation: the path names the written fd, whose size
+ * and mtime are still those captured after the sync (the rename moves
+ * only ctime), so a foreign in-place write into our installed inode
+ * disproves it too (review N2). */
+static bool temp_proven(const file_temp *t, os_stat *now, os_err *oe)
+{
+    file_expectation at_path;
+    *oe = os_file_stat(&t->fd, now);
+    if (*oe != OS_OK) return false;
+    if (file_expectation_observe_at(&t->dir, t->base, &at_path, oe) != FILE_OK) return false;
+    return at_path.presence == FILE_PRESENT && identity_eq(&at_path.stat.id, &now->id) &&
+           at_path.stat.size == now->size && identity_eq(&now->id, &t->fd_stat.id) &&
+           now->size == t->fd_stat.size && now->mtime_ns == t->fd_stat.mtime_ns;
+}
+
+static bool pair_foreign(const file_temp *t)
+{
+    switch (t->pair) {
+    case FILE_PAIR_FOREIGN:
+        return true;
+    case FILE_PAIR_NONE:
+    case FILE_PAIR_OURS:
+        return false;
+    }
+    return true;
+}
+
+/* VERIFIED only on proof and an undisturbed displaced source; the pair's
+ * verdict is kept in custody, so no later verification forgets it. */
 static int temp_verify_installed(const file_temp *t, file_save_outcome *out)
 {
     os_stat now;
-    file_expectation at_path;
-    os_err oe = os_file_stat(&t->fd, &now);
-    int rc = FILE_ERR_IO;
-    if (oe == OS_OK) rc = file_expectation_observe_at(&t->dir, t->base, &at_path, &oe);
-    if (rc != FILE_OK || at_path.presence != FILE_PRESENT ||
-        !identity_eq(&at_path.stat.id, &now.id) || at_path.stat.size != now.size ||
-        !identity_eq(&now.id, &t->fd_stat.id) || now.size != t->fd_stat.size ||
-        now.mtime_ns != t->fd_stat.mtime_ns) {
+    os_err oe = OS_OK;
+    if (!temp_proven(t, &now, &oe) || pair_foreign(t)) {
         out->pub = FILE_PUB_CONFLICT;
         out->oserr = oe;
         return FILE_ERR_CONFLICT;
@@ -701,12 +724,13 @@ static bool source_displaced(const file_temp *t)
  * link count only is our rename: the after ctime becomes the backing's
  * baseline (when the before value was that baseline; otherwise the
  * backing already fails validation and stays failing). Any other
- * difference, or an unobservable pair, is CONFLICT. */
-static int source_rebaseline(file_source *b, os_err before_err, const os_stat *before)
+ * difference, or an unobservable pair, is FOREIGN. */
+static file_source_pair source_rebaseline(file_source *b, os_err before_err,
+                                          const os_stat *before)
 {
     os_stat after;
     if (before_err != OS_OK || os_file_stat(&b->fd, &after) != OS_OK)
-        return FILE_ERR_CONFLICT;
+        return FILE_PAIR_FOREIGN;
     file_expectation x = { .presence = FILE_PRESENT, .stat = *before };
     file_expectation y = { .presence = FILE_PRESENT, .stat = after };
     uint32_t d = file_expectation_diff(&x, &y);
@@ -714,12 +738,34 @@ static int source_rebaseline(file_source *b, os_err before_err, const os_stat *b
         if (d != FILE_CHG_METADATA || after.kind != before->kind ||
             after.perm != before->perm || after.uid != before->uid ||
             after.gid != before->gid || after.nlink >= before->nlink)
-            return FILE_ERR_CONFLICT;
+            return FILE_PAIR_FOREIGN;
     }
     file_expectation base = { .presence = FILE_PRESENT, .stat = source_baseline(b) };
     if (file_expectation_diff(&base, &x) == FILE_CHG_NONE)
         atomic_store(&b->ctime_ns, after.ctime_ns);
-    return FILE_OK;
+    return FILE_PAIR_OURS;
+}
+
+/* What a rename that reported an error actually did, by observation
+ * (review N-B): the temp name still naming our fd proves nothing was
+ * renamed (a rename removes its source name); the destination naming
+ * our fd with the temp name gone proves it was; anything else is
+ * unknown. The errno alone proves neither. */
+typedef enum rename_effect { RENAME_NOT_DONE, RENAME_DONE, RENAME_UNKNOWN } rename_effect;
+
+static rename_effect observe_rename(const file_temp *t)
+{
+    os_stat mine;
+    file_expectation at_tmp, at_dest;
+    if (os_file_stat(&t->fd, &mine) != OS_OK ||
+        file_expectation_observe_at(&t->dir, t->tmp, &at_tmp, NULL) != FILE_OK ||
+        file_expectation_observe_at(&t->dir, t->base, &at_dest, NULL) != FILE_OK)
+        return RENAME_UNKNOWN;
+    bool tmp_ours = at_tmp.presence == FILE_PRESENT && identity_eq(&at_tmp.stat.id, &mine.id);
+    bool dest_ours = at_dest.presence == FILE_PRESENT && identity_eq(&at_dest.stat.id, &mine.id);
+    if (tmp_ours && !dest_ours) return RENAME_NOT_DONE;
+    if (dest_ours && !tmp_ours) return RENAME_DONE;
+    return RENAME_UNKNOWN;
 }
 
 static int temp_publish_core(file_temp *t, const prepare_args *hooks,
@@ -769,18 +815,24 @@ static int temp_publish_core(file_temp *t, const prepare_args *hooks,
         return e == OS_E_EXIST ? FILE_ERR_CHANGED : FILE_ERR_NOTSUP;
     }
     if (e != OS_OK) {
-        out->pub = FILE_PUB_RENAME_UNCERTAIN;
         out->oserr = e;
-        t->state = FILE_TEMP_HELD; /* evidence: nothing is unlinked */
-        return FILE_ERR_IO;
+        switch (observe_rename(t)) {
+        case RENAME_NOT_DONE:
+            out->pub = FILE_PUB_PRE_RENAME; /* still ours, definitely unpublished */
+            temp_release(t, true);
+            return FILE_ERR_IO;
+        case RENAME_UNKNOWN:
+            out->pub = FILE_PUB_RENAME_UNCERTAIN;
+            t->state = FILE_TEMP_HELD; /* evidence: nothing is unlinked */
+            return FILE_ERR_IO;
+        case RENAME_DONE:
+            break; /* performed despite the report */
+        }
     }
     t->tmp[0] = '\0'; /* the temp name is gone: nothing there is ours */
     if (hooks != NULL) STEP(hooks->step, hooks->step_ctx, 5 /* RENAMED */);
-    if (displaced && source_rebaseline(t->source, before_err, &before) != FILE_OK) {
-        out->pub = FILE_PUB_CONFLICT;
-        t->state = FILE_TEMP_HELD;
-        return FILE_ERR_CONFLICT;
-    }
+    if (displaced) t->pair = source_rebaseline(t->source, before_err, &before);
+    /* A FOREIGN pair still takes the barrier: the rename happened. */
     return temp_barrier_and_verify(t, hooks, out);
 }
 
@@ -794,8 +846,13 @@ static int temp_retry_core(file_temp *t, file_save_outcome *out)
     case FILE_TEMP_HELD: {
         /* After an uncertain rename the barrier is owed only once the
          * path is proven to be the held fd; no proof, no sync. */
-        int rc = temp_verify_installed(t, out);
-        if (rc != FILE_OK) return rc;
+        os_stat now;
+        os_err oe = OS_OK;
+        if (!temp_proven(t, &now, &oe)) {
+            out->pub = FILE_PUB_CONFLICT;
+            out->oserr = oe;
+            return FILE_ERR_CONFLICT;
+        }
         return temp_barrier_and_verify(t, NULL, out);
     }
     case FILE_TEMP_EMPTY:
@@ -949,6 +1006,9 @@ int file_temp_recover(file_temp *t, const char *path,
     int rc = FILE_ERR_IO;
     if (e != OS_OK) {
         if (oserr != NULL) *oserr = e;
+        /* A symlink (or a directory) at the name is what it is: a
+         * mismatch class, not an I/O failure to retry (review N-F). */
+        if (e == OS_E_LOOP || e == OS_E_ISDIR) rc = FILE_ERR_NOTREG;
     } else {
         rc = witness_check(&t->fd, &t->dir, t->base, prepared, &t->fd_stat, &(uint32_t){0}, oserr);
     }
@@ -1301,6 +1361,25 @@ static void save_post(file *f, work_ctx *ctx)
     publish_or_continue(ctx, f->save_msg_kind, &w);
 }
 
+/* Off the UI: rewrite the destination with a canonical directory, so a
+ * relative or symlinked spelling of file_path(f) is recognized as the
+ * file's own path at settle (review N-D). The leaf is kept: a symlink
+ * leaf is replaced, never followed, so it is another path. Left as given
+ * when the directory cannot be resolved (prepare then refuses it). */
+static void canonical_dest(char dest[OS_PATH_MAX])
+{
+    char dir[OS_PATH_MAX], leaf[OS_NAME_MAX], canon[OS_PATH_MAX];
+    if (split_path(dest, dir, sizeof dir, leaf, sizeof leaf) != OS_OK ||
+        os_path_canonical(dir, canon, sizeof canon) != OS_OK)
+        return;
+    size_t dn = strlen(canon), ln = strlen(leaf);
+    bool root = dn == 1 && canon[0] == '/';
+    if (dn + (root ? 0u : 1u) + ln >= OS_PATH_MAX) return;
+    if (!root) canon[dn++] = '/';
+    memcpy(canon + dn, leaf, ln + 1);
+    copy_str(dest, canon);
+}
+
 static void save_job_fn(work_ctx *ctx)
 {
     file *f = ctx->arg;
@@ -1316,6 +1395,7 @@ static void save_job_fn(work_ctx *ctx)
     uint32_t kind = FILE_MSG_SAVE_DONE;
     switch (f->save_op) {
     case FILE_SAVE_OP_PREPARE: {
+        canonical_dest(f->save_dest);
         prepare_args a = hooks;
         a.dest_path = f->save_dest;
         a.snap = f->save_snap;

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -38,6 +39,7 @@ static int tests_run;
 /* ---- os-seam injection -------------------------------------------------- */
 static int fail_file_sync, fail_dir_sync, fail_register;
 static int register_gate_r = -1; /* MF1: the UI holds a registration at the worker */
+static _Atomic int register_blocked;
 static unsigned calls_file_sync, calls_dir_sync, calls_register;
 
 os_err __real_os_file_sync(os_file *f);
@@ -59,6 +61,7 @@ os_err __wrap_os_fault_register(const os_map *v, os_fault_id *o)
 {
     calls_register++;
     if (register_gate_r >= 0) {
+        atomic_store(&register_blocked, 1);
         char g;
         ssize_t n = read(register_gate_r, &g, 1);
         (void)n;
@@ -74,7 +77,12 @@ os_err __wrap_os_fault_register(const os_map *v, os_fault_id *o)
 
 /* Round 2 seams (review wave1-L2-1-opus.md). Atomic: the bulk worker
  * reads them while the UI arms them. */
-enum { RENAME_PASS = 0, RENAME_EIO, RENAME_EIO_BLOCK, RENAME_FOREIGN };
+/* EIO / EISDIR: nothing renamed. AWAY: the temp moves to UNCERTAIN_AWAY
+ * and EIO is returned, so neither name proves anything (a true
+ * uncertain outcome). */
+enum { RENAME_PASS = 0, RENAME_EIO, RENAME_EISDIR, RENAME_AWAY, RENAME_AWAY_BLOCK,
+       RENAME_FOREIGN };
+#define UNCERTAIN_AWAY "uncertain.away"
 static _Atomic int rename_inject;
 static _Atomic unsigned calls_rename;
 static char rename_foreign_path[4096];
@@ -88,13 +96,18 @@ os_err __wrap_os_rename_at(const os_dir *a, const char *b, const os_dir *c,
     atomic_fetch_add(&calls_rename, 1);
     switch (atomic_exchange(&rename_inject, RENAME_PASS)) {
     case RENAME_EIO:
-        return OS_E_IO; /* nothing renamed: an uncertain outcome */
-    case RENAME_EIO_BLOCK: {
+        return OS_E_IO; /* reported, but nothing renamed */
+    case RENAME_EISDIR:
+        return OS_E_ISDIR;
+    case RENAME_AWAY_BLOCK: {
         char g;
         ssize_t n = read(rename_gate_r, &g, 1);
         (void)n;
-        return OS_E_IO;
     }
+    /* fall through */
+    case RENAME_AWAY:
+        (void)__real_os_rename_at(a, b, c, UNCERTAIN_AWAY, OS_RENAME_REPLACE);
+        return OS_E_IO;
     case RENAME_FOREIGN:
         put_file(rename_foreign_path, "foreign", 7); /* after the recheck */
         break;
@@ -102,6 +115,52 @@ os_err __wrap_os_rename_at(const os_dir *a, const char *b, const os_dir *c,
         break;
     }
     return __real_os_rename_at(a, b, c, d, m);
+}
+/* Round 3: a stat of a name that lies once (MF-D, X13), and a read-back
+ * during which the file's times move without its bytes (X7). */
+static _Atomic int stat_at_lie_on; /* lie on the Nth call from now (1-based) */
+os_err __real_os_stat_at(const os_dir *dir, const char *name, unsigned flags, os_stat *st);
+os_err __wrap_os_stat_at(const os_dir *dir, const char *name, unsigned flags, os_stat *st)
+{
+    os_err e = __real_os_stat_at(dir, name, flags, st);
+    int n = atomic_load(&stat_at_lie_on);
+    if (n > 0) {
+        atomic_store(&stat_at_lie_on, n - 1);
+        if (n == 1 && e == OS_OK) st->id.index[0] ^= 1u; /* another inode */
+    }
+    return e;
+}
+static char pread_touch_path[4096];
+static _Atomic int pread_touch;
+os_err __real_os_file_pread(os_file *f, void *buf, size_t n, uint64_t off, size_t *got);
+os_err __wrap_os_file_pread(os_file *f, void *buf, size_t n, uint64_t off, size_t *got)
+{
+    os_err e = __real_os_file_pread(f, buf, n, off, got);
+    if (atomic_exchange(&pread_touch, 0)) {
+        /* (P) 1000000000 s since the epoch: a time no save writes. */
+        struct timespec ts[2] = { { 1000000000, 0 }, { 1000000000, 0 } };
+        if (utimensat(AT_FDCWD, pread_touch_path, ts, 0) != 0) _exit(90);
+    }
+    return e;
+}
+/* The /proc/self/status read behind os_creation_mask, refused on demand
+ * (the child "mask_fallback" arms it before the first read). */
+static int openat_refuse_status;
+int __real_openat(int dirfd, const char *path, int flags, ...);
+int __wrap_openat(int dirfd, const char *path, int flags, ...)
+{
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    if (openat_refuse_status && strcmp(path, "/proc/self/status") == 0) {
+        errno = EACCES;
+        return -1;
+    }
+    return __real_openat(dirfd, path, flags, mode);
 }
 static _Atomic int poll_taint;
 os_err __real_os_fault_poll(os_fault_id id, uint64_t *epoch);
@@ -1063,13 +1122,18 @@ static void t_r2_prefix_after_failed_open(void)
     close_file(&f1);
 }
 
-/* MF2: an uncertain rename keeps custody reachable and its evidence. */
+/* MF2: an uncertain rename keeps custody reachable and its evidence. The
+ * temp moved to UNCERTAIN_AWAY and EIO came back: neither the temp name
+ * nor the destination proves anything (round 3: a rename observed not to
+ * have happened is PRE_RENAME instead, t_r3_rename_not_performed). */
 static void t_r2_uncertain_rename(void)
 {
     const char *dir = ROOT "/r2/unc";
     const char *path = ROOT "/r2/unc/u.txt";
+    const char *away = ROOT "/r2/unc/" UNCERTAIN_AWAY;
     put_file(path, "old", 3);
     unlink_temps(dir);
+    (void)unlink(away);
     int fds0 = count_fds();
     file_expectation exp;
     os_err oe;
@@ -1079,32 +1143,31 @@ static void t_r2_uncertain_rename(void)
     file_temp tmp;
     memset(&tmp, 0, sizeof tmp);
     CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
-    atomic_store(&rename_inject, RENAME_EIO);
+    atomic_store(&rename_inject, RENAME_AWAY);
     file_save_outcome out;
     CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
     CHECK(out.pub == FILE_PUB_RENAME_UNCERTAIN);
     CHECK(tmp.state == FILE_TEMP_HELD);
     CHECK(file_eq(path, "old", 3));
-    CHECK(count_temps(dir) == 1);
+    CHECK(file_eq(away, "uncertain", 9));
     file_temp_discard(&tmp);
     CHECK(tmp.state == FILE_TEMP_DONE);
     CHECK(count_fds() == fds0);
-    CHECK(count_temps(dir) == 1); /* no authority to unlink after it */
-    unlink_temps(dir);
+    CHECK(file_eq(away, "uncertain", 9)); /* no authority to unlink after it */
+    CHECK(unlink(away) == 0);
     /* The asynchronous object: custody stays reachable for discard. */
     open_file(&f1, path, 0);
     fds0 = count_fds();
-    atomic_store(&rename_inject, RENAME_EIO);
+    atomic_store(&rename_inject, RENAME_AWAY);
     save_async(&f1, s, file_path(&f1), file_baseline(&f1), 0);
     CHECK(last_msg.status == FILE_ERR_IO && last_msg.mode == FILE_PUB_RENAME_UNCERTAIN);
     CHECK(file_save_phase_of(&f1) == FILE_SAVE_HELD); /* custody reachable */
     CHECK(file_save_begin(&f1, s, file_path(&f1), file_baseline(&f1), 0, 5) == FILE_ERR_BUSY);
-    CHECK(count_temps(dir) == 1);
     file_save_abandon(&f1);
     CHECK(!file_save_busy(&f1) && file_save_phase_of(&f1) == FILE_SAVE_IDLE);
     CHECK(count_fds() == fds0);
-    CHECK(count_temps(dir) == 1);
-    unlink_temps(dir);
+    CHECK(file_eq(away, "uncertain", 9));
+    CHECK(unlink(away) == 0);
     file_expectation now = *file_baseline(&f1);
     save_async(&f1, s, file_path(&f1), &now, 0);
     CHECK(last_msg.status == FILE_OK && file_eq(path, "uncertain", 9));
@@ -1196,7 +1259,7 @@ static void t_r2_abandon_while_publishing(void)
     CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
     rename_gate_r = g[0];
     unsigned renames = atomic_load(&calls_rename);
-    atomic_store(&rename_inject, RENAME_EIO_BLOCK);
+    atomic_store(&rename_inject, RENAME_AWAY_BLOCK);
     CHECK(file_save_publish(&f1) == FILE_OK);
     uint64_t deadline = os_now_ns() + UINT64_C(20000000000);
     while (atomic_load(&calls_rename) == renames) {
@@ -1207,12 +1270,12 @@ static void t_r2_abandon_while_publishing(void)
     CHECK(write(g[1], "x", 1) == 1);
     PUMP_UNTIL(&pool, not_busy, &f1);
     CHECK(file_save_outcome_of(&f1)->pub == FILE_PUB_RENAME_UNCERTAIN);
-    CHECK(count_temps(dir) == 1); /* evidence kept */
+    CHECK(exists(ROOT "/r2/abpub/" UNCERTAIN_AWAY)); /* evidence kept */
     file_save_abandon(&f1);
     CHECK(file_save_phase_of(&f1) == FILE_SAVE_IDLE);
     CHECK(count_fds() == fds0);
-    CHECK(count_temps(dir) == 1);
-    unlink_temps(dir);
+    CHECK(exists(ROOT "/r2/abpub/" UNCERTAIN_AWAY));
+    CHECK(unlink(ROOT "/r2/abpub/" UNCERTAIN_AWAY) == 0);
     rename_gate_r = -1;
     close(g[0]);
     close(g[1]);
@@ -1563,6 +1626,501 @@ static void t_r2_mapped_cancel_lease(void)
     close_gate();
 }
 
+/* ---- round 3 (re-check docs/reviews/wave1-L2-1-opus-recheck.md) -------- */
+
+/* MF-B: an existing destination the owner cannot read keeps its observed
+ * mode; the new-file default is only for a name with no destination. */
+static void t_r3_unreadable_dest(void)
+{
+    const char *path = ROOT "/r3/noread.txt";
+    piece_tree *t = text_tree("replacement");
+    piece_snapshot *s = snap_of(t);
+    for (unsigned flags = 0; flags <= FILE_SAVE_FORCE; flags += FILE_SAVE_FORCE) {
+        put_file(path, "secret", 6);
+        CHECK(chmod(path, 0060) == 0);
+        file_expectation exp;
+        os_err oe;
+        CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+        file_save_outcome out;
+        CHECK(file_save_write(path, s, NULL, &exp, flags, NULL, &out) == FILE_OK);
+        struct stat st;
+        CHECK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0060);
+        CHECK(chmod(path, 0600) == 0);
+        CHECK(file_eq(path, "replacement", 11));
+    }
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* MF-D: file_temp_verify and file_temp_recover, each refusal class. */
+static uint8_t r3_body[10000];
+static void r3_install(const char *path, file_temp *tmp, piece_tree **t, piece_snapshot **s)
+{
+    for (size_t i = 0; i < sizeof r3_body; i++) r3_body[i] = (uint8_t)('a' + i % 26);
+    (void)unlink(path);
+    mkpath(path);
+    CHECK(piece_open_copy(reserve, r3_body, sizeof r3_body, t) == PIECE_OK);
+    *s = snap_of(*t);
+    file_expectation absent;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &absent, &oe) == FILE_OK);
+    memset(tmp, 0, sizeof *tmp);
+    CHECK(file_temp_prepare(tmp, path, *s, NULL, &absent, 0, &oe) == FILE_OK);
+    file_save_outcome out;
+    CHECK(file_temp_publish(tmp, &out) == FILE_OK && tmp->state == FILE_TEMP_HELD);
+}
+static void t_r3_verify(void)
+{
+    const char *path = ROOT "/r3/verify.txt";
+    file_temp tmp;
+    piece_tree *t;
+    piece_snapshot *s;
+    r3_install(path, &tmp, &t, &s);
+    file_expectation inst;
+    uint32_t pcrc = 0;
+    os_err oe = OS_OK;
+    CHECK(file_temp_verify(&tmp, &inst, &pcrc, &oe) == FILE_OK);
+    CHECK(pcrc == file_crc32c(0, r3_body, FILE_WIRE_PREFIX_BYTES));
+    CHECK(inst.presence == FILE_PRESENT && inst.stat.size == sizeof r3_body);
+    /* The name lies on its second look: not a stable observation (X13). */
+    atomic_store(&stat_at_lie_on, 2);
+    CHECK(file_temp_verify(&tmp, &inst, &pcrc, &oe) == FILE_ERR_CHANGED);
+    CHECK(atomic_load(&stat_at_lie_on) == 0);
+    /* The fd's times move during the read-back, bytes unchanged (X7). */
+    strcpy(pread_touch_path, path);
+    atomic_store(&pread_touch, 1);
+    CHECK(file_temp_verify(&tmp, &inst, &pcrc, &oe) == FILE_ERR_CHANGED);
+    CHECK(atomic_load(&pread_touch) == 0);
+    CHECK(file_temp_verify(&tmp, &inst, &pcrc, &oe) == FILE_OK); /* stable again */
+    /* Same inode and size, other bytes: only the content CRC sees it (X6). */
+    int fd = open(path, O_WRONLY);
+    CHECK(fd >= 0 && pwrite(fd, "Z", 1, 5000) == 1 && close(fd) == 0);
+    CHECK(file_temp_verify(&tmp, &inst, &pcrc, &oe) == FILE_ERR_CHANGED);
+    /* A symlink at the destination is a mismatch, not an I/O error. */
+    CHECK(unlink(path) == 0 && symlink("elsewhere", path) == 0);
+    CHECK(file_temp_verify(&tmp, &inst, &pcrc, &oe) == FILE_ERR_CHANGED);
+    CHECK(tmp.state == FILE_TEMP_HELD); /* failure preserves custody */
+    file_temp_discard(&tmp);
+    CHECK(unlink(path) == 0);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+static void t_r3_recover(void)
+{
+    const char *path = ROOT "/r3/recover.txt";
+    file_temp tmp;
+    piece_tree *t;
+    piece_snapshot *s;
+    r3_install(path, &tmp, &t, &s);
+    file_witness w = tmp.witness;
+    file_temp_discard(&tmp);
+    int fds0 = count_fds();
+    file_temp rec;
+    os_err oe = OS_OK;
+    /* content mismatch */
+    file_witness bad = w;
+    bad.content_crc32c ^= 1u;
+    memset(&rec, 0, sizeof rec);
+    CHECK(file_temp_recover(&rec, path, &bad, &oe) == FILE_ERR_CHANGED);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    /* re-stat mismatch (X7 through recover) */
+    strcpy(pread_touch_path, path);
+    atomic_store(&pread_touch, 1);
+    CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_CHANGED);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    /* the name moves between its two looks (X13 through recover) */
+    atomic_store(&stat_at_lie_on, 2);
+    CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_CHANGED);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    /* the real installed file: INSTALLED_UNSYNCED, then barrier-only retry */
+    CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_OK);
+    CHECK(rec.state == FILE_TEMP_INSTALLED_UNSYNCED);
+    unsigned renames = atomic_load(&calls_rename);
+    file_save_outcome out;
+    CHECK(file_temp_retry_barrier(&rec, &out) == FILE_OK && out.pub == FILE_PUB_VERIFIED);
+    CHECK(atomic_load(&calls_rename) == renames);
+    file_temp_discard(&rec);
+    CHECK(count_fds() == fds0 && file_eq(path, r3_body, sizeof r3_body));
+    /* a symlink is what it is: not a regular file, not an I/O error */
+    CHECK(unlink(path) == 0 && symlink("recover.target", path) == 0);
+    put_file(ROOT "/r3/recover.target", r3_body, sizeof r3_body);
+    oe = OS_OK;
+    CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_NOTREG);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    CHECK(unlink(path) == 0 && unlink(ROOT "/r3/recover.target") == 0);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* MF-D / X9: from HELD, the retry syncs nothing until the destination is
+ * proven to be the held fd; once it is, the barrier settles VERIFIED. */
+static void t_r3_held_retry_proof(void)
+{
+    const char *path = ROOT "/r3/proof/p.txt";
+    const char *away = ROOT "/r3/proof/" UNCERTAIN_AWAY;
+    put_file(path, "old", 3);
+    (void)unlink(away);
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("proven later");
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    atomic_store(&rename_inject, RENAME_AWAY);
+    file_save_outcome out;
+    CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO && tmp.state == FILE_TEMP_HELD);
+    unsigned syncs = calls_dir_sync;
+    CHECK(file_temp_retry_barrier(&tmp, &out) != FILE_OK);
+    CHECK(out.pub == FILE_PUB_CONFLICT && calls_dir_sync == syncs); /* no proof, no sync */
+    CHECK(tmp.state == FILE_TEMP_HELD && file_eq(path, "old", 3));
+    CHECK(rename(away, path) == 0); /* the installation becomes visible */
+    CHECK(file_temp_retry_barrier(&tmp, &out) == FILE_OK && out.pub == FILE_PUB_VERIFIED);
+    CHECK(calls_dir_sync == syncs + 1);
+    file_temp_discard(&tmp);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* Item 4a: a rename that failed without renaming is a BEFORE-rename
+ * result, and its temp is removed (it is still ours and unpublished). */
+static void t_r3_rename_not_performed(void)
+{
+    const char *dir = ROOT "/r3/unr";
+    const char *path = ROOT "/r3/unr/u.txt";
+    int injects[] = { RENAME_EIO, RENAME_EISDIR };
+    os_err errs[] = { OS_E_IO, OS_E_ISDIR };
+    piece_tree *t = text_tree("never installed");
+    piece_snapshot *s = snap_of(t);
+    for (size_t i = 0; i < 2; i++) {
+        put_file(path, "old", 3);
+        unlink_temps(dir);
+        int fds0 = count_fds();
+        file_expectation exp;
+        os_err oe;
+        CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+        file_temp tmp;
+        memset(&tmp, 0, sizeof tmp);
+        CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+        atomic_store(&rename_inject, injects[i]);
+        file_save_outcome out;
+        CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
+        CHECK(out.pub == FILE_PUB_PRE_RENAME && out.oserr == errs[i]);
+        CHECK(tmp.state == FILE_TEMP_DONE);
+        CHECK(count_temps(dir) == 0 && count_fds() == fds0 && file_eq(path, "old", 3));
+        /* asynchronous: SAVE_DONE leaves IDLE and no temp */
+        open_file(&f1, path, 0);
+        atomic_store(&rename_inject, injects[i]);
+        save_async(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+        CHECK(last_msg.status == FILE_ERR_IO && last_msg.mode == FILE_PUB_PRE_RENAME);
+        CHECK(file_save_phase_of(&f1) == FILE_SAVE_IDLE && count_temps(dir) == 0);
+        CHECK(!file_check(&f1, NULL));
+        close_file(&f1);
+        CHECK(count_fds() == fds0);
+    }
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* Item 4b and X1: a displaced source that moved beyond our own rename is
+ * CONFLICT; the barrier still runs, and no retry turns it into VERIFIED. */
+static const char *r3_hook_link;
+static int r3_hook_op;
+enum { R3_GROW = 1, R3_RELINK, R3_TOUCH_DEST };
+static void r3_renamed_hook(void *ctx, int step)
+{
+    (void)ctx;
+    if (step != FILE_STEP_RENAMED || r3_hook_link == NULL) return;
+    switch (r3_hook_op) {
+    case R3_GROW: { /* the displaced inode grows through its other name */
+        int fd = open(r3_hook_link, O_WRONLY | O_APPEND);
+        if (fd < 0 || write(fd, "XX", 2) != 2 || close(fd) != 0) _exit(91);
+        break;
+    }
+    case R3_RELINK: { /* a link comes back: ctime moves, the count does not fall */
+        char c[4096];
+        strcpy(c, r3_hook_link);
+        strcat(c, ".relink");
+        (void)unlink(c);
+        if (link(r3_hook_link, c) != 0) _exit(92);
+        break;
+    }
+    case R3_TOUCH_DEST: { /* our installed inode's mtime moves (X16) */
+        struct timespec ts[2] = { { 1000000000, 0 }, { 1000000000, 0 } };
+        if (utimensat(AT_FDCWD, r3_hook_link, ts, 0) != 0) _exit(93);
+        break;
+    }
+    }
+    r3_hook_link = NULL;
+}
+static void r3_linked_pair(const char *a, const char *b)
+{
+    put_file(a, "AAAAAAAAAA", 10);
+    (void)unlink(b);
+    CHECK(link(a, b) == 0);
+}
+static void t_r3_source_conflict(void)
+{
+    const char *a = ROOT "/r3/sc/a.txt", *b = ROOT "/r3/sc/b.txt";
+    for (int op = R3_GROW; op <= R3_RELINK; op++) {
+        r3_linked_pair(a, b);
+        open_file(&f1, a, 1);
+        piece_tree *t;
+        CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+        const piece_backing *bk = piece_view_backing(piece_tree_view(t));
+        CHECK(piece_replace(t, 10, 0, (const uint8_t *)"+", 1) == PIECE_OK);
+        piece_snapshot *s = snap_of(t);
+        save_prepare(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+        CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
+        r3_hook_link = b;
+        r3_hook_op = op;
+        file_test_set_step_hook(&f1, r3_renamed_hook, NULL);
+        unsigned syncs = calls_dir_sync;
+        memset(&last_msg, 0, sizeof last_msg);
+        CHECK(file_save_publish(&f1) == FILE_OK);
+        PUMP_UNTIL(&pool, save_done, &f1);
+        file_test_set_step_hook(&f1, NULL, NULL);
+        CHECK(last_msg.status == FILE_ERR_CONFLICT && last_msg.mode == FILE_PUB_CONFLICT);
+        CHECK(calls_dir_sync == syncs + 1); /* the barrier was not skipped */
+        CHECK(file_save_phase_of(&f1) == FILE_SAVE_HELD);
+        CHECK(!file_backing_validate(&f1, bk));
+        memset(&last_msg, 0, sizeof last_msg);
+        CHECK(file_save_retry_barrier(&f1) == FILE_OK);
+        PUMP_UNTIL(&pool, save_done, &f1);
+        CHECK(last_msg.mode == FILE_PUB_CONFLICT); /* never VERIFIED */
+        CHECK(!file_backing_validate(&f1, bk));
+        file_save_abandon(&f1);
+        piece_snapshot_release(s);
+        piece_close(t);
+        close_file(&f1);
+    }
+}
+
+/* X3: a source that changed BEFORE our rename (FORCE skips the recheck)
+ * is never re-baselined by the rename pair. */
+static void t_r3_rebaseline_needs_baseline(void)
+{
+    const char *path = ROOT "/r3/rb/a.txt";
+    put_file(path, "BBBBBBBBBB", 10);
+    open_file(&f1, path, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    const piece_backing *bk = piece_view_backing(piece_tree_view(t));
+    CHECK(piece_replace(t, 0, 0, (const uint8_t *)">", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    save_prepare(&f1, s, file_path(&f1), file_baseline(&f1), FILE_SAVE_FORCE);
+    CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
+    struct stat st;
+    CHECK(stat(path, &st) == 0);
+    int fd = open(path, O_WRONLY);
+    CHECK(fd >= 0 && write(fd, "CCCCCCCCCC", 10) == 10 && close(fd) == 0);
+    restore_mtime(path, &st);
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_publish(&f1) == FILE_OK);
+    PUMP_UNTIL(&pool, save_done, &f1);
+    CHECK(last_msg.mode == FILE_PUB_VERIFIED); /* the destination is ours */
+    CHECK(!file_backing_validate(&f1, bk));    /* the source is not */
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* Item 4c: a relative destination naming the file's own path adopts the
+ * installed baseline like the canonical one. */
+static void t_r3_relative_own_path(void)
+{
+    const char *rel = ROOT "/r3/rel.txt";
+    put_file(rel, "rel", 3);
+    open_file(&f1, rel, 0);
+    CHECK(strcmp(file_path(&f1), rel) != 0); /* canonical differs from rel */
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 3, 0, (const uint8_t *)"+", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    save_async(&f1, s, rel, file_baseline(&f1), 0);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(file_baseline(&f1)->stat.id.index[0] == file_save_outcome_of(&f1)->installed.stat.id.index[0]);
+    CHECK(!file_check(&f1, NULL));
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* X14: a verified save to another path leaves this file's baseline. */
+static void t_r3_saveas_keeps_baseline(void)
+{
+    const char *path = ROOT "/r3/mine.txt", *other = ROOT "/r3/other.txt";
+    put_file(path, "mine", 4);
+    (void)unlink(other);
+    open_file(&f1, path, 0);
+    file_expectation before = *file_baseline(&f1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    piece_snapshot *s = snap_of(t);
+    file_expectation absent;
+    os_err oe;
+    CHECK(file_expectation_observe_path(other, &absent, &oe) == FILE_OK);
+    save_async(&f1, s, other, &absent, 0);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(memcmp(file_baseline(&f1), &before, sizeof before) == 0);
+    CHECK(!file_check(&f1, NULL));
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* X4, X5: decode accepts only the job the slot names: epoch and
+ * generation both count (N8). */
+static int r3_tamper_seen;
+static void r3_tamper_cb(const work_msg *m, void *ud)
+{
+    (void)ud;
+    if (m->kind == FILE_MSG_SAVE_PREPARED && !r3_tamper_seen) {
+        file_msg out;
+        work_msg x = *m;
+        x.epoch_++;
+        CHECK(file_msg_decode(&x, &out) == 1);
+        x = *m;
+        x.generation++;
+        CHECK(file_msg_decode(&x, &out) == 1);
+        r3_tamper_seen = 1;
+    }
+    on_msg(m, ud);
+}
+static void t_r3_decode_identity(void)
+{
+    const char *path = ROOT "/r3/decode.txt";
+    put_file(path, "decode", 6);
+    open_file(&f1, path, 0);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    piece_snapshot *s = snap_of(t);
+    r3_tamper_seen = 0;
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_begin(&f1, s, file_path(&f1), file_baseline(&f1), 0, 5) == FILE_OK);
+    uint64_t deadline = os_now_ns() + UINT64_C(20000000000);
+    while (file_save_phase_of(&f1) != FILE_SAVE_PREPARED) {
+        work_mailbox_drain(&pool, r3_tamper_cb, NULL);
+        CHECK(os_now_ns() < deadline);
+        os_sleep_ns(UINT64_C(1000000));
+    }
+    CHECK(r3_tamper_seen);
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* X8: discard unlinks the temp name only while it still names our fd. */
+static void t_r3_unlink_identity(void)
+{
+    const char *dir = ROOT "/r3/own";
+    const char *path = ROOT "/r3/own/o.txt";
+    put_file(path, "dest", 4);
+    unlink_temps(dir);
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("ours");
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    char tp[4096], fp[4096];
+    CHECK(snprintf(tp, sizeof tp, "%s/%s", dir, tmp.tmp) < (int)sizeof tp);
+    CHECK(snprintf(fp, sizeof fp, "%s/foreign.x", dir) < (int)sizeof fp);
+    put_file(fp, "foreign", 7);
+    CHECK(rename(fp, tp) == 0); /* someone reuses the temp name */
+    file_temp_discard(&tmp);
+    CHECK(file_eq(tp, "foreign", 7)); /* not ours: never unlinked */
+    CHECK(unlink(tp) == 0);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* X15: close readiness waits for a reload job too. */
+static void t_r3_close_waits_reload(void)
+{
+    const char *path = ROOT "/r3/reload.txt";
+    put_file(path, "reloadable", 10);
+    open_file(&f1, path, 1);
+    int g[2];
+    CHECK(pipe(g) == 0);
+    atomic_store(&register_blocked, 0);
+    register_gate_r = g[0];
+    CHECK(file_reload_begin(&f1, 9) == FILE_OK);
+    uint64_t deadline = os_now_ns() + UINT64_C(20000000000);
+    while (!atomic_load(&register_blocked)) {
+        CHECK(os_now_ns() < deadline);
+        os_sleep_ns(UINT64_C(1000000));
+    }
+    file_close_begin(&f1);
+    CHECK(!file_close_ready(&f1)); /* the reload job still runs */
+    CHECK(write(g[1], "x", 1) == 1);
+    PUMP_UNTIL(&pool, close_ready_cond, &f1);
+    file_close_finish(&f1);
+    register_gate_r = -1;
+    close(g[0]);
+    close(g[1]);
+}
+
+/* X16: a foreign touch of our installed inode between rename and
+ * verification is CONFLICT (N2: fd_stat's mtime is compared). */
+static void t_r3_installed_touched(void)
+{
+    const char *path = ROOT "/r3/touch.txt";
+    put_file(path, "before", 6);
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("after!");
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    r3_hook_link = path;
+    r3_hook_op = R3_TOUCH_DEST;
+    file_test_set_step_hook(NULL, r3_renamed_hook, NULL);
+    file_save_outcome out;
+    CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_CONFLICT && out.pub == FILE_PUB_CONFLICT);
+    file_test_set_step_hook(NULL, NULL, NULL);
+    file_temp_discard(&tmp);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* X18: the null-ctx validator refuses a backing file did not create. */
+static void fake_acquire(void *ctx) { (void)ctx; }
+static void fake_release(void *ctx) { (void)ctx; }
+static void t_r3_null_ctx_validator(void)
+{
+    const char *path = ROOT "/r3/nullctx.txt";
+    put_file(path, "null ctx", 8);
+    open_file(&f1, path, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    const piece_backing *b = piece_view_backing(piece_tree_view(t));
+    CHECK(file_backing_validate(NULL, b));
+    piece_backing forged = *b;
+    forged.acquire = fake_acquire;
+    forged.release = fake_release;
+    CHECK(!file_backing_validate(NULL, &forged));
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* Item 5: the creation mask comes from /proc/self/status; unreadable, it
+ * is 077 (the private side). Fresh processes: the value is read once. */
+static void t_r3_creation_mask(void)
+{
+    CHECK(run_child("mask_proc", "027", 027) == 0);
+    CHECK(run_child("mask_fallback", "077", 022) == 0);
+}
+
 /* ---- children (file_test --child NAME ARG) ------------------------------- */
 static uint32_t child_result_perm;
 static const char *child_dir;
@@ -1586,6 +2144,12 @@ static void child_temp_mode(void *ctx, int step)
 }
 static int child_main(const char *name, const char *arg)
 {
+    if (strcmp(name, "mask_proc") == 0 || strcmp(name, "mask_fallback") == 0) {
+        /* Before anything in os can read the mask. */
+        openat_refuse_status = strcmp(name, "mask_fallback") == 0;
+        uint32_t want = (uint32_t)strtoul(arg, NULL, 8);
+        return os_creation_mask() == want ? 0 : 10;
+    }
     CHECK(piece_reserve_create(&reserve) == PIECE_OK);
     piece_tree *t = text_tree("child text");
     piece_snapshot *s = snap_of(t);
@@ -1776,6 +2340,21 @@ int main(int argc, char **argv)
     RUN(t_r2_check_fault_poll);
     RUN(t_r2_source_validation);
     RUN(t_r2_mapped_cancel_lease);
+    RUN(t_r3_unreadable_dest);
+    RUN(t_r3_verify);
+    RUN(t_r3_recover);
+    RUN(t_r3_held_retry_proof);
+    RUN(t_r3_rename_not_performed);
+    RUN(t_r3_source_conflict);
+    RUN(t_r3_rebaseline_needs_baseline);
+    RUN(t_r3_relative_own_path);
+    RUN(t_r3_saveas_keeps_baseline);
+    RUN(t_r3_decode_identity);
+    RUN(t_r3_unlink_identity);
+    RUN(t_r3_close_waits_reload);
+    RUN(t_r3_installed_touched);
+    RUN(t_r3_null_ctx_validator);
+    RUN(t_r3_creation_mask);
     RUN(t_durability);
     FIRED();
     piece_reserve_destroy(reserve);

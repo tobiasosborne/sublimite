@@ -43,6 +43,9 @@ Path diagnosis (MF8, A15): a name never reaches an ASSERT. The results are:
 - trailing `/`, the root included: `OS_E_ISDIR` (`FILE_ERR_NOTREG` on open);
 - `OS_PATH_MAX` bytes or more, or a leaf over NAME_MAX: `OS_E_NAMETOOLONG`.
 A relative path resolves against the working directory. Round 1 accepted those, and the bench and tests use them.
+Round 3 (review N-D): the async prepare rewrites the destination with its canonical directory on the worker, so a
+relative or symlinked spelling of `file_path(f)` adopts its VERIFIED baseline exactly like the canonical one. The leaf
+is kept: a symlink leaf is replaced, never followed, so it is another path.
 
 ## 3. Change detection, the validator, Keep
 
@@ -82,7 +85,8 @@ the trace defeats it. "Adopt a ctime move explained by a falling link count" is 
 trace defeats it: the count did fall. A held descriptor defeats even "link count 0".
 
 **Product consequence, named.** Keep after a foreign replace-by-rename of a mapped (large) file now always refuses.
-The UI must reload, or keep the buffer by value. See §10.
+So do Save and Save As of that buffer, because prepare's source validation refuses the same moved ctime. This is
+MF-A (§10).
 
 ## 4. The save file half and temp custody (erratum 4)
 
@@ -110,31 +114,41 @@ reused temp name (MF2, M18).
 4. It does one closing poll and validates the retained source in full.
 5. It applies metadata. The destination opens `READ | NONBLOCK | NOFOLLOW`. When that open is still the expected
    regular file, its metadata is copied (`os_file_copy_metadata`; the existing mode is kept). When it is another kind or
-   another inode, the result is `FILE_ERR_CHANGED` without FORCE. Otherwise the new-file mode
-   `0666 & ~os_creation_mask()` is applied by `os_file_set_perm` (MF7).
+   another inode, the result is `FILE_ERR_CHANGED` without FORCE. When no copy happens, the mode comes from
+   `os_file_set_perm`. A destination that exists keeps its observed mode: the expectation's for one the owner cannot
+   open (MF-B, round 3: 0060 stays 0060), what is there now under FORCE. Only a name with no destination gets the
+   new-file mode `0666 & ~os_creation_mask()` (MF7). Special bits travel only with the owner, that is through the copy.
 6. It syncs and captures `fd_stat`.
 
 **Mode (MF7, advisor ruling, a deliberate deviation from v1).** v1 gave a new file 0644 whatever the umask (v1
 file.c:908/919 at 6fec2e8). v2 gives `0666 & ~mask`. The mask is captured once, by a constructor in os that runs before
-main and so before any thread exists. That is the only moment the umask can be read (by set-and-restore) without a
-window in which another thread creates a file under the altered mask. Nothing calls `umask(2)` after startup. The two
+main and so before any thread exists. Round 3 (advisor) replaced that: the mask is read once, at the first call, from
+the `Umask:` line of `/proc/self/status`. A read changes nothing, so there is no window and no assumption about
+threads or constructor order. If the line cannot be read, the mask is 077, the private side. No `umask(2)` call
+remains in `src/`. A later change by the process is not seen. There is no os start entry point to hang the read on, and
+a constructor would bring the ordering assumption back, so "at os start" is realized as "at os's first use of it". The two
 modes agree under umask 022, and v2 never widens past the user's umask. The temp is created `0600 & ~m`, so it is never
 wider than a new file's result (P: (0600 & ~m) ⊆ (0666 & ~m)). For an existing destination, the temp grants group and
 other nothing the result lacks. It is owner read/write until the copy applies the predecessor's mode. Narrowing it
 further would break the copy itself: setting a user xattr needs owner write on the inode, even through the fd.
-Alternative considered: reading `Umask:` from `/proc/self/status` (Linux ≥ 4.7) at any time, with no set at all. The
-ruling fixed the startup capture instead.
 
 **Publish** does the following, in order:
 1. It rechecks the destination (unless FORCE).
 2. It takes the before-stat of a displaced source.
 3. It renames once, NOREPLACE for an absent expectation. EXIST and NOTSUP are PRE_RENAME: nothing was renamed, and the
-   temp is cleaned up. Any other error is RENAME_UNCERTAIN, and custody goes to HELD with nothing unlinked.
-4. It runs the rebaseline pair (§3).
-5. It syncs the directory. On failure, custody goes to INSTALLED_UNSYNCED.
+   temp is cleaned up. Any other error is classified by observation, not by errno (round 3, review N-B):
+   - the temp name still names the held fd: nothing was renamed, because a rename removes its source name. That is
+     PRE_RENAME, and the temp is removed (still ours, definitely unpublished);
+   - the destination names the held fd and the temp name is gone: the rename was performed despite the report, so
+     publish continues;
+   - anything else is RENAME_UNCERTAIN, and custody goes to HELD with nothing unlinked.
+4. It runs the rebaseline pair (§3). The verdict, `file_source_pair` OURS or FOREIGN, stays in custody.
+5. It syncs the directory, a FOREIGN pair included (round 3: the rename happened, so the barrier is owed). On
+   failure, custody goes to INSTALLED_UNSYNCED.
 6. It verifies that the path names the written fd, whose size and mtime still equal `fd_stat`. The rename moves only
-   ctime, so a foreign in-place write into our installed inode is a CONFLICT (N2, answered: `fd_stat` is now used).
-   Custody goes to HELD.
+   ctime, so a foreign in-place write into our installed inode is a CONFLICT (N2, answered: `fd_stat` is now used). A
+   FOREIGN pair is CONFLICT at this and every later verification, so no retry turns it into VERIFIED. Custody goes to
+   HELD.
 
 **Retry** (`file_temp_retry_barrier`) only syncs the original directory and re-verifies. It never renames. From HELD,
 after an uncertain rename, it first proves that the path names the held fd, and without that proof it syncs nothing.
@@ -148,7 +162,8 @@ gate.
 
 **file_temp_recover** opens a PREPARED's named candidate and its parent, non-blocking with no leaf follow. On a stable
 match to the whole witness, it transfers them into INSTALLED_UNSYNCED. Otherwise it releases everything and leaves the
-temp EMPTY. `file_save_write`, the one-shot form, discards retained custody before it returns.
+temp EMPTY. A symlink or directory at the name is FILE_ERR_NOTREG, a mismatch class (round 3, review N-F), never the
+I/O error that savectl would retry forever. `file_save_write`, the one-shot form, discards retained custody before it returns.
 
 **NOTSUP fallback (unchanged).** None. An absent target on a filesystem without atomic exclusion is refused, because
 observe-then-REPLACE is the v1 race (Q14). N1 (the recheck-then-REPLACE window for a PRESENT target) stays open by
@@ -227,11 +242,16 @@ adds `os_file_set_perm` and `os_creation_mask`.
 
 - `os_stat.nlink`.
 - `os_file_set_perm` (fchmod through the descriptor; `fchmod` was already granted to os).
-- `os_creation_mask`, with `umask` granted to os in `tools/system-symbols.txt`.
-- One process global, `creation_mask` in `os_posix.c`. It is written once by the constructor before main and read
-  only afterwards. This entry is the decision record CLAUDE.md requires for a global not named in PLAN.
-Tests: `tests/os_test.c` `case_modes`. It covers the startup mask against the live umask, creation `0600 & ~m`,
-set_perm 0640 and 0600, and nlink 1 → 2 → 0.
+- `os_creation_mask`: read once from `/proc/self/status`, 077 if unreadable (round 3). The round 2 `umask` grant is
+  withdrawn from `tools/system-symbols.txt`.
+- Two process globals in `os_posix.c`: `creation_mask` and its `os_once` guard. They are written only inside the once
+  and read only afterwards. This entry is the decision record CLAUDE.md requires for a global not named in PLAN.
+
+Tests:
+- `tests/os_test.c` `case_modes` covers the mask against the live umask (the test itself reads it with umask(2),
+  outside src/), creation `0600 & ~m`, set_perm 0640 and 0600, and nlink 1 → 2 → 0.
+- `tests/file_test.c` `t_r3_creation_mask` re-executes the suite twice. Under umask 027 the value is 027. With the
+  `/proc/self/status` open refused (`--wrap=openat`), it is 077.
 
 ## 9. Round 2 report
 
@@ -328,21 +348,135 @@ the growth comes from three sources:
 - the metadata and mode split.
 The tests grew more than the code.
 
-## 10. Outside scope, reported only
+## 10. Open items (advisor)
 
-- **Keep and by-value capture after a foreign rename of a mapped source.** With ctime strict and one re-baselining
-  point, a foreign replace-by-rename leaves the old mapped inode's ctime moved, so its validator refuses forever (the
-  safe direction, journal.h §5). Keep refuses (§3). A rule-5 conflict checkpoint that reads those mapped spans through
-  the validator would refuse too. Savectl and the journal need a decided route: reload, or capture before detection.
-  That is a product decision for the advisor and Tobias.
+**MF-A: open, v2-hy8, design under signature (docs/decisions/wave1-file-source-witness.md).** The defect: edits to a
+mapped file after a foreign replace-by-rename cannot be saved anywhere. A foreign rename
+over the path drops the old inode's link and moves its ctime. The validator then refuses those intact bytes forever,
+by the round 2 rule. So Keep, Save, Save As to a fresh name, and a conflict checkpoint that reads the mapped spans are
+all refused; only reload remains, and it discards the edits. The reviewer's candidate is a content hash taken off path
+after acquisition, re-checked on a ctime-only drift. Round 3 does not change this behaviour.
+
+**MF-C: stated limit until v2-hy8, which closes it.** The limit: the rename pair can absorb a foreign rewrite inside
+its window. The pair
+re-baselines the displaced backing to a foreign rewrite exactly when all of these coincide:
+1. The displaced inode is writable by another process through a second name (a hard link) or through a descriptor it
+   already holds. The destination path itself names our new inode from the rename on.
+2. That process writes it between our `rename(2)` returning and our after-fstat of the held descriptor. Those are two
+   consecutive syscalls on the publish worker; only the test-only RENAMED step hook runs between them.
+3. The write leaves the size unchanged.
+4. The writer restores the mtime exactly (`touch -r`, `cp -p`, `rsync -t` and similar), so only ctime moves.
+5. The write changes no kind, mode, owner or group, and adds no link: a link added in the window keeps the link count
+   from falling, and that is refused (`t_r3_source_conflict`, relink case).
+
+The pair then shows only "ctime moved, link count fell", which is exactly what our own rename shows. The after ctime
+becomes the baseline, and the validator accepts the foreign bytes as original; undo by reference would restore them.
+Without condition 2, prepare's source validation or the next validation refuses. Without condition 4, the pair is
+FOREIGN. The window is the same class as N1 (recheck-then-REPLACE): inherent to plain rename plus a stat pair, not
+to the code.
+
+## 11. Round 3 report
+
+Input: `docs/reviews/wave1-L2-1-opus-recheck.md`; the advisor's scope items 1–5. Red runs on the round 2 code are in
+`build/r3/red-round2.log`, green runs in `build/r3/green-round3.log`. Each test runs alone with
+`build/san/tests/file_test <name>`.
+
+### Red and green per item
+
+| Item | Test | Red on round 2 | Root cause | Green |
+|---|---|---|---|---|
+| 1 MF-B | `t_r3_unreadable_dest` | `FAIL ... == 0060`: an owner-unreadable 0060 destination became 0644, without and with FORCE | The fallback for "metadata not copied" was the new-file default, whatever the reason the copy did not happen. A destination that exists but cannot be opened was treated like no destination. | ok: the observed mode is kept; the default applies only to a name with no destination |
+| 2 MF-D | `t_r3_verify`, `t_r3_recover`, `t_r3_held_retry_proof` | recover of a symlink: `FAIL ... == FILE_ERR_NOTREG` (it was IO, OS_E_LOOP). The other assertions were already green; their red is the mutants (X6, X7, X9, X13). | The NOFOLLOW open's ELOOP fell into the generic I/O path, so a foreign symlink read as "retry later". The rest was implemented but untested. | ok: content mismatch, re-stat mismatch, a name that moves between its two looks, symlink (CHANGED for verify, NOTREG for recover), and a HELD retry that syncs nothing until proven, then settles VERIFIED |
+| 4a N-B | `t_r3_rename_not_performed` | `FAIL out.pub == FILE_PUB_PRE_RENAME`: EIO or EISDIR with nothing renamed gave RENAME_UNCERTAIN, HELD, and a temp left forever | The classification trusted the errno class: every error other than EXIST/NOTSUP was "uncertain". The kernel's own evidence was never looked at. | ok: classified by observation (§4); PRE_RENAME, temp removed, async IDLE, `file_check` clean |
+| 4b N-C | `t_r3_source_conflict` | `FAIL calls_dir_sync == syncs + 1`: a FOREIGN pair skipped the barrier, and a retry then gave VERIFIED | The source verdict was a return path, not state: CONFLICT returned early, and custody kept no memory of why. | ok: the barrier runs; the verdict lives in custody (`file_source_pair`); retries stay CONFLICT; the validator stays false |
+| 4c N-D | `t_r3_relative_own_path` | `FAIL file_baseline(..) == installed`: a relative self-save read as an external change | Own-path adoption compared spellings (`strcmp(save_dest, f->path)`), but `f->path` is canonical and the destination was not. | ok: the prepare job canonicalizes the directory |
+| 5 umask | `t_r3_creation_mask` | `FAIL run_child("mask_fallback", ...)`: the constructor read the live mask, and nothing could make it fall back | The capture was a set-and-restore at constructor time, which no open failure can affect, and it rested on "no thread before main". | ok: `/proc/self/status`, read once; 077 when unreadable; under umask 027 the value is 027 |
+
+Item 3 is the mutant table below. The round 2 tests `t_r2_uncertain_rename` and `t_r2_abandon_while_publishing` used
+"EIO with nothing renamed" as their uncertain case, which round 3 reclassifies as before-rename. They now use a true
+uncertain case: the temp is moved to a third name and EIO is returned, so neither name proves anything. Their
+evidence assertion follows the temp to that name.
+
+### Mutant table (item 3)
+
+`build/r3/mutate3.py` re-expresses each surviving attack mutant of `build/review-probe/mutate2.py` against the round 3
+code. Each one is applied, the san suite is rebuilt, the named test runs, and the mutant is reverted. `cmp` against
+the saved base passed afterwards.
+
+| # | Mutation | Killed by |
+|---|---|---|
+| X1 | the rebaseline accepts any pair difference | `t_r3_source_conflict` (grow case) |
+| X2 | the rebaseline ignores the falling link count | `t_r3_source_conflict` (relink case) |
+| X3 | the rebaseline does not require before == baseline | `t_r3_rebaseline_needs_baseline` |
+| X4 | decode ignores the epoch | `t_r3_decode_identity` |
+| X5 | decode ignores the generation | `t_r3_decode_identity` |
+| X6 | the witness check skips the content CRC | `t_r3_verify` |
+| X7 | the witness check skips the stable re-stat | `t_r3_verify` |
+| X8 | `temp_unlink_own` drops the identity check | `t_r3_unlink_identity` |
+| X9 | the HELD retry skips the installation proof | `t_r3_held_retry_proof` |
+| X13 | the witness check skips the path stability recheck | `t_r3_verify` |
+| X14 | VERIFIED adoption for a save to another path | `t_r3_saveas_keeps_baseline` |
+| X15 | close readiness ignores the reload slot | `t_r3_close_waits_reload` |
+| X16 | the installation proof ignores the `fd_stat` mtime (N2) | `t_r3_installed_touched` |
+| X18 | the null-ctx validator accepts any backing | `t_r3_null_ctx_validator` |
+
+14 of 14 were killed (P, a count of the rows).
+
+### Sizes
+
+Changed lines against round 2 (`diff`, + added / − removed):
+
+| File | Added | Removed |
+|---|---|---|
+| `src/file/file.c` | 122 | 42 |
+| `src/file/file.h` | 12 | 0 |
+| `src/os/os.h` | 6 | 7 |
+| `src/os/os_posix.c` | 45 | 7 |
+| `tests/file_test.c` | 596 | 17 |
+| `Makefile` | 1 | 1 |
+| `tools/system-symbols.txt` | 0 | 1 |
+
+Comment-free, non-blank lines (`build/r2/ncloc.py`):
+
+| File | Before round 3 | After |
+|---|---|---|
+| `file.c` | 1,873 | 1,932 |
+| `file.h` | 286 | 292 |
+| `os.h` | 244 | 244 |
+| `os_posix.c` | 1,301 | 1,332 |
+
+## 12. Outside scope, reported only
+
+- **MF-A and MF-C**: see §10 (v2-hy8).
+- **Custody hand-over to savectl** (review N-H): the async object keeps custody in `f->save_temp` with no take
+  call. That belongs to savectl's bead.
 - **Publish backpressure spins.** `publish_or_continue` re-queues through `work_continue` on every invocation while the
   mailbox is full, so a bulk worker loops (CPU, not a sleep) until the UI drains. Round 1 behaved the same. It needs a
   wake-on-drain primitive in work.
 - **Chown limitation:** bead v2-jh7 (Tobias). **Publish-by-exchange (N1):** a later bead, by ruling.
 - **file_crc32c** rebuilds its 1 KiB table per call (N9 nit). There is no trace.
+- **The reviewer's suggested separate "source drift" bit** in the outcome (N-C) is not added. Round 3 keeps CONFLICT
+  for both a foreign destination and a FOREIGN pair, as the advisor scoped it. Savectl's CONFLICT_CANCEL therefore
+  still conflates the two.
 - **Worklog and HANDOFF** were not written. Under Law 3 the worker does not touch session state; the coordinator does.
 
-## 11. Lane results
+## 13. Lane results
+
+Round 3 stamp: BAT0 = Not charging, load1 1.30 at the check start and 1.92 at the tsan start (M), 2026-11-25
+05:14–05:17 CET. Logs are in `build/r3/lane-*.log`.
+- `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189`: exit 0, `check: ok`.
+  - check-layers: 6 isolated layer links;
+  - check-san: 33 binaries, `file_test: ok (56 tests)`, `os_test: ok`;
+  - check-law2: 9 release suites, `law2_file_test: ok`;
+  - contract: PASS 64.
+- `nice make -j2 check-tsan`: exit 0. 13 threaded suites passed, `file_test: ok (56 tests)`.
+- `nice make -j2 fuzz-smoke`: exit 0. 16 fuzzers replayed their seeds.
+
+The first `check` attempt failed at check-symbols. The release build's fortify turned the `/proc/self/status`
+`read` into `__read_chk`, which is not granted. The read now goes through `os_file_read` / `os_file_close`, and all
+three lanes were rerun from the start.
+
+Round 2 (for the record):
 
 Stamp: BAT0 = Not charging, load1 0.09 at the start and 0.73 at the tsan start (M), 2026-11-25 04:04–04:09 CET. Logs
 are in `build/r2/lane-*.log`.

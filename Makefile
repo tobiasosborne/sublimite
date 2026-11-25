@@ -229,7 +229,7 @@ LDFLAGS_find_timeout_test := -Wl,--wrap=work_should_stop
 LDFLAGS_journal_codec_test := -Wl,--wrap=base_cpu_has_sse42
 # file (L2-1): sync-barrier and fault-registry failures are injected at the
 # os seam; the six save step hooks link from the FILE_TEST_HOOKS variant.
-LDFLAGS_file_test := -Wl,--wrap=os_file_sync,--wrap=os_dir_sync,--wrap=os_fault_register,--wrap=os_rename_at,--wrap=os_fault_poll,--wrap=os_fault_retire,--wrap=os_unmap
+LDFLAGS_file_test := -Wl,--wrap=os_file_sync,--wrap=os_dir_sync,--wrap=os_fault_register,--wrap=os_rename_at,--wrap=os_fault_poll,--wrap=os_fault_retire,--wrap=os_unmap,--wrap=os_stat_at,--wrap=os_file_pread,--wrap=openat
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/file_test: $(B)/$(c)/src/file/file_test_hooks.o))
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/find_bench_test: $(B)/$(c)/bench/find_bench))
 # Undo (v2-0fv.8) runs on the real tree (v2-0fv.17). Its suite observes the

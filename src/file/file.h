@@ -299,6 +299,17 @@ typedef struct file_save_outcome {
     os_err oserr;
 } file_save_outcome;
 
+/* The displaced source's rename pair (file_temp_publish): NONE when no
+ * displaced source was lent or nothing was renamed yet; OURS when the
+ * pair showed our own rename only; FOREIGN when it showed more. A
+ * FOREIGN pair makes every later verification of this custody CONFLICT,
+ * retries included. */
+typedef enum file_source_pair {
+    FILE_PAIR_NONE = 0,
+    FILE_PAIR_OURS,
+    FILE_PAIR_FOREIGN
+} file_source_pair;
+
 /* Custody of one temp across threads or jobs: fd, directory, temp and
  * destination names, the expectation it was prepared against, its
  * witness and source, all in caller storage. Zero-initialize before
@@ -316,6 +327,7 @@ typedef struct file_temp {
                               * rename moves only its ctime, so size and
                               * mtime still match at verification */
     file_source *source;     /* retained; NULL for private text */
+    file_source_pair pair;
     unsigned flags;          /* FILE_SAVE_FORCE */
 } file_temp;
 

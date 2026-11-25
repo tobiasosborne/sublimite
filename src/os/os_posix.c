@@ -357,16 +357,54 @@ os_err os_file_set_perm(os_file *f, uint32_t perm)
     return rc == 0 ? OS_OK : fail();
 }
 
-/* Written once by the constructor before main (no thread exists yet), then
- * only read: the one process global this needs (os.h os_creation_mask). */
+/* The creation mask, read once from the "Umask:" line of
+ * /proc/self/status (Linux >= 4.7, fs/proc/array.c). Reading it there
+ * changes nothing, so no window exists in which another thread creates a
+ * file under an altered mask, and no assumption about threads is needed;
+ * umask(2) is never called. Unreadable or unparsable: 077, the private
+ * side. (P) The line follows "Name:" and a task name of at most 15
+ * bytes, each escaped to at most 4 ("\ooo"), so it ends within
+ * 6 + 60 + 1 + 7 + 4 + 1 = 79 bytes; 256 B holds it. The once guard is
+ * one of the process globals os keeps (docs/decisions/L2-1-file.md §8). */
+static os_once creation_once = OS_ONCE_INIT;
 static uint32_t creation_mask;
-__attribute__((constructor)) static void capture_creation_mask(void)
+static void read_creation_mask(void)
 {
-    mode_t m = umask(0);
-    (void)umask(m);
-    creation_mask = (uint32_t)m & 0777u;
+    creation_mask = 077u;
+    int fd;
+    RETRY(fd, openat(AT_FDCWD, "/proc/self/status", O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return;
+    os_file f = { fd };
+    char buf[256];
+    size_t have = 0;
+    while (have < sizeof buf - 1) {
+        size_t n = 0;
+        if (os_file_read(&f, buf + have, sizeof buf - 1 - have, &n) != OS_OK || n == 0) break;
+        have += n;
+    }
+    os_file_close(&f);
+    buf[have] = '\0';
+    static const char key[] = "\nUmask:";
+    for (size_t i = 0; i + sizeof key - 1 <= have; i++) {
+        if (memcmp(buf + i, key, sizeof key - 1) != 0) continue;
+        size_t at = i + sizeof key - 1;
+        while (buf[at] == ' ' || buf[at] == '\t') at++;
+        uint32_t m = 0;
+        size_t digits = 0;
+        while (buf[at] >= '0' && buf[at] <= '7' && digits < 4) {
+            m = m * 8u + (uint32_t)(buf[at] - '0');
+            at++;
+            digits++;
+        }
+        if (digits > 0 && buf[at] == '\n') creation_mask = m & 0777u;
+        return;
+    }
 }
-uint32_t os_creation_mask(void) { return creation_mask; }
+uint32_t os_creation_mask(void)
+{
+    os_once_run(&creation_once, read_creation_mask);
+    return creation_mask;
+}
 
 os_err os_file_stat(const os_file *f, os_stat *st)
 {

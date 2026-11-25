@@ -84,13 +84,12 @@ _Noreturn void os_assert_fail(const char *file, int line, const char *expr);
 /* The build supplies EDIT_APP_ID. */
 const char *os_app_id(void);
 
-/* The process file-creation mask (umask) captured once, by a constructor in
- * os that runs before main and so before any thread exists. umask(2) can
- * only be read by setting it, and a set-and-restore while another thread
- * creates a file would create that file under the wrong mask; the start of
- * the process is the one moment with no such thread. Nothing calls umask(2)
- * after it, so a later change by the process is not seen (L2-1 round 2,
- * advisor ruling on review finding 7). */
+/* The process file-creation mask (umask), read once at the first call from
+ * the "Umask:" line of /proc/self/status: a read that changes nothing, so
+ * it has no window and assumes nothing about threads. umask(2) is never
+ * called. If the line cannot be read the mask is 077 (the private side).
+ * A later change by the process is not seen (L2-1 round 3, advisor). Any
+ * thread. */
 uint32_t os_creation_mask(void);
 
 /* Monotonic time for deadlines, in nanoseconds. */
