@@ -60,7 +60,24 @@ branches: push each at every pause or session end; delete the remote branch once
     keeps, writes v2-4ht.md, shows red/green, lists the EDIT-INTEGRATION cases, compares the double with the real
     journal, and judges the two out-of-brief edits (undo's static maintain_retired, the render smoke placeholder).
     original_generation in edit_options is SIGNED and in the edit spec.
-  - CLAUDE QUEUE, each at room >= 1.0, one at a time: the L2-1 adversarial read, 2b-1, EDIT-CORE's finishing pass.
+  - L2-1 STATE (2026-11-25):
+    - round 1 (Muse) got DO NOT LAND from a fresh Opus review (10 MUST-FIX);
+    - round 2 (Opus) fixed all ten (re-check: 23/23 mutants caught), but 4 new MUST-FIX and 14 new-code survivors;
+    - ROUND 3 runs on the round-2 thread: MF-B, MF-D, the 14 survivors, the EIO/EISDIR, dirsync and relative-path
+      NOTEs, and the umask read from /proc/self/status (077 fallback);
+    - then the reviewer re-checks again, then the advisor's owner read, then L2-1 LANDS with MF-A and MF-C stated OPEN.
+    Branch review/l2-1c (2108374).
+    - MF-C is accepted as a stated limit (same class as N1).
+    - MF-A gets a source-witness design (Astra, docs/decisions/wave1-file-source-witness.md), then bead v2-hy8 (P1,
+      Claude, blocks the Wave 1 exit).
+    - Tobias questions: v2-jh7 (chown), v2-b4y (export-to-new-name).
+    - Sol: v2-sve (work wake-on-drain) after Astra's job.
+    - The savectl brief carries custody hand-over (GAP 2) as an explicit open item.
+    - The deletion review table gets file 2,159 vs v1 1,664, with the reason, and asks whether the custody states can
+      be fewer.
+    - Publish-by-exchange BREAKS (wave1-publish-by-exchange.md); rename-over with its stated window stays.
+  - CLAUDE QUEUE, each at room >= 1.0, one at a time: L2-1 round 3, its re-check, 2b-1 (after the advisor's L5 read),
+    EDIT-CORE's finishing pass, then the source-witness bead v2-hy8.
   - Codex: Astra on the Wave 2 harvest (docs/decisions/wave2-L3-L4-harvest.md), document only. Muse: no dispatch while
     unreadable.
   - Serial chains:
