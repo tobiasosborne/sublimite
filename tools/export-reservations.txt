@@ -98,3 +98,15 @@ config_toml_parse LF-2-toml # The unit in one paragraph and opening scope. Wave 
 dnd_parse_uri_list LF-1-dnd # The module in one paragraph. The GUI drop handler decodes a text/uri-list payload into an IPC open request.
 
 work_mailbox_receive wave1-export-triage # Advisor decisions. Temporary pending the L2-1 file integration decision on selective receive.
+
+# Signed Wave 2 render front door and headless descriptor; L5/backend integration follows.
+render_measure wave2-render-spec # Headers as text. Common physical admission for L5 and backend setup.
+render_open wave2-render-spec # Headers as text. L5 funds prepaid packet and driver storage.
+render_bind wave2-render-spec # Headers as text. L5 installs the current binding and sheet.
+render_image_changed wave2-render-spec # Headers as text. Font settlement forwards through the L5 adapter.
+render_submit wave2-render-spec # Headers as text. L5 accepts one immutable frame and its input association.
+render_event wave2-render-spec # Headers as text. L5 routes typed native/work evidence and pumps recovery.
+render_pending wave2-render-spec # Headers as text. L5 schedules runnable work or waits for a wake.
+render_stats wave2-render-spec # Headers as text. L5 reads accepted association, timing and outcome.
+render_close wave2-render-spec # Headers as text. L5 retires the service by physical quiescence.
+render_driver_null wave2-render-spec # Backend-facing public factories. Headless descriptor and conformance oracle.

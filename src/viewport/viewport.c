@@ -1,8 +1,8 @@
 #include "viewport/viewport.h"
 
-#include "render/render.h"
+#include "edit/edit.h"
 
 size_t viewport_smoke(void)
 {
-	return render_smoke();
+	return edit_smoke();
 }
