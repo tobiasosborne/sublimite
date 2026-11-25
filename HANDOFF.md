@@ -40,6 +40,18 @@ branches: push each at every pause or session end; delete the remote branch once
     - Codex (serial): v2-677 permission bits (Sol, running; fix in os_file_copy_metadata, test in os_persist_test; the
       file-suite assertion is added by the L2-1 merge). Then Astra answers her ten L5 questions as errata (section
       "Errata proposed by the L5 spec" in wave1-app-spec.md). The advisor reads the L5 spec and the errata together.
+  - L5 RULING (advisor, 2026-11-25 01:30): Wave 1 gets a MINIMAL L5. A save whose displaced generation has any
+    dependent other than the saver is REFUSED, visibly, and tested. Session-level peer protection, closed-kept and
+    imported drafts, eviction and reopen move to the Wave 3 session vertical. The L2 peer mechanism stays as signed.
+    - Signed L5 errata: 1 (release_fence settlement; EDIT_SAVE_FORGOTTEN), 2 (journal_new_owner, journal_source_key),
+      3 (file_target as a value; savectl_identity deleted), 4 (file_temp_verify/recover, HELD), 5 (pending cutoff on a
+      recovered buffer; backing-owned validation context), 8 (runnable queries; completion published before the wake),
+      9 (JOURNAL_SELF_CONTAINED_LIMIT as a constant).
+    - Not signed: 6 (deferred) and 7 (Astra to answer).
+    - Astra is redrawing the spec. When the redraw is signed:
+      - errata 3/4/5 become ONE follow-up file bead; L2-1 lands as reviewed, without them;
+      - errata 2/8/9 go into the 2b-1 brief;
+      - erratum 1 and the edit event go into the savectl and EDIT-CORE briefs.
   - Serial chains:
     - Codex: N2 (LANDED 1.27), then Astra's N2 landing read (docs/reviews/wave1-N2-astra.md), then Astra's minimal
       L5 spec (docs/decisions/wave1-app-spec.md; PLAN 4.7: app_loop, app_buffers, app_save, app_session, the headless
