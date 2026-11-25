@@ -117,10 +117,16 @@ branches: push each at every pause or session end; delete the remote branch once
     Codex (advisor, 07:55): Wave 2 design runs now on Astra, one at a time. It touches no Wave 1 file.
     1. viewport + layout SIGNED (16ffada, now on v2; A29 entered). Sol implements viewport (running);
     2. render frame contract: done (fb7776c), signed in substance;
-    3. font revision F3–F8 + R-C (replacing F2), WITH the render errata R-A and R-B in the same Astra job (briefs
-       wave2-font-sendback.md and wave2-render-errata.md). Render is SIGNED IN SUBSTANCE (fb7776c), including the
-       PLAN §4.6 amendment text;
-    4. plat.
+    3. font and render SIGNED (af0e95e, both on v2; A30 entered);
+    4. plat (Astra, running); then Astra re-reviews viewport round 3 (it goes first if Sol's round arrives while plat
+       is far from done).
+    SOL'S ORDER after viewport lands, one bead each: (1) render_types.h, the common render service with render_submit
+    and the null driver; (2) layout; (3) font and font_async; (4) the backends, after plat is signed. Astra reviews
+    each; the advisor reads the header in full, her review, and the diff of any send-back.
+    EVERY WAVE 2 IMPLEMENTATION BRIEF carries three lines: (a) the header holds the whole contract as comments, so the
+    next module's implementer never opens the .c file; (b) a rule another module also needs has one implementation
+    and one public constant, never a second copy; (c) benches are per step and per whole operation, on an ordinary
+    and a worst fixture, stamped with power and load.
     After each signature, Sol implements from the signed text.
   - Codex: Astra on the Wave 2 harvest (docs/decisions/wave2-L3-L4-harvest.md), document only. Muse: no dispatch while
     unreadable.

@@ -527,3 +527,10 @@ Findings, none blocking:
 - Survivors R5f, R5h and R5i/j go to v2-4xk. R5i/j needs a decision there: either os distinguishes EMFILE from EIO, or
   the recover rule is restated in terms of what os can report.
 
+## A30. Render, GL and font: backend-owned atlas with tile deltas (advisor, 2026-11-25; docs/decisions/wave2-render-spec.md at af0e95e)
+Amends PLAN §4.6, and the font row of §2 to match.
+> **PLAN §4.6, Render & GL & Font.** Keep depth-one T5/device and terminal presentation retirement, with quiescent restart on loss. Shared render_submit_prep admits a common physical frame capacity and snapshots changed cells, fixed-region damage and bounded, tight R8 tile deltas into prepaid frame storage. The backend applies deltas to its private atlas before drawing. A cell waiting for its current tile keeps its geometry and paints background until delivery. Rebuild backend residency from the active font generation on restart. Keep identical pixel-Q8 sampling on GL and XShm, baked ASCII cold start, high-DPI admission and font_async as sole runtime glyph source. Font retention follows CPU publications and physical font jobs. Backend fences retire backend resources. Measure the GL 3.3-compatible direct-cell/TBO upload candidates and ship one baseline-compatible winner.
+The atomic inline PLAT_EV_KEY, the coherent PLAT_EV_SURFACE, X11 GL/XShm and Wayland EGL-only decisions in §4.6 stand.
+Signed with the Wave 2 render frame contract and the Wave 2 font contract (docs/decisions/wave2-font-spec.md at
+af0e95e).
+

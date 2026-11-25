@@ -294,4 +294,7 @@ E8 (VP_WAIT; viewport owner read, V5). viewport_progress gains VP_WAIT: "blocked
 call again when that evidence changes". The step returns it for an inexact SEEK_LINE answer, and the port may return it
 too. The one-indexed-attempt-per-rank-observation rule belongs to the driver that receives VP_WAIT, and the header says
 so.
+(Advisor, 2026-11-25, at the font signature.) The layout_paint callback shapes in this text are NO LONGER provisional.
+If the first implementer finds a mismatch with font_async_lookup, that is an erratum to bring to the advisor, not a
+local convention.
 
