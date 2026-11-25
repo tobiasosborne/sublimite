@@ -285,4 +285,13 @@ E6 (Home; from v2-1sg Q2). There is no physical Home in Wave 2. HOME is visual H
 words "physical-line Home" (from E4) named an action that does not exist and are struck from the HOME row and from the
 paragraph under the table. The rank/select algorithm stays for SELECT_LINE only. A distinct logical-line Home bound to a
 key at the v1 pin, if any, is a harvest finding for the Wave 3 keys work.
+E7 (REFLOW; viewport owner read, V4). REFLOW does not carry the previous width in `target`, a field that means a byte or
+a line everywhere else. The S2 table's REFLOW row reads: "V keeps the selection it is given; the issuer clears the
+preference on a width change". Whoever changes the width (L5, where the geometry serial is minted) clears
+preferred_col in the selection it puts into the REFLOW intent. Viewport's REFLOW never inspects `target` and never
+compares widths.
+E8 (VP_WAIT; viewport owner read, V5). viewport_progress gains VP_WAIT: "blocked on evidence only the driver can obtain;
+call again when that evidence changes". The step returns it for an inexact SEEK_LINE answer, and the port may return it
+too. The one-indexed-attempt-per-rank-observation rule belongs to the driver that receives VP_WAIT, and the header says
+so.
 
