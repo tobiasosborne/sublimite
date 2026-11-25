@@ -148,7 +148,8 @@ typedef enum edit_kind {
     EDIT_TYPE, EDIT_DELETE_FORWARD, EDIT_BACKSPACE
 } edit_kind;
 typedef enum edit_save_event {
-    EDIT_SAVE_CAPTURED, EDIT_SAVE_INSTALLED, EDIT_SAVE_RELEASED
+    EDIT_SAVE_CAPTURED, EDIT_SAVE_INSTALLED, EDIT_SAVE_RELEASED,
+    EDIT_SAVE_FORGOTTEN
 } edit_save_event;
 
 /* The options carry the fields named below; edit_create copies them and
@@ -262,8 +263,18 @@ bool edit_take_change(edit_buffer *b, edit_change *out);
  * RELEASED drops the cutoff after definitive cancellation/failure.
  * The caller matches the admitted incarnation and holds at most one cutoff
  * (G, one active save per controller). CAPTURED requires a complete
- * published boundary. The other events require an owned cutoff.
- * A retriable or ambiguous save keeps its cutoff. */
+ * published boundary. INSTALLED and RELEASED require the matching owned
+ * cutoff. FORGOTTEN clears only the saved bookmark, is idempotent and
+ * requires no cutoff. Deliver it in the same UI publication as
+ * invalidation of the saved association, including Keep, detachment and
+ * idle conflict. Preserve any independent in-flight bookmark. On rejection
+ * of a complete FINISHED at verification, release the matching edit
+ * cutoff and forget saved on entry to IDLE_CHANGED. The journal cutoff and
+ * index claim survive through durable conflict protection. In other
+ * ambiguous cases retain the edit cutoff until its definitive disposition.
+ * Deliver INSTALLED on verified durable install or RELEASED once on
+ * definitive non-install if still owned. (Erratum: L5 item 1, signed by the
+ * advisor 2026-11-25.) */
 void edit_save_boundary(edit_buffer *b, edit_save_event event);
 
 /* The UI calls this after submit or upon open or activation outside

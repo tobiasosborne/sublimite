@@ -8,8 +8,7 @@ Routing: Sol. No process kill, no truncated mapping, no real journal. Kill cuts 
 Depends on:
 - N2 (v2-zh6: wire amendment + pure reader) landed;
 - the validator erratum (v2-bkz: piece_validate_fn) landed;
-- the piece pinned-store reader erratum (proposal docs/decisions/wave1-piece-span-reader.md, pending signature; its
-  implementation is Claude/Muse) landed.
+- the piece pinned-store reader erratum (v2-40h: piece_snapshot_read_span + D1' + the undo owner-abort rule) landed as 1.31.
 LANDING ORDER (coordinator's note for the advisor): EDIT-CORE can be written and tested against the double as soon as
 those three land. It LANDS only after 2b-1. The L2 layer check links libL2.a whole-archive, and edit.o's journal_*
 calls resolve only once 2b-1 defines them. The worker adds no stub definitions to src/journal/.
@@ -57,6 +56,16 @@ Scope:
   piece_lines_resolve, then piece_replenish, then undo_maintain. It runs outside the input-to-submit window, with no
   resolve while a replay is prepared. Its three budgets are the caller's numbers, derived at the call site (Law 4); the
   edit header says so.
+- Signed errata since the edit spec was signed (2026-11-25):
+  - EDIT_SAVE_FORGOTTEN (L5 item 1), now in the edit spec at edit_save_boundary. FORGOTTEN clears only the saved
+    bookmark, is idempotent, needs no cutoff, and is delivered in the same UI publication that invalidates the saved
+    association. INSTALLED only follows a verified durable install, and RELEASED comes once on a definitive
+    non-install. The cutoff is retained while a settlement is ambiguous. Each rule is a test.
+  - D1' on edit's failure path: on CONFLICT from undo_commit or any failed undo call, do journal_command_abort, then
+    release the candidate snapshot, then undo_abort, in that order and in one dispatch. No undo call closes a
+    checkpoint by itself (undo.h, 1.31). Test: abort with a live provisional snapshot dies; the ordered path does not.
+  - Every source-coordinate literal (a restore of bytes absent from the document) is read with
+    piece_snapshot_read_span (piece.h, 1.31), with scratch of at most one record.
 - The burst policy: join within 300 ms, (G) v1 parity with its source line.
 - Every compound command is atomic. On any refusal nothing changes and the refusal is visible.
 
