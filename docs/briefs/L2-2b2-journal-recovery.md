@@ -70,6 +70,22 @@ Scope:
   - Never seek past corruption to apply a later marker.
   - Nobody deletes a set-aside image automatically; the user is told where it is.
 
+SIGNED L5 ERRATA FOR THIS BEAD (advisor 2026-11-25, verbatim from docs/decisions/wave1-app-spec.md at a53a0f6):
+
+**journal.h runtime.** Replace the BUFFER member in `journal_recovery_item.value` and extend its ownership comment.
+
+```c
+struct {
+    uint64_t owner, current_id, saved_id;
+    piece_tree *tree;
+    journal_cutoff *pending;
+} buffer;
+```
+
+> BUFFER transfers the original writer cutoff for a selected open PREPARED, otherwise NULL. Match it to the selected CONTROL by owner/token. Preserve its image, reserved closing credits, embargo and evidence. The cursor releases untaken trees and cutoffs. A taken cutoff transfers once to the recovering disposition owner. A mapped BUFFER tree uses a file-created piece_backing whose context owns the file_source for that mapping. Private and unresolved text require no mapped source. Retain EVIDENCE for each unresolved origin.
+
+Erratum 2's restart sentence: "On restart advance past the preamble high-waters and every retained mention, including discarded owners, orphan declarations and TABS entries."
+
 Acceptance (each a test, red first):
 - PLAN §4.2 at journal level. Kill at every member and marker of a command group and of a checkpoint group, with
   acknowledged keys of the same and other buffers interleaved. Before ACK: pre-edit or whole-edit; after ACK: whole-edit.

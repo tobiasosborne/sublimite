@@ -474,3 +474,21 @@ PLAN §4.4's "orthogonal four axes" are observables, not stored fields.
 - The edit-core and edit-integration briefs are SIGNED. EDIT-CORE is developed against the double after N2, v2-bkz and
   the piece reader erratum, and lands after 2b-1, with its landing reads done on the wip.
 
+## Wave 1 L5 contract signed (advisor, 2026-11-25 20:25 CET)
+docs/decisions/wave1-app-spec.md, read in full at a53a0f6 (body and errata), is SIGNED as the minimal Wave 1 L5
+contract: 22 commands, 20 public functions (loop 5, buffers 8, save 3, session 4), zero L5 save phases (A27), and step
+3's fairness per A28(6).
+Where each erratum goes:
+- 2b-1: erratum 2 (without its restart and rotation sentences), the journal.h part of 8, and erratum 9's "existing
+  checkpoint slot".
+- 2b-2: the journal.h part of 5, and erratum 2's restart sentence.
+- 2b-3: erratum 9's constant and derivation, and the high-waters through rotation.
+- savectl brief: erratum 1, the savectl parts of 3 and 5, and savectl_runnable from 8.
+- EDIT-CORE finishing pass: confirm the edit.h parts of 1 and 8.
+- L5 brief: erratum 9's session policy, plus three corrections:
+  (1) intake against an intersecting claim is always REFUSED, busy, naming the holder. The FIFO head may wait only on
+      something that completes without later input from the same stream, and the worker lists every head wait and
+      what ends it;
+  (2) the active owner is defined at the ADMISSION of CLOSE_DISCARD;
+  (3) app_next_deadline_ns returns OS_DEADLINE_NEVER in Wave 1 unless a real deadline source is named.
+

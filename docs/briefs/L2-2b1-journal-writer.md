@@ -79,6 +79,34 @@ Scope:
 - One -Wswitch-enum state enum per independent axis (for example worker transport; recovery suspension). State why each
   is independent, or merge them.
 
+SIGNED L5 ERRATA FOR THIS BEAD (advisor 2026-11-25, verbatim from docs/decisions/wave1-app-spec.md at a53a0f6):
+
+### 2. Journal lineage allocation
+
+**journal.h runtime.** Insert after `journal_append`.
+
+```c
+journal_err journal_new_owner(journal *j, uint64_t *owner);
+journal_err journal_source_key(journal *j, const journal_generation *source,
+                               uint64_t *key, journal_request **declaration);
+```
+
+> new_owner allocates a fresh nonzero owner from the writer's buffer high-water. source_key accepts a validated acquisition's canonical location, fd-derived wire identity and prefix witness; ignore the input key and flags. Reuse the active matching declaration with its current policy and return its key and a null declaration. Otherwise allocate from capture's generation high-water and admit the GENERATION append, returning its key and original owned request. Serialize competing lookups through declaration visibility or reconciliation. Exclude staged and abandoned install keys. Check outputs and counter exhaustion before admission; refusal preserves outputs. Burn allocated numbers for this writer lifetime.
+
+(Erratum 2's restart sentence is 2b-2's; its rotation sentence is 2b-3's.)
+
+### 8. Runnable service and finish-before-wake
+
+**journal.h runtime.** Add beside `journal_service`.
+
+```c
+bool journal_runnable(const journal *j);
+```
+
+> Inspect present continuations on the UI without I/O. Return true when another service opportunity can advance a record, adoption, barrier or retirement now. Waiting only for a worker, explicit retry or unchanged external dependency is quiescent. Delivery and returned capacity re-enable eligible work. An admitted journal_sync records its required position and returns the owned request. Only the writer submits ready barriers, at the end of the record round after external producers have had their opportunities. Advance each ready class in rotation and rotate instances within classes. Use one ready record per opportunity, the smallest positive fair record quantum. A blocked class counts as visited. A newly ready record may start the next turn.
+
+Of erratum 9, only this: the small-draft checkpoint uses the EXISTING checkpoint slot, so 2b-1 adds no second slot and hard-codes no size.
+
 Acceptance (each a test, red first):
 - The typing-path append and the command group under the release malloc guard (active && count == 0; law2 suite).
 - Fair service: a large checkpoint or long command on buffer A does not delay a one-byte key on buffer B beyond the

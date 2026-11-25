@@ -87,6 +87,9 @@ branches: push each at every pause or session end; delete the remote branch once
     then the landing.
   - v2-4xk (P2, Claude, after L2-1, blocks the Wave 1 exit and savectl): the changed side named, plus named tests for
     the 15 round-3 survivors and X12.
+  - L5 SPEC SIGNED (2026-11-25 20:25). Erratum placement and the three L5-brief corrections are recorded in
+    wave0-plan-amendments.md, "Wave 1 L5 contract signed". The 2b-1/2b-2/2b-3 briefs now carry their errata verbatim.
+    The savectl and L5 briefs (not yet written) must carry theirs.
   - Source witness: SIGNED at 9968034 as v2-hy8's contract.
   - New bead v2-4xk (Claude): file's publish/verify results name the changed side (source vs destination). It blocks the
     savectl bead.

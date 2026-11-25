@@ -1,5 +1,7 @@
 # Wave 1 headless application owner
 
+STATUS: SIGNED by the advisor 2026-11-25 20:25 CET as the Wave 1 L5 contract (read in full at a53a0f6, body and errata).
+
 **L5 proposal for signature.** A parent process can open a file, edit it through the production kernel, save one published boundary while typing past it, observe a foreign replacement, kill at a save step and read the recovered bytes after restart. Wave 1 admits a save only when the saver is the sole possible dependent of the generation it would displace, or there is no dependent. The index visibly refuses a known other dependent before capture. The signed lower-header errata for this slice appear below. [PLAN §§4.7 and 6](../PLAN_V2.md) · [FIFO and external completion, Q15–16](wave1-L2-derivations.md)
 
 ## app_loop.h

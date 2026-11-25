@@ -67,6 +67,24 @@ Scope:
   - Measure and report how long a checkpoint of that size takes to become durable under typing, as a tracked number,
     not as the source of the constant.
 
+SIGNED L5 ERRATA FOR THIS BEAD (advisor 2026-11-25, verbatim from docs/decisions/wave1-app-spec.md at a53a0f6):
+
+### 9. Journal volume policy
+
+**journal.h runtime.** Insert a header constant beside the checkpoint contract. In the following replacement template L2-2b-3 substitutes its derived unsigned byte count for `@LIMIT_BYTES@` and records the pin, rotation budget and margin in the adjacent comment. The value is inclusive.
+
+```c
+/* Whole-text/delta split at the v1 parity pin. Reduce only if one such
+ * framed checkpoint plus the stated margin exceeds the rotation budget. */
+#define JOURNAL_SELF_CONTAINED_LIMIT UINT64_C(@LIMIT_BYTES@)
+```
+
+> After the first acknowledged edit whose published text length is at most JOURNAL_SELF_CONTAINED_LIMIT and whose recovery still depends on a source, the session retains its validated snapshot, IDs and intended TARGET. After submit request an ordinary by-value checkpoint and sync through its visible COMMIT. Secure an independent suffix from BEGIN, including Undo between literal records. For a restart-resolvable ORIGINAL, settle any provisional reference to its key and publish its monotone VALUE_ONLY redeclaration before BEGIN. ADD and materialized private bytes emit literals. If edits advanced the boundary, take the current matching snapshot and IDs at BEGIN. Recheck eligibility and source on change. Retain the protection obligation on a refused claim and retry on progress. A newer qualifying boundary can satisfy it. First becoming small on a later ACK qualifies. Use the existing checkpoint slot. The edit ACK does not wait for this covering sync.
+
+L2-2b-3 sets the numeric constant from journal volume and reports time to durability under typing separately. Ordinary rotation already has an exact-match switch and a parent barrier. [Rotation bead and derivation](../briefs/L2-2b3-journal-rotation.md)
+
+Erratum 2's rotation sentence: "Carry both high-waters through rotation."
+
 Acceptance (each a test, red first):
 - Rotation is deferred while a token, pinned cutoff or open group is live.
 - An exact-match switch, with the parent barrier gating new credits. A miss leaves the old image active and loses
