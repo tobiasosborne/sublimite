@@ -11,13 +11,25 @@
  * The metered port then hands out only the evidence asked for by a motion. */
 enum { FLAT_S = 32768, FLAT_D = 2 * FLAT_S + 4 };
 typedef struct {
+    size_t row, next;
+    uint64_t column;
+} viewport_flat_byte;
+
+typedef enum { FLAT_READY, FLAT_DELAYED, FLAT_COLUMN } flat_query_state;
+
+typedef struct {
     const uint8_t *text;
     size_t length, rows, wrap_cols;
     viewport_row_cert *row;
     uint64_t *lines;
+    viewport_flat_byte *at;
     size_t line_count, counted, window_cap;
-    size_t calls[VP_LOGICAL_START + 1], bytes, row_hops;
-    bool delay, waiting;
+    size_t calls[VP_LOGICAL_START + 1], bytes, row_hops, work;
+    size_t column_cursor, column_visits;
+    viewport_request neighbors[2]; /* two operands per page (S2) */
+    size_t neighbor_requests;
+    bool delay;
+    flat_query_state state;
     viewport_request pending;
 } viewport_flat;
 
@@ -48,6 +60,8 @@ static inline void flat_rows(viewport_flat *f, size_t first, size_t stop, bool s
                 row = pos;
                 row_col = col;
             }
+            for (size_t i = pos; i < pos + used; ++i)
+                f->at[i] = (viewport_flat_byte){.next = pos + used, .column = col};
             pos += used;
             col += cells;
         }
@@ -66,7 +80,8 @@ static inline viewport_flat flat_open(const uint8_t *text, size_t len, size_t wr
     viewport_flat f = {.text = text, .length = len, .wrap_cols = wrap_cols, .window_cap = FLAT_S};
     f.row = calloc(len + 1, sizeof *f.row);
     f.lines = calloc(len + 1, sizeof *f.lines);
-    assert(f.row && f.lines);
+    f.at = calloc(len + 1, sizeof *f.at);
+    assert(f.row && f.lines && f.at);
     f.line_count = 1;
     f.counted = len;
     size_t first = 0, last_hard = 0, seam = 0;
@@ -95,6 +110,11 @@ static inline viewport_flat flat_open(const uint8_t *text, size_t len, size_t wr
         }
     }
     flat_rows(&f, first, len, synthetic, false, f.line_count - 1);
+    for (size_t r = 0; r < f.rows; ++r) {
+        uint64_t stop = r + 1 < f.rows ? f.row[r + 1].byte : len + 1;
+        for (uint64_t i = f.row[r].byte; i < stop; ++i)
+            f.at[i].row = r;
+    }
     return f;
 }
 
@@ -102,18 +122,13 @@ static inline void flat_close(viewport_flat *f)
 {
     free(f->row);
     free(f->lines);
+    free(f->at);
 }
 
 static inline size_t flat_row_at(const viewport_flat *f, uint64_t byte, bool trailing)
 {
-    size_t lo = 0, hi = f->rows;
-    while (hi - lo > 1) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (f->row[mid].byte <= byte)
-            lo = mid;
-        else
-            hi = mid;
-    }
+    assert(byte <= f->length);
+    size_t lo = f->at[byte].row;
     if (trailing && lo && f->row[lo].byte == byte && f->row[lo - 1].end == byte)
         --lo;
     return lo;
@@ -158,30 +173,60 @@ static inline bool flat_same_request(viewport_request a, viewport_request b)
     return false;
 }
 
+static inline uint64_t flat_screen_column(const viewport_flat *f, viewport_row_cert row,
+                                            uint64_t byte)
+{
+    uint64_t logical = byte >= row.end ? row.end_column : f->at[byte].column;
+    return row.indent + logical - row.col;
+}
+
+static inline viewport_progress flat_column_query(viewport_flat *f, const viewport_request *r,
+                                                  size_t *credit, viewport_evidence *e, bool resume)
+{
+    viewport_row_cert row = f->row[flat_row_at(f, r->as.column.row_byte, false)];
+    if (!resume)
+        f->column_cursor = (size_t)row.byte;
+    const uint64_t want = r->as.column.screen_column;
+    while (f->column_cursor < row.end) {
+        if (!*credit) {
+            f->state = FLAT_COLUMN;
+            f->pending = *r;
+            return VP_MORE;
+        }
+        --*credit;
+        ++f->work;
+        ++f->column_visits;
+        uint64_t col = flat_screen_column(f, row, f->column_cursor);
+        size_t next = f->at[f->column_cursor].next;
+        if (col >= want || flat_screen_column(f, row, next) > want)
+            break;
+        f->column_cursor = next;
+    }
+    e->point = f->column_cursor;
+    return VP_DONE;
+}
+
 static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
                                            size_t *credit, viewport_evidence *e)
 {
     viewport_flat *f = ctx;
     assert(*credit);
     ++f->calls[r->kind];
-    if (f->delay && !f->waiting) {
+    flat_query_state previous = f->state;
+    if (f->delay && previous == FLAT_READY) {
         f->pending = *r;
-        f->waiting = true;
+        f->state = FLAT_DELAYED;
         return VP_MORE;
     }
-    if (f->waiting)
+    if (previous != FLAT_READY)
         assert(flat_same_request(*r, f->pending));
-    f->waiting = false;
-    *e = (viewport_evidence){.length = f->length};
+    f->state = FLAT_READY;
+    *e = (viewport_evidence){0};
     size_t i;
     switch (r->kind) {
     case VP_WINDOW: {
         uint64_t byte = r->as.window.byte;
-        if (byte >= f->length) {
-            --*credit;
-            e->off = f->length;
-            return VP_DONE;
-        }
+        assert(byte < f->length);
         /* Keep a window aligned to its admitted size. Tests vary both the
          * cap and the grant, including windows of a single byte. */
         size_t n = *credit < f->window_cap ? *credit : f->window_cap;
@@ -192,13 +237,15 @@ static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
         e->bytes = f->text + e->off;
         *credit -= e->len;
         f->bytes += e->len;
+        f->work += e->len;
         return VP_DONE;
     }
     case VP_ROW:
         e->row = f->row[flat_row_at(f, r->as.row.byte, r->as.row.trailing)];
-        e->count = flat_col(f, e->row, r->as.row.byte, UINT64_MAX);
+        e->screen_column = flat_screen_column(f, e->row, r->as.row.byte);
         break;
     case VP_NEIGHBOR: {
+        f->neighbors[f->neighbor_requests++ % 2] = *r;
         size_t src = flat_row_at(f, r->as.neighbor.byte, r->as.neighbor.trailing);
         int64_t delta = r->as.neighbor.displacement;
         uint64_t hops = delta < 0 ? (uint64_t)(-(delta + 1)) + 1 : (uint64_t)delta;
@@ -212,12 +259,10 @@ static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
         break;
     }
     case VP_COLUMN:
-        i = flat_row_at(f, r->as.column.row_byte, false);
-        e->point = flat_col(f, f->row[i], f->length, r->as.column.screen_column);
-        break;
+        return flat_column_query(f, r, credit, e, previous == FLAT_COLUMN);
     case VP_LOGICAL_RANK:
-        for (i = 1; i < f->line_count && f->lines[i] <= r->as.logical_rank.byte; ++i) {}
-        e->count = i - 1;
+        i = flat_row_at(f, r->as.logical_rank.byte, false);
+        e->count = f->row[i].exact_line;
         e->exact = r->as.logical_rank.byte <= f->counted;
         break;
     case VP_LOGICAL_START:
@@ -227,12 +272,13 @@ static inline viewport_progress flat_query(void *ctx, const viewport_request *r,
         e->exact = e->off <= f->counted;
         if (!e->exact) {
             e->off = f->counted;
-            for (i = 1; i < f->line_count && f->lines[i] <= e->off; ++i) {}
-            e->count = i - 1;
+            i = flat_row_at(f, e->off, false);
+            e->count = f->row[i].exact_line;
         }
         break;
     }
     --*credit;
+    ++f->work;
     return VP_DONE;
 }
 
@@ -240,7 +286,7 @@ static inline viewport_answer flat_motion(viewport_motion *m, viewport_flat *f,
                                           viewport_intent in, viewport_frame frame,
                                           size_t grant)
 {
-    viewport_motion_begin(m, &in, frame);
+    viewport_motion_begin(m, &in, frame, f->length);
     viewport_port port = {f, flat_query};
     viewport_answer out = {0};
     size_t credit = 0;
@@ -248,9 +294,9 @@ static inline viewport_answer flat_motion(viewport_motion *m, viewport_flat *f,
     assert(out.intent_serial == 0);
     for (;;) {
         credit = grant;
-        size_t before = f->bytes;
+        size_t before = f->work;
         viewport_progress progress = viewport_motion_step(m, &port, &credit, &out);
-        assert(credit <= grant && f->bytes - before <= grant - credit);
+        assert(credit <= grant && f->work - before <= grant - credit);
         if (progress == VP_DONE) {
             assert(out.intent_serial == in.serial);
             return out;

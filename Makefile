@@ -203,6 +203,8 @@ $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/ipc_test: $(B)/$(c)/src/ipc/ipc_
 $(B)/fuzz/ipc_fuzz: $(B)/fuzz/src/ipc/ipc_posix_test_hooks.o
 # Work tests also exercise the private admission and mailbox limits.
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/work_test: $(B)/$(c)/src/work/work_test_hooks.o))
+# Meter actual motion-decoder bytes through the same L1 call in each test lane.
+LDFLAGS_viewport_test := -Wl,--wrap=utf8_grapheme_step
 # The UTF-8 fixtures check the private scalar width and backward step as well.
 $(foreach c,rel san tsan,$(eval $(B)/$(c)/tests/utf8_test: $(B)/$(c)/src/utf8/utf8_test_hooks.o))
 $(B)/fuzz/utf8_fuzz: $(B)/fuzz/src/utf8/utf8_test_hooks.o
