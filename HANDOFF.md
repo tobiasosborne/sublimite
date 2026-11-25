@@ -86,11 +86,10 @@ branches: push each at every pause or session end; delete the remote branch once
     - R3-C: recover classifies EACCES/NOENT as a mismatch.
     Then a re-check limited to MF-E, R3-A, R3-C and a rerun of all mutants; then the advisor's single owner read;
     then the landing.
-  - L2-1 ROUND 5 (round-2 worker): MF-F (file_check's source comparison for mapped only; Keep must not make the
-    buffer deaf); R4-A (a pre-rename observation, no errno trusted); the R4l rule in file.h; and an ENUMERATION
-    table of every source and destination check site, with its backing kinds and its killing test, fixing any
-    third MF-E-class site in this round. Then the reviewer verifies the table, the three fixes and the mutants;
-    then the advisor's single owner read; then the landing.
+  - L2-1 LANDED as 1.33 (f80cd9e; docs d1e8f6e). Owner-read findings O1–O6 are in the amendments ("L2-1 landed").
+    v2-4xk is widened to the file follow-up (O1, O2, N-C, survivors), P1, next on Claude before 2b-1. O3 goes to the
+    N1-window bead; O4 (delete the file object's async save pipeline) belongs to the savectl brief; O5 (file
+    opaque?) and R5-B go to the deletion review.
   - Wave 1 deletion review question (advisor): does a copy buffer need to hold the original fd after the load? If
     not, close it at OPEN_READY.
   - Viewport/layout r2: SIGNED IN SUBSTANCE. Errata E1–E4 (S from G5, not the slice: candidate S = 32,768) are in
