@@ -37,7 +37,11 @@ branches: push each at every pause or session end; delete the remote branch once
           6fec2e8; the advisor adds it to v1's backlog), recorded in docs/decisions/L2-1-file.md with the reason: it
           agrees with v1 under umask 022 and never widens past the user's umask. Assertions: umask 022 gives 0644,
           umask 077 gives 0600, and the temp is never wider than the result.
-    - Open with Tobias (advisor): may Codex run two jobs at once (Astra on documents, Sol on code, disjoint files) while far behind pace? Until he answers, one Codex job at a time.
+    - CODEX RULE (Tobias, 21:45 CET 2026-11-25: "codex is fine, there is really plenty"): two Codex jobs may run at
+    once, one Astra and one Sol, on disjoint files. Take a reading at each Codex dispatch, and hold a dispatch if Codex
+    is < 2.0 behind. Claude and Muse are unchanged (one job each; Claude at room >= 1.0; no Muse while unreadable).
+    Every Wave 2 review goes to Astra; Opus reviews only Wave 1 work that the Codex filter refuses. The advisor reads
+    diffs, not whole files.
   - Codex (serial): v2-677 permission bits (Sol, running; fix in os_file_copy_metadata, test in os_persist_test; the
       file-suite assertion is added by the L2-1 merge). Then Astra answers her ten L5 questions as errata (section
       "Errata proposed by the L5 spec" in wave1-app-spec.md). The advisor reads the L5 spec and the errata together.
