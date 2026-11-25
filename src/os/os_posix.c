@@ -231,6 +231,7 @@ static void from_stat(os_stat *o, const struct stat *s)
     o->perm = (uint32_t)(s->st_mode & 07777);
     o->uid = (uint32_t)s->st_uid;
     o->gid = (uint32_t)s->st_gid;
+    o->nlink = (uint64_t)s->st_nlink;
 }
 
 /* ---- file handles ------------------------------------------------------- */
@@ -349,6 +350,24 @@ os_err os_file_pwrite_once(os_file *f, const void *buf, size_t n, uint64_t offse
     *done = (size_t)r;
     return OS_OK;
 }
+os_err os_file_set_perm(os_file *f, uint32_t perm)
+{
+    int rc;
+    RETRY(rc, fchmod(f->fd, (mode_t)(perm & 07777u)));
+    return rc == 0 ? OS_OK : fail();
+}
+
+/* Written once by the constructor before main (no thread exists yet), then
+ * only read: the one process global this needs (os.h os_creation_mask). */
+static uint32_t creation_mask;
+__attribute__((constructor)) static void capture_creation_mask(void)
+{
+    mode_t m = umask(0);
+    (void)umask(m);
+    creation_mask = (uint32_t)m & 0777u;
+}
+uint32_t os_creation_mask(void) { return creation_mask; }
+
 os_err os_file_stat(const os_file *f, os_stat *st)
 {
     struct stat s;

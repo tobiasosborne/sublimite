@@ -113,6 +113,7 @@ sem_post               os # last handler leaving a retiring fault slot (async-si
 sem_wait               os # retiring owner waits for admitted fault handlers
 sigaction              os # query, install and reset the SIGBUS action (fault service)
 sigemptyset            os # empty mask for the fault chain's default action
+umask                  os # read the creation mask once at process start (os_creation_mask)
 unlinkat               os # directory-relative name removal
 write                  os # sequential write or eventfd signal
 

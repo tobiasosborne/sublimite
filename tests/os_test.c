@@ -908,6 +908,42 @@ static void case_known_dirs(void)
     puts("os_test: namespace ok");
 }
 
+/* L2-1 round 2: the link count, the startup creation mask and the
+ * permission seam (docs/decisions/L2-1-file.md, MF5 and MF7). */
+static void case_modes(void)
+{
+    /* The mask os captured at process start equals the one this test
+     * process still runs under (nothing here changes it before now). */
+    mode_t m = umask(0);
+    umask(m);
+    CHECK(os_creation_mask() == (uint32_t)m);
+    os_dir dir = OS_DIR_INIT;
+    OK(os_dir_open(&dir, work_root));
+    os_file f = OS_FILE_INIT;
+    OK(os_file_open_at(&f, &dir, "modes.bin", OS_OPEN_RDWR | OS_OPEN_CREATE | OS_OPEN_EXCL));
+    os_stat st;
+    OK(os_file_stat(&f, &st));
+    CHECK(st.perm == (0600u & ~(uint32_t)m) && st.nlink == 1);
+    OK(os_file_set_perm(&f, 0640));
+    OK(os_file_stat(&f, &st));
+    CHECK(st.perm == 0640);
+    OK(os_file_set_perm(&f, 0600));
+    OK(os_stat_at(&dir, "modes.bin", OS_STAT_NOFOLLOW, &st));
+    CHECK(st.perm == 0600);
+    char a[OS_PATH_MAX], b[OS_PATH_MAX];
+    join(a, sizeof a, work_root, "modes.bin");
+    join(b, sizeof b, work_root, "modes.lnk");
+    CHECK(link(a, b) == 0);
+    OK(os_file_stat(&f, &st));
+    CHECK(st.nlink == 2);
+    OK(os_unlink_at(&dir, "modes.lnk"));
+    OK(os_unlink_at(&dir, "modes.bin"));
+    OK(os_file_stat(&f, &st));
+    CHECK(st.nlink == 0);
+    os_file_close(&f);
+    os_dir_close(&dir);
+}
+
 static const struct {
     const char *name;
     void (*run)(void);
@@ -917,6 +953,7 @@ static const struct {
     {"threads", case_threads},
     {"wake", case_wake},
     {"files", case_files},
+    {"modes", case_modes},
     {"dirs", case_dirs},
     {"locks", case_locks},
     {"map", case_map},
