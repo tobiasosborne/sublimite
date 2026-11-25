@@ -81,7 +81,7 @@ os_err __wrap_os_fault_register(const os_map *v, os_fault_id *o)
  * and EIO is returned, so neither name proves anything (a true
  * uncertain outcome). */
 enum { RENAME_PASS = 0, RENAME_EIO, RENAME_EISDIR, RENAME_AWAY, RENAME_AWAY_BLOCK,
-       RENAME_FOREIGN, RENAME_BACK };
+       RENAME_FOREIGN, RENAME_BACK, RENAME_EACCES, RENAME_DONE_EIO, RENAME_SWAP };
 #define UNCERTAIN_AWAY "uncertain.away"
 static _Atomic int rename_inject;
 static _Atomic unsigned calls_rename;
@@ -99,6 +99,20 @@ os_err __wrap_os_rename_at(const os_dir *a, const char *b, const os_dir *c,
         return OS_E_IO; /* reported, but nothing renamed */
     case RENAME_EISDIR:
         return OS_E_ISDIR;
+    case RENAME_EACCES:
+        return OS_E_ACCESS;
+    case RENAME_SWAP: {
+        /* Nothing renamed; a foreign file now holds our temp name. */
+        char p[4096];
+        if (snprintf(p, sizeof p, "%s.swap", rename_foreign_path) >= (int)sizeof p) _exit(94);
+        put_file(p, "swapped in", 10);
+        if (rename(p, rename_foreign_path) != 0) _exit(95);
+        return OS_E_IO;
+    }
+    case RENAME_DONE_EIO: {
+        os_err e = __real_os_rename_at(a, b, c, d, m);
+        return e != OS_OK ? e : OS_E_IO;
+    }
     case RENAME_AWAY_BLOCK: {
         char g;
         ssize_t n = read(rename_gate_r, &g, 1);
@@ -154,6 +168,9 @@ os_err __wrap_os_file_pread(os_file *f, void *buf, size_t n, uint64_t off, size_
 /* The /proc/self/status read behind os_creation_mask, refused on demand
  * (the child "mask_fallback" arms it before the first read). */
 static int openat_refuse_status;
+/* Round 5 (R4l): one transient open failure of a named leaf. */
+static char openat_fail_leaf[OS_NAME_MAX];
+static int openat_fail_errno;
 int __real_openat(int dirfd, const char *path, int flags, ...);
 int __wrap_openat(int dirfd, const char *path, int flags, ...)
 {
@@ -166,6 +183,11 @@ int __wrap_openat(int dirfd, const char *path, int flags, ...)
     }
     if (openat_refuse_status && strcmp(path, "/proc/self/status") == 0) {
         errno = EACCES;
+        return -1;
+    }
+    if (openat_fail_errno != 0 && strcmp(path, openat_fail_leaf) == 0) {
+        errno = openat_fail_errno;
+        openat_fail_errno = 0;
         return -1;
     }
     return __real_openat(dirfd, path, flags, mode);
@@ -548,6 +570,7 @@ static void t_sigbus(void)
     uint32_t reasons = 0;
     CHECK(file_check(&f1, &reasons));
     CHECK((reasons & (FILE_CHG_FAULTED | FILE_CHG_TRUNCATED | FILE_CHG_SIZE)) != 0);
+    CHECK((reasons & FILE_CHG_TRUNCATED) != 0); /* enumeration A8 */
     CHECK(!file_backing_validate(&f1, b));
     CHECK(file_resolve_keep(&f1) == FILE_ERR_CHANGED);
     piece_close(t);
@@ -1731,6 +1754,11 @@ static void t_r3_recover(void)
     memset(&rec, 0, sizeof rec);
     CHECK(file_temp_recover(&rec, path, &bad, &oe) == FILE_ERR_CHANGED);
     CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
+    /* another inode with the same bytes (enumeration B8) */
+    bad = w;
+    bad.index_low ^= 1u;
+    CHECK(file_temp_recover(&rec, path, &bad, &oe) == FILE_ERR_CHANGED);
+    CHECK(rec.state == FILE_TEMP_EMPTY && count_fds() == fds0);
     /* re-stat mismatch (X7 through recover) */
     strcpy(pread_touch_path, path);
     atomic_store(&pread_touch, 1);
@@ -2117,6 +2145,17 @@ static void t_r3_null_ctx_validator(void)
     forged.acquire = fake_acquire;
     forged.release = fake_release;
     CHECK(!file_backing_validate(NULL, &forged));
+    /* Enumeration A3: each identity field counts, with either ctx. */
+    piece_backing other = *b;
+    other.fault.gen++;
+    CHECK(!file_backing_validate(NULL, &other) && !file_backing_validate(&f1, &other));
+    other = *b;
+    other.len--;
+    CHECK(!file_backing_validate(NULL, &other) && !file_backing_validate(&f1, &other));
+    other = *b;
+    other.ctx = &other; /* not this file's backing */
+    CHECK(!file_backing_validate(&f1, &other));
+    CHECK(file_backing_validate(&f1, b));
     piece_close(t);
     close_file(&f1);
 }
@@ -2268,6 +2307,335 @@ static void t_r4_recover_unreadable_absent(void)
     piece_close(t);
 }
 
+/* ---- round 5 (re-check docs/reviews/wave1-L2-1-opus-recheck3.md) ------ */
+
+/* MF-F: for a copy buffer the old inode backs nothing on screen, so Keep
+ * sticks; and Keep never makes the buffer deaf to the next change. */
+enum { R5_CHMOD = 0, R5_INPLACE, R5_ATOMIC };
+static void r5_foreign_change(const char *path, int op, int round)
+{
+    switch (op) {
+    case R5_CHMOD:
+        CHECK(chmod(path, round % 2 == 0 ? 0640 : 0600) == 0);
+        break;
+    case R5_INPLACE: { /* a different length each time: never invisible to stat */
+        int fd = open(path, O_WRONLY | O_TRUNC);
+        size_t n = (size_t)(3 + round);
+        CHECK(fd >= 0 && write(fd, "INPLACEINPLACE", n) == (ssize_t)n && close(fd) == 0);
+        break;
+    }
+    case R5_ATOMIC:
+        r4_foreign_atomic_save(path, round % 2 == 0 ? "atomic even" : "atomic odd!");
+        break;
+    }
+}
+static void t_r5_copy_keep_sticks(void)
+{
+    const char *path = ROOT "/r5/keep.txt";
+    for (int op = R5_CHMOD; op <= R5_ATOMIC; op++) {
+        put_file(path, "original", 8);
+        open_file(&f1, path, 0);
+        CHECK(file_open_mode(&f1) == FILE_MODE_COPY);
+        piece_tree *t;
+        CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+        CHECK(piece_replace(t, 0, 0, (const uint8_t *)"kept ", 5) == PIECE_OK);
+        piece_snapshot *s = snap_of(t);
+        CHECK(!file_check(&f1, NULL));
+        r5_foreign_change(path, op, 0);
+        CHECK(file_check(&f1, NULL));
+        CHECK(file_resolve_keep(&f1) == FILE_OK);
+        uint32_t reasons = 0xffu;
+        CHECK(!file_check(&f1, &reasons) && reasons == FILE_CHG_NONE); /* Keep sticks */
+        save_async(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+        CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+        file_save_abandon(&f1);
+        CHECK(!file_check(&f1, NULL)); /* and stays clean after a save */
+        /* Not deaf: a second foreign change at the path is reported. */
+        r5_foreign_change(path, op, 1);
+        reasons = 0;
+        CHECK(file_check(&f1, &reasons) && reasons != FILE_CHG_NONE);
+        CHECK(file_resolve_keep(&f1) == FILE_OK);
+        CHECK(!file_check(&f1, NULL));
+        piece_snapshot_release(s);
+        piece_close(t);
+        close_file(&f1);
+    }
+}
+
+/* R4-A: "definitely not renamed" is judged against the destination as
+ * observed just before the rename, in every mode: under FORCE with a
+ * stale expectation, EIO, EACCES and a real EISDIR each leave no temp
+ * and a clean PRE_RENAME. */
+static void t_r5_force_not_renamed(void)
+{
+    const char *dir = ROOT "/r5/force";
+    const char *path = ROOT "/r5/force/f.txt";
+    piece_tree *t = text_tree("forced");
+    piece_snapshot *s = snap_of(t);
+    int injects[] = { RENAME_EIO, RENAME_EACCES, RENAME_PASS /* real EISDIR */ };
+    os_err errs[] = { OS_E_IO, OS_E_ACCESS, OS_E_ISDIR };
+    for (size_t i = 0; i < 3; i++) {
+        (void)rmdir(path);
+        put_file(path, "old", 3);
+        unlink_temps(dir);
+        int fds0 = count_fds();
+        file_expectation stale;
+        os_err oe;
+        CHECK(file_expectation_observe_path(path, &stale, &oe) == FILE_OK);
+        r4_foreign_atomic_save(path, "foreign now"); /* the expectation goes stale */
+        file_temp tmp;
+        memset(&tmp, 0, sizeof tmp);
+        CHECK(file_temp_prepare(&tmp, path, s, NULL, &stale, FILE_SAVE_FORCE, &oe) == FILE_OK);
+        if (i == 2) CHECK(unlink(path) == 0 && mkdir(path, 0700) == 0);
+        atomic_store(&rename_inject, injects[i]);
+        file_save_outcome out;
+        CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
+        CHECK(out.pub == FILE_PUB_PRE_RENAME && out.oserr == errs[i]);
+        CHECK(tmp.state == FILE_TEMP_DONE && count_temps(dir) == 0 && count_fds() == fds0);
+        if (i < 2) CHECK(file_eq(path, "foreign now", 11));
+        else CHECK(rmdir(path) == 0);
+    }
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* R4l: a transient open error on recover (EIO, EMFILE) stays an I/O error,
+ * which keeps the obligation: the next attempt recovers. */
+static void t_r5_recover_transient(void)
+{
+    const char *path = ROOT "/r5/recover5.txt";
+    file_temp tmp;
+    piece_tree *t;
+    piece_snapshot *s;
+    r3_install(path, &tmp, &t, &s);
+    file_witness w = tmp.witness;
+    file_temp_discard(&tmp);
+    int errnos[] = { EIO, EMFILE };
+    for (size_t i = 0; i < 2; i++) {
+        file_temp rec;
+        memset(&rec, 0, sizeof rec);
+        os_err oe = OS_OK;
+        strcpy(openat_fail_leaf, "recover5.txt");
+        openat_fail_errno = errnos[i];
+        CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_ERR_IO && oe == OS_E_IO);
+        CHECK(openat_fail_errno == 0 && rec.state == FILE_TEMP_EMPTY);
+        CHECK(file_temp_recover(&rec, path, &w, &oe) == FILE_OK); /* obligation kept */
+        CHECK(rec.state == FILE_TEMP_INSTALLED_UNSYNCED);
+        file_temp_discard(&rec);
+    }
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* The third MF-E site (enumeration, §14): the rename pair compares the
+ * displaced source's fd stat; for a copy buffer it protects nothing, so
+ * a foreign change to the old inode in the window never makes our own
+ * installed text a CONFLICT. */
+static void t_r5_copy_pair(void)
+{
+    const char *a = ROOT "/r5/pair/a.txt", *b = ROOT "/r5/pair/b.txt";
+    r3_linked_pair(a, b);
+    open_file(&f1, a, 0);
+    CHECK(file_open_mode(&f1) == FILE_MODE_COPY);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    CHECK(piece_replace(t, 10, 0, (const uint8_t *)"+", 1) == PIECE_OK);
+    piece_snapshot *s = snap_of(t);
+    save_prepare(&f1, s, file_path(&f1), file_baseline(&f1), 0);
+    CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
+    r3_hook_link = b;
+    r3_hook_op = R3_GROW;
+    file_test_set_step_hook(&f1, r3_renamed_hook, NULL);
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_publish(&f1) == FILE_OK);
+    PUMP_UNTIL(&pool, save_done, &f1);
+    file_test_set_step_hook(&f1, NULL, NULL);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(file_eq(a, "AAAAAAAAAA+", 11));
+    CHECK(!file_check(&f1, NULL));
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* ---- round 5 enumeration pins (docs/decisions/L2-1-file.md §14) ------- */
+
+/* A6: the rename pair runs only on the DISPLACED mapped source. A mapped
+ * Save As to another name displaces nothing of ours, so a drift of the
+ * source in the window does not disprove the destination (erratum 1). */
+static void t_r5_mapped_saveas_pair(void)
+{
+    const char *a = ROOT "/r5/msa/a.txt", *as = ROOT "/r5/msa/as.txt";
+    put_file(a, "mapped source", 13);
+    put_file(as, "another file", 12); /* present: the pair must still not run */
+    open_file(&f1, a, 1);
+    piece_tree *t;
+    CHECK(file_open_tree(&f1, reserve, &t) == FILE_OK);
+    piece_snapshot *s = snap_of(t);
+    file_expectation other;
+    os_err oe;
+    CHECK(file_expectation_observe_path(as, &other, &oe) == FILE_OK && other.presence == FILE_PRESENT);
+    save_prepare(&f1, s, as, &other, 0);
+    CHECK(file_save_phase_of(&f1) == FILE_SAVE_PREPARED);
+    r3_hook_link = a; /* the source's mtime moves inside the window */
+    r3_hook_op = R3_TOUCH_DEST;
+    file_test_set_step_hook(&f1, r3_renamed_hook, NULL);
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_save_publish(&f1) == FILE_OK);
+    PUMP_UNTIL(&pool, save_done, &f1);
+    file_test_set_step_hook(&f1, NULL, NULL);
+    CHECK(last_msg.status == FILE_OK && last_msg.mode == FILE_PUB_VERIFIED);
+    CHECK(file_eq(as, "mapped source", 13));
+    file_save_abandon(&f1);
+    piece_snapshot_release(s);
+    piece_close(t);
+    close_file(&f1);
+}
+
+/* A10, A11: acquisition requires the canonical name to be the opened
+ * inode, before and after the read; and a regular file. */
+static void t_r5_open_identity(void)
+{
+    const char *path = ROOT "/r5/oid.txt";
+    put_file(path, "identity", 8);
+    for (int lie = 1; lie <= 2; lie++) { /* first look (A10), second look (A11) */
+        memset(&f1, 0, sizeof f1);
+        memset(&last_msg, 0, sizeof last_msg);
+        atomic_store(&stat_at_lie_on, lie);
+        CHECK(file_open_begin(&f1, &pool, path, NULL) == FILE_OK);
+        PUMP_UNTIL(&pool, open_settled, &f1);
+        CHECK(last_msg.kind == FILE_MSG_OPEN_FAILED && last_msg.status == FILE_ERR_CHANGED);
+        CHECK(atomic_load(&stat_at_lie_on) == 0);
+        close_file(&f1);
+    }
+    /* A11: the fd stat moves during the read (bytes unchanged). */
+    memset(&f1, 0, sizeof f1);
+    memset(&last_msg, 0, sizeof last_msg);
+    strcpy(pread_touch_path, path);
+    atomic_store(&pread_touch, 1);
+    CHECK(file_open_begin(&f1, &pool, path, NULL) == FILE_OK);
+    PUMP_UNTIL(&pool, open_settled, &f1);
+    CHECK(last_msg.kind == FILE_MSG_OPEN_FAILED && last_msg.status == FILE_ERR_CHANGED);
+    close_file(&f1);
+    const char *fifo = ROOT "/r5/oid.fifo";
+    (void)unlink(fifo);
+    CHECK(mkfifo(fifo, 0600) == 0);
+    memset(&f1, 0, sizeof f1);
+    memset(&last_msg, 0, sizeof last_msg);
+    CHECK(file_open_begin(&f1, &pool, fifo, NULL) == FILE_OK);
+    PUMP_UNTIL(&pool, open_settled, &f1);
+    CHECK(last_msg.kind == FILE_MSG_OPEN_FAILED && last_msg.status == FILE_ERR_NOTREG);
+    close_file(&f1);
+    CHECK(unlink(fifo) == 0);
+}
+
+/* B8: the witness check refuses a non-regular candidate as NOTREG. */
+static void t_r5_recover_fifo(void)
+{
+    const char *fifo = ROOT "/r5/rf.fifo";
+    mkpath(fifo);
+    (void)unlink(fifo);
+    CHECK(mkfifo(fifo, 0600) == 0);
+    file_witness w;
+    memset(&w, 0, sizeof w);
+    file_temp rec;
+    memset(&rec, 0, sizeof rec);
+    os_err oe = OS_OK;
+    CHECK(file_temp_recover(&rec, fifo, &w, &oe) == FILE_ERR_NOTREG);
+    CHECK(rec.state == FILE_TEMP_EMPTY);
+    CHECK(unlink(fifo) == 0);
+}
+
+/* B13: Keep refuses a path that is no longer a regular file. */
+static void t_r5_keep_kind(void)
+{
+    const char *path = ROOT "/r5/kk.txt";
+    (void)unlink(path); /* a killed earlier run may have left the FIFO */
+    put_file(path, "regular", 7);
+    open_file(&f1, path, 0);
+    CHECK(unlink(path) == 0 && mkfifo(path, 0600) == 0);
+    CHECK(file_check(&f1, NULL));
+    CHECK(file_resolve_keep(&f1) == FILE_ERR_CHANGED);
+    CHECK(file_changed(&f1));
+    close_file(&f1);
+    CHECK(unlink(path) == 0);
+}
+
+/* B6: a rename performed despite an error report proceeds to the barrier
+ * and verification: VERIFIED, our text installed, no temp left. */
+static void t_r5_renamed_despite_eio(void)
+{
+    const char *dir = ROOT "/r5/deio";
+    const char *path = ROOT "/r5/deio/d.txt";
+    put_file(path, "old", 3);
+    unlink_temps(dir);
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("installed anyway");
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    atomic_store(&rename_inject, RENAME_DONE_EIO);
+    file_save_outcome out;
+    CHECK(file_temp_publish(&tmp, &out) == FILE_OK && out.pub == FILE_PUB_VERIFIED);
+    CHECK(file_eq(path, "installed anyway", 16) && count_temps(dir) == 0);
+    file_temp_discard(&tmp);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* B6: the temp name holds a foreign file after a failed rename: neither
+ * name proves anything, so UNCERTAIN, and the foreign file stays. */
+static void t_r5_temp_name_swapped(void)
+{
+    const char *dir = ROOT "/r5/swap";
+    const char *path = ROOT "/r5/swap/s.txt";
+    put_file(path, "old", 3);
+    unlink_temps(dir);
+    file_expectation exp;
+    os_err oe;
+    CHECK(file_expectation_observe_path(path, &exp, &oe) == FILE_OK);
+    piece_tree *t = text_tree("ours");
+    piece_snapshot *s = snap_of(t);
+    file_temp tmp;
+    memset(&tmp, 0, sizeof tmp);
+    CHECK(file_temp_prepare(&tmp, path, s, NULL, &exp, 0, &oe) == FILE_OK);
+    CHECK(snprintf(rename_foreign_path, sizeof rename_foreign_path, "%s/%s", dir, tmp.tmp) <
+          (int)sizeof rename_foreign_path);
+    atomic_store(&rename_inject, RENAME_SWAP);
+    file_save_outcome out;
+    CHECK(file_temp_publish(&tmp, &out) == FILE_ERR_IO);
+    CHECK(out.pub == FILE_PUB_RENAME_UNCERTAIN && tmp.state == FILE_TEMP_HELD);
+    file_temp_discard(&tmp);
+    CHECK(file_eq(rename_foreign_path, "swapped in", 10) && file_eq(path, "old", 3));
+    CHECK(unlink(rename_foreign_path) == 0);
+    piece_snapshot_release(s);
+    piece_close(t);
+}
+
+/* B12, B13: a path that cannot be observed (its parent denies search) is
+ * a change for file_check, and an I/O refusal for Keep, never adoption. */
+static void t_r5_check_unobservable(void)
+{
+    const char *dir = ROOT "/r5/noperm";
+    const char *path = ROOT "/r5/noperm/x.txt";
+    (void)chmod(dir, 0700); /* a failed earlier run may have left it closed */
+    put_file(path, "hidden", 6);
+    open_file(&f1, path, 0);
+    file_expectation before = *file_baseline(&f1);
+    CHECK(chmod(dir, 0600) == 0); /* no search permission */
+    uint32_t reasons = 0;
+    CHECK(file_check(&f1, &reasons) && (reasons & FILE_CHG_METADATA) != 0);
+    CHECK(file_os_err(&f1) == OS_E_ACCESS);
+    CHECK(file_resolve_keep(&f1) == FILE_ERR_IO);
+    CHECK(memcmp(file_baseline(&f1), &before, sizeof before) == 0);
+    CHECK(chmod(dir, 0700) == 0);
+    close_file(&f1);
+}
+
 /* ---- children (file_test --child NAME ARG) ------------------------------- */
 static uint32_t child_result_perm;
 static const char *child_dir;
@@ -2362,7 +2730,8 @@ static int child_main(const char *name, const char *arg)
         *strrchr(dirbuf, '/') = '\0';
         int temps = count_temps(dirbuf);
         CHECK(unlink(arg) == 0);
-        if (rc == FILE_OK || temps != 0) return 7;
+        int want = strcmp(name, "fifo") == 0 ? FILE_ERR_NOTREG : FILE_ERR_CHANGED;
+        if (rc != want || temps != 0) return 7;
         return 0;
     }
     return 8;
@@ -2506,6 +2875,17 @@ int main(int argc, char **argv)
     RUN(t_r4_mapped_still_refuses);
     RUN(t_r4_rename_back);
     RUN(t_r4_recover_unreadable_absent);
+    RUN(t_r5_copy_keep_sticks);
+    RUN(t_r5_force_not_renamed);
+    RUN(t_r5_recover_transient);
+    RUN(t_r5_copy_pair);
+    RUN(t_r5_mapped_saveas_pair);
+    RUN(t_r5_open_identity);
+    RUN(t_r5_recover_fifo);
+    RUN(t_r5_keep_kind);
+    RUN(t_r5_renamed_despite_eio);
+    RUN(t_r5_temp_name_swapped);
+    RUN(t_r5_check_unobservable);
     RUN(t_durability);
     FIRED();
     piece_reserve_destroy(reserve);

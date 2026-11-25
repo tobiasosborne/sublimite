@@ -50,11 +50,15 @@ is kept: a symlink leaf is replaced, never followed, so it is another path.
 ## 3. Change detection, the validator, Keep
 
 **file_check** combines three things:
-- the path observation against the path baseline;
-- the held fd against the backing's baseline, through the same classifier, ctime included (MF6), plus TRUNCATED for a
-  mapping;
-- one closing fault poll.
-A failed fd stat is a change (N3).
+- the path observation against the path baseline (both kinds; a failed observation is a change);
+- for a MAPPED backing only, the held fd against the backing's baseline, through the same classifier, ctime included
+  (MF6), plus TRUNCATED; a failed fd stat is a change (N3);
+- for a MAPPED backing only, one closing fault poll.
+
+A copy buffer's old inode backs nothing on screen, so it has no source leg (round 5, review MF-F). Before round 5 the
+fd leg ran for copies too, and Keep re-baselines only the path. So after any foreign change of a copy's original, a
+chmod, an in-place rewrite or an atomic replace, every later check reported a change that no Keep could dismiss. The
+path leg alone still reports every later change at the path (`t_r5_copy_keep_sticks`, second change).
 
 **The one re-baselining point (MF5, advisor ruling).** The backing stores its acquisition stat immutably, plus one
 `_Atomic int64_t ctime_ns`. The publish job does the following when its custody's source is the displaced inode (its
@@ -141,16 +145,21 @@ further would break the copy itself: setting a user xattr needs owner write on t
 2. It takes the before-stat of a displaced source.
 3. It renames once, NOREPLACE for an absent expectation. EXIST and NOTSUP are PRE_RENAME: nothing was renamed, and the
    temp is cleaned up. Any other error is classified by observation, not by errno (round 3, review N-B):
-   - the temp name still names the held fd and the destination still matches its expectation: nothing was renamed,
-     because a rename removes its source name. That is PRE_RENAME, and the temp is removed (still ours, definitely
-     unpublished). The expectation clause is round 4 (review R3-A). Without it, a rename that was performed, followed
-     by a foreign rename moving the destination back onto our exact temp name, looked "not renamed", and file then
-     unlinked that inode and left the destination absent. Under FORCE a stale expectation never matches, so the
-     result is unknown, the safe side;
+   - the temp name still names the held fd and the destination is still what it was JUST BEFORE the rename: nothing
+     was renamed, because a rename removes its source name. That is PRE_RENAME, and the temp is removed (still ours,
+     definitely unpublished). The destination clause is round 4 (review R3-A). Without it, a rename that was
+     performed, followed by a foreign rename moving the destination back onto our exact temp name, looked "not
+     renamed", and file then unlinked that inode and left the destination absent. Round 5 (review R4-A): the baseline
+     is an observation taken immediately before `os_rename_at`, in every mode. Without FORCE it is the recheck's,
+     which equals the expectation. Under FORCE it is what the rename could displace, so a stale FORCE expectation
+     no longer turns a definite "not renamed" into UNCERTAIN with a leaked temp. A failed pre-rename observation is
+     a refusal before rename. No errno is trusted for any of this;
    - the destination names the held fd and the temp name is gone: the rename was performed despite the report, so
      publish continues;
    - anything else is RENAME_UNCERTAIN, and custody goes to HELD with nothing unlinked.
-4. It runs the rebaseline pair (§3). The verdict, `file_source_pair` OURS or FOREIGN, stays in custody.
+4. It runs the rebaseline pair (§3), for a MAPPED displaced source only. The verdict, `file_source_pair` OURS or
+   FOREIGN, stays in custody. A copy's old inode is nobody's evidence: before round 5, a drift of it in the window
+   turned our own installed text into CONFLICT (review R4-B, the third MF-E site, §14).
 5. It syncs the directory, a FOREIGN pair included (round 3: the rename happened, so the barrier is owed). On
    failure, custody goes to INSTALLED_UNSYNCED.
 6. It verifies that the path names the written fd, whose size and mtime still equal `fd_stat`. The rename moves only
@@ -487,6 +496,18 @@ Comment-free, non-blank lines (`build/r2/ncloc.py`):
 | `file.c` | 1,932 | 1,934 |
 | `file.h` | 292 | 292 |
 
+## 11b. Round 5 report
+
+Input: `docs/reviews/wave1-L2-1-opus-recheck3.md` (MF-F, R4-A, the R4l survivor), with the advisor's rulings. Red runs
+on the round 4 code are in `build/r5/red-round4.log`, green runs in `build/r5/green-round5.log`.
+
+| Item | Test | Red on round 4 | Root cause | Green |
+|---|---|---|---|---|
+| 1 MF-F | `t_r5_copy_keep_sticks` | after a chmod and Keep, `file_check` still reported a change (`:2319`) | `file_check`'s source leg compared a copy's held fd with its acquisition stat. Keep re-baselines only the path, and nothing re-baselines a copy source, so a copy buffer stayed "changed" forever. This is MF-E's rule broken at a second site. | ok, for chmod, in-place rewrite and atomic replace: Keep sticks and stays clean after a Save, and a second foreign change at the path is reported again |
+| 2 R4-A | `t_r5_force_not_renamed` | under FORCE with a stale expectation, EIO gave UNCERTAIN, HELD and a leaked temp (`:2364`) | Round 4 compared the after-look with the expectation, which FORCE never rechecked, so a definite "not renamed" could never be proved. | ok: EIO, EACCES and a real EISDIR (the name is now a directory) each give PRE_RENAME, DONE, no temp and no fd leaked |
+| 3 R4l | `t_r5_recover_transient` | green on round 4; red is mutant B9b | The rule was implemented but no test pinned "every other error keeps the obligation". | ok: EIO and EMFILE on recover's open stay FILE_ERR_IO, and the next attempt recovers. The rule is in file.h, in one sentence. |
+| 4 third site | `t_r5_copy_pair` | our installed text reported CONFLICT (`:2424`) | The rename pair compared a copy source's fd stat, which protects nothing (review R4-B). MF-E's rule broken at a third site, found by the enumeration. | ok: VERIFIED, the text installed, `file_check` clean |
+
 ## 12. Outside scope, reported only
 
 - **MF-A and MF-C**: see §10 (v2-hy8).
@@ -500,13 +521,34 @@ Comment-free, non-blank lines (`build/r2/ncloc.py`):
 - **The reviewer's suggested separate "source drift" bit** in the outcome (N-C) is not added. Round 3 keeps CONFLICT
   for both a foreign destination and a FOREIGN pair, as the advisor scoped it. Savectl's CONFLICT_CANCEL therefore
   still conflates the two.
-- **The rename pair for a COPY source** (review MF-E, last bullet) is unchanged. A FOREIGN verdict is meaningless for
-  a copy, whose bytes are private, but it can still turn an installed save of a copy buffer into CONFLICT. No round 4
-  test reaches it: after Keep, the displaced inode is not the copy's source. Report only.
+- **The rename pair for a COPY source** (review MF-E, last bullet; R4-B) was fixed in round 5: it is the third MF-E
+  site (§14, A6).
+- **Round 5 survivors and unpinned branches, by ruling elsewhere:**
+  - the destination-comparison weakenings in `observe_rename` (presence only, identity only, metadata ignored;
+    R4b–R4d), and R3-B: v2-4xk;
+  - to the backlog:
+    - the equivalent closing poll A5c;
+    - recover NOTDIR (R4j);
+    - recheck2's N13/N14 (`canonical_dest` spellings) and N16/N18 (the FORCE-over-another-inode mode, the
+      vanished-name mode);
+    - A12 (a diagnosis branch reachable only through a race);
+    - the fd-stat failure branches of A2 and A8, which have no seam: a held fd's fstat fails only on device error.
+- **`file_save_begin` still lends a copy buffer's source.** The reference is now unused by prepare and publish. It is
+  harmless (it pins one fd), and dropping it would change the custody contract that savectl's bead owns.
 - **R3-B, R3-D, the 15 surviving round 3 mutants and X12** go to the post-landing test bead, by ruling.
 - **Worklog and HANDOFF** were not written. Under Law 3 the worker does not touch session state; the coordinator does.
 
 ## 13. Lane results
+
+Round 5 stamp: BAT0 = Charging, load1 0.19 at the check start and 0.78 at the tsan start (M), 2026-11-25
+20:24–20:27 CET. Logs are in `build/r5/lane-*.log`.
+- `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189`: exit 0, `check: ok`.
+  - check-layers: 6 isolated layer links;
+  - check-san: 33 binaries, `file_test: ok (71 tests)`, `os_test: ok`;
+  - check-law2: 9 release suites, `law2_file_test: ok`;
+  - contract: PASS 64.
+- `nice make -j2 check-tsan`: exit 0. 13 threaded suites passed, `file_test: ok (71 tests)`.
+- `nice make -j2 fuzz-smoke`: exit 0. 16 fuzzers replayed their seeds.
 
 Round 4 stamp: BAT0 = Not charging, load1 0.32 at the check start and 0.89 at the tsan start (M), 2026-11-25
 06:47–06:50 CET. Logs are in `build/r4/lane-*.log`.
@@ -543,3 +585,75 @@ are in `build/r2/lane-*.log`.
   - contract: PASS 64.
 - `nice make -j2 check-tsan`: exit 0. 13 threaded suites passed, `file_test: ok (41 tests)`.
 - `nice make -j2 fuzz-smoke`: exit 0. 16 fuzzers replayed their seeds, `file_fuzz` included.
+
+## 14. The enumeration: every source and destination check in file.c (round 5)
+
+Method: every site in `src/file/file.c` that reads, compares or requires the identity or state of (a) the original
+source, the acquisition's inode, held fd or mapping; or (b) the destination, the name being saved to, recovered or
+watched. Each site gets one mutant (`build/r5/mutate5.py`) that removes or weakens it. The named test must fail; the
+results are in `build/r5/mutations-all.txt`. Lines are file.c as of this round. The rule from the MF-E ruling decides
+the kinds column: a source check applies only where bytes are read from the source, which means MAPPED. COPY appears
+for a source check only at acquisition, where the copy's bytes are read from that fd.
+
+### (a) The original source
+
+| # | file.c | Function | Kinds | What it reads or requires | Killed by (mutant) |
+|---|---|---|---|---|---|
+| A1 | 267 | `backing_poll_changed` | mapped (copy: none) | the fault epoch of the registration | `t_r2_check_fault_poll` (A1: never polls) |
+| A2 | 329 | `file_source_validate` | as called: mapped in file (prepare, Keep, validator); public for any | the held fd's stat equals the baseline (ctime included), and the poll is pristine | `t_change_in_place` (A2: fd stat ignored) |
+| A3 | 340–352 | `file_backing_validate` | mapped (copies have no piece backing) | the supplied backing is this acquisition: ctx, callbacks, bytes and len, fault id; then A2 | `t_r3_null_ctx_validator` (A3a ctx, A3b callbacks, A3c bytes/len, A3d fault id) |
+| A5 | 610–620 | `temp_prepare_core` | mapped (MF-E) | the closing poll and the lent source's full validation after the write | `t_r2_source_validation` (A5a: skipped); `t_r4_copy_after_foreign_save` (A5b: copy validated too). The poll alone (A5c) is equivalent, because A2 polls first; it goes to the backlog by ruling. |
+| A6 | 721–732 | `source_displaced` | mapped (round 5: third site) | the lent source is the displaced inode (identity equals the PRESENT expectation's) | `t_r5_copy_pair` (A6a: copy too); `t_r5_mapped_saveas_pair` (A6b: identity dropped) |
+| A7 | 740–758 | `source_rebaseline` | mapped | the before/after fstat pair of the displaced source; before equals the baseline | `t_r2_validate_after_own_save` (A7a: never stores); `t_r3_source_conflict` (A7b any difference, A7c link count); `t_r3_rebaseline_needs_baseline` (A7d) |
+| A8 | 1908–1927 | `file_check` (source leg) | mapped (round 5: MF-F) | the held fd's stat against the baseline, TRUNCATED, the fault poll | `t_r5_copy_keep_sticks` (A8a: copy too); `t_r2_keep_hardlink` (A8b: ctime); `t_r2_check_fault_poll` (A8c: poll); `t_sigbus` (A8d: TRUNCATED) |
+| A9 | 1955–1960 | `file_resolve_keep` | mapped (copy keeps anything) | the mapped inode still validates in full (A2) | `t_change_in_place` (A9: skipped) |
+| A10 | 1224–1234 | `acquire_work` (before the read) | both | the opened fd is a regular file, and the canonical name names the opened inode | `t_r5_open_identity` (A10a identity, A10b kind) |
+| A11 | 1333–1340 | `acquire_work` (after the read or map) | both: a copy's bytes ARE read from this fd | the fd's stat is unchanged by the read, and the name still names the inode | `t_r5_open_identity` (A11a name, A11b fd stat) |
+| A12 | 1192 | `acquire_work` (canonicalization failed) | both | a plain stat of the requested name, for the diagnosis only (NOTREG versus IO) | not pinned. It is reached only when `realpath` fails on an existing non-regular name, which needs a race. Diagnosis only; backlog. |
+| — | `file_save_begin` | `file_save_begin` | both | lends a source reference (`file_source_acquire`); compares nothing | — (a copy's reference is now unused by prepare and publish) |
+
+### (b) The destination
+
+| # | file.c | Function | Kinds | What it reads or requires | Killed by (mutant) |
+|---|---|---|---|---|---|
+| B1 | 516 | `temp_prepare_core` | both | a PRESENT expectation must be a regular file (NOTREG before any open) | `t_r2_fifo_destination` (B1; the child now requires NOTREG) |
+| B2 | 465–492 | `temp_metadata` | both | opens the destination non-blocking, without following the leaf. It copies metadata when the destination is the expected regular file, refuses a different one (non-FORCE), and otherwise picks the mode: the observed one, or new-file only when there is no destination. | `t_save_metadata_xattr` (B2a: no copy); `t_r2_fifo_destination` (B2b: blocking open); `t_r4_copy_after_foreign_save` (B2c: no early refusal); `t_r3_unreadable_dest` (B2d: unreadable mode). FORCE-over-another-inode's mode and the vanished-name mode are not pinned (recheck2 N16/N18, backlog); R3-B is in v2-4xk. |
+| B3 | 807–820 | `temp_publish_core` | both | the observation just before the rename: it equals the expectation without FORCE; it is the baseline for "not renamed" | `t_save_changed_refused` (B3a: no recheck); `t_r5_force_not_renamed` (B3b: stale expectation under FORCE) |
+| B4 | 825–829 | `temp_publish_core` | both | NOREPLACE when the expectation is ABSENT | `t_r2_exist_race` (B4) |
+| B5 | 830–837 | `temp_publish_core` | both | EXIST/NOTSUP: definitely not renamed; the temp is removed | `t_r2_exist_race` (B5) |
+| B6 | 771–786 | `observe_rename` | both | after a failed rename: is the temp name ours, is the destination ours, is the destination still the pre-rename observation | `t_r4_rename_back` (B6a); `t_r5_renamed_despite_eio` (B6b); `t_r2_uncertain_rename` (B6c); `t_r5_temp_name_swapped` (B6d). Presence-only, identity-only and metadata-ignoring weakenings of the destination comparison are v2-4xk. |
+| B7 | 655–664, 873 | `temp_proven`, `temp_retry_core` | both | the name names the written fd, with the size and mtime captured after the sync; the HELD retry needs that proof | `t_save_foreign_after_rename` (B7a); `t_r3_installed_touched` (B7b); `t_r3_held_retry_proof` (B7c) |
+| B8 | 895–947 | `witness_check` | both | the regular-file kind, name → fd, witness identity and size, full CRC, a stable re-stat, and the name re-checked | `t_r5_recover_fifo` (B8d kind); `t_r3_recover` (B8e identity); `t_r3_verify` (B8a CRC, B8b re-stat, B8c name) |
+| B9 | 1026–1037 | `file_temp_recover` | both | what the open's error says about the name: NOENT, NOTDIR or ACCESS is CHANGED; LOOP or ISDIR is NOTREG; anything else is IO | `t_r4_recover_unreadable_absent` (B9a); `t_r5_recover_transient` (B9b); `t_r3_recover` (B9c). NOTDIR is in the backlog by ruling (R4j). |
+| B10 | 1394–1410, 1423 | `canonical_dest` | both | the destination's directory, resolved, so the own-path test compares like with like | `t_r3_relative_own_path` (B10). recheck2 N13/N14 are backlog. |
+| B11 | 1507–1508 | `save_settle` | both | VERIFIED adoption only for a save to `file_path(f)` | `t_r3_saveas_keeps_baseline` (B11a); `t_r2_barrier_retry_async` (B11b) |
+| B12 | 1895–1902 | `file_check` (path leg) | both | the path against the path baseline; a failed observation is a change | `t_r5_copy_keep_sticks` (B12: leg dropped); `t_r5_check_unobservable` (B12b: failure not a change) |
+| B13 | 1943–1949 | `file_resolve_keep` | both | the path observed (a failure refuses), and a non-regular path refused | `t_r5_check_unobservable` (B13b: failure adopted); `t_r5_keep_kind` (B13) |
+| B14 | 2034 | `file_watch_poll` | both | an event for our leaf, the directory itself, or an overflow runs `file_check` | `t_watch` (B14: never matches) |
+| B15 | 418–419 | `temp_unlink_own` | both | the temp name still names our fd before any unlink | `t_r3_unlink_identity` (B15) |
+
+59 mutants in all (P, the rows of `build/r5/mutations-all.txt`): 58 killed by their named test, and A5c is equivalent.
+Two early "kills" were fixture artefacts: B13b failed on a directory a failed B12b run had left closed, and a FIFO left
+by a failed B13 run hung the suite. Both tests now clear their fixtures first, and those mutants were re-run with
+genuine kills.
+
+**Third site found and fixed:** A6, the rename pair, for a copy source (review R4-B, `t_r5_copy_pair`). No other
+source check protects nothing for copies:
+- A10 and A11 guard the read that fills a copy;
+- A2 and A3 are reached for copies only by a public caller;
+- A9 already skips copies.
+
+Changed lines against round 4 (`diff`, + added / − removed):
+
+| File | Added | Removed |
+|---|---|---|
+| `src/file/file.c` | 48 | 26 |
+| `src/file/file.h` | 12 | 8 |
+| `tests/file_test.c` | 382 | 2 |
+
+Comment-free, non-blank lines (`build/r2/ncloc.py`):
+
+| File | Before round 5 | After |
+|---|---|---|
+| `file.c` | 1,934 | 1,943 |
+| `file.h` | 292 | 292 |

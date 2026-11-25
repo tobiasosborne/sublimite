@@ -714,10 +714,20 @@ static int temp_barrier_and_verify(file_temp *t, const prepare_args *hooks,
     return rc;
 }
 
-/* The source is the displaced generation: our rename drops its link. */
+/* The source is the displaced generation: our rename drops its link.
+ * Mapped sources only: the pair exists to keep a mapped backing's bytes
+ * validating; a copy's bytes are private, so its old inode's drift is
+ * nobody's evidence (enumeration §14, the third MF-E site). */
 static bool source_displaced(const file_temp *t)
 {
-    return t->source != NULL && t->expect.presence == FILE_PRESENT &&
+    if (t->source == NULL) return false;
+    switch (t->source->mode) {
+    case FILE_MODE_MMAP:
+        break;
+    case FILE_MODE_COPY:
+        return false;
+    }
+    return t->expect.presence == FILE_PRESENT &&
            identity_eq(&t->source->stat.id, &t->expect.stat.id);
 }
 
@@ -750,14 +760,16 @@ static file_source_pair source_rebaseline(file_source *b, os_err before_err,
 
 /* What a rename that reported an error actually did, by observation
  * (review N-B): the temp name still naming our fd, with the destination
- * still matching its expectation, proves nothing was renamed (a rename
- * removes its source name; the expectation rules out a foreign rename
- * that moved an installed destination back onto our temp name, R3-A);
+ * still what it was just before the rename (pre), proves nothing was
+ * renamed (a rename removes its source name; pre rules out a foreign
+ * rename that moved an installed destination back onto our temp name,
+ * R3-A). pre is the recheck's observation without FORCE, which equals the
+ * expectation, and a fresh one under FORCE (R4-A);
  * the destination naming our fd with the temp name gone proves it was;
  * anything else is unknown and unlinks nothing. The errno proves neither. */
 typedef enum rename_effect { RENAME_NOT_DONE, RENAME_DONE, RENAME_UNKNOWN } rename_effect;
 
-static rename_effect observe_rename(const file_temp *t)
+static rename_effect observe_rename(const file_temp *t, const file_expectation *pre)
 {
     os_stat mine;
     file_expectation at_tmp, at_dest;
@@ -767,7 +779,7 @@ static rename_effect observe_rename(const file_temp *t)
         return RENAME_UNKNOWN;
     bool tmp_ours = at_tmp.presence == FILE_PRESENT && identity_eq(&at_tmp.stat.id, &mine.id);
     bool dest_ours = at_dest.presence == FILE_PRESENT && identity_eq(&at_dest.stat.id, &mine.id);
-    if (tmp_ours && !dest_ours && file_expectation_diff(&t->expect, &at_dest) == FILE_CHG_NONE)
+    if (tmp_ours && !dest_ours && file_expectation_diff(pre, &at_dest) == FILE_CHG_NONE)
         return RENAME_NOT_DONE;
     if (dest_ours && !tmp_ours) return RENAME_DONE;
     return RENAME_UNKNOWN;
@@ -789,11 +801,16 @@ static int temp_publish_core(file_temp *t, const prepare_args *hooks,
         return FILE_ERR_STATE; /* at most one rename, only from SYNCED */
     }
 
-    if ((t->flags & FILE_SAVE_FORCE) == 0) {
-        file_expectation now;
+    /* The destination just before the rename, in every mode: without
+     * FORCE it must equal the expectation; under FORCE it is what the
+     * rename may displace. Either way it is the baseline for "nothing
+     * was renamed" below. A failed observation refuses, before rename. */
+    file_expectation pre;
+    {
         os_err oe = OS_OK;
-        int rc = file_expectation_observe_at(&t->dir, t->base, &now, &oe);
-        if (rc == FILE_OK && file_expectation_diff(&t->expect, &now) != FILE_CHG_NONE)
+        int rc = file_expectation_observe_at(&t->dir, t->base, &pre, &oe);
+        if (rc == FILE_OK && (t->flags & FILE_SAVE_FORCE) == 0 &&
+            file_expectation_diff(&t->expect, &pre) != FILE_CHG_NONE)
             rc = FILE_ERR_CHANGED;
         if (rc != FILE_OK) {
             out->pub = FILE_PUB_PRE_RENAME;
@@ -821,7 +838,7 @@ static int temp_publish_core(file_temp *t, const prepare_args *hooks,
     }
     if (e != OS_OK) {
         out->oserr = e;
-        switch (observe_rename(t)) {
+        switch (observe_rename(t, &pre)) {
         case RENAME_NOT_DONE:
             out->pub = FILE_PUB_PRE_RENAME; /* still ours, definitely unpublished */
             temp_release(t, true);
@@ -1884,24 +1901,29 @@ bool file_check(file *f, uint32_t *reasons)
             bits |= file_expectation_diff(&f->baseline, &now);
         }
     }
+    /* The source leg: the mapped inode the text reads. A copy buffer's old
+     * inode backs nothing on screen, so it has no source leg (review MF-F;
+     * the rule of file.h file_temp_prepare). The path leg above sees every
+     * change at the path for both kinds. */
     if (f->backing != NULL) {
         file_source *b = f->backing;
-        if (backing_poll_changed(b)) bits |= FILE_CHG_FAULTED;
-        file_expectation want = { .presence = FILE_PRESENT, .stat = source_baseline(b) };
-        file_expectation got;
-        os_err oe = OS_OK;
-        if (file_expectation_observe_fd(&b->fd, &got, &oe) != FILE_OK) {
-            bits |= FILE_CHG_METADATA; /* review N3 */
-            f->oserr = oe;
-        } else {
-            bits |= file_expectation_diff(&want, &got); /* ctime included (MF6) */
-            switch (b->mode) {
-            case FILE_MODE_MMAP:
+        switch (b->mode) {
+        case FILE_MODE_COPY:
+            break;
+        case FILE_MODE_MMAP: {
+            if (backing_poll_changed(b)) bits |= FILE_CHG_FAULTED;
+            file_expectation want = { .presence = FILE_PRESENT, .stat = source_baseline(b) };
+            file_expectation got;
+            os_err oe = OS_OK;
+            if (file_expectation_observe_fd(&b->fd, &got, &oe) != FILE_OK) {
+                bits |= FILE_CHG_METADATA; /* review N3 */
+                f->oserr = oe;
+            } else {
+                bits |= file_expectation_diff(&want, &got); /* ctime included (MF6) */
                 if (got.stat.size < b->backing.len) bits |= FILE_CHG_TRUNCATED;
-                break;
-            case FILE_MODE_COPY:
-                break;
             }
+            break;
+        }
         }
     }
     f->last_reasons = bits;

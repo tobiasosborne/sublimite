@@ -389,9 +389,11 @@ int file_temp_verify(const file_temp *t, file_expectation *installed,
  * followed) and its parent; on a stable fd/path match to the whole
  * witness, transfer the descriptors, destination name and witness to
  * the temp in INSTALLED_UNSYNCED. Finish with file_temp_retry_barrier.
- * On mismatch (FILE_ERR_CHANGED: absent, unreadable or different;
- * FILE_ERR_NOTREG: a symlink or directory) or I/O failure release every
- * partial acquisition and leave the temp EMPTY. */
+ * On mismatch or I/O failure release every partial acquisition and
+ * leave the temp EMPTY. Opening the name, NOENT, NOTDIR and ACCESS mean
+ * the named file is gone or unreadable (FILE_ERR_CHANGED), LOOP and
+ * ISDIR mean it is not a regular file (FILE_ERR_NOTREG), and every other
+ * error is FILE_ERR_IO, which keeps the recovery obligation. */
 int file_temp_recover(file_temp *t, const char *path,
                       const file_witness *prepared, os_err *oserr);
 /* Release custody and reach DONE. A SYNCED temp is still ours and
@@ -617,11 +619,13 @@ void file_reload_discard(file *f);
 
 /* ---- change detection ---- */
 
-/* Observe path + held fd + one closing fault poll against the
- * baselines. Returns true when changed (sticky); *reasons (optional)
- * receives this check's FILE_CHG_* bits. A failed observation (path or
- * fd) is a change: FILE_CHG_METADATA, and file_os_err says why. UI
- * thread; two stats. */
+/* Observe the path against the path baseline and, for a mapped backing
+ * only, the held fd and one closing fault poll against the backing's
+ * baseline (a copy buffer's old inode backs nothing on screen). Returns
+ * true when changed (sticky); *reasons (optional) receives this check's
+ * FILE_CHG_* bits. A failed observation (path or fd) is a change:
+ * FILE_CHG_METADATA, and file_os_err says why. UI thread; at most two
+ * stats. */
 bool file_check(file *f, uint32_t *reasons);
 bool file_changed(const file *f);
 /* "Keep mine": adopt the observed disk state as the new path baseline,
