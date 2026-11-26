@@ -109,8 +109,9 @@ branches: push each at every pause or session end; delete the remote branch once
     savectl bead.
   - STATE 2026-11-26 01:20 (supersedes the queues below where they differ):
     - Render: round 3 is wip 48a3210 on t3/w2-render. Astra's r3 re-check (d4e406c): F1–F3 FIXED, the four
-      survivors killed, no MUST-FIX. Three new mutants (A, C, D) survived on correct code. Sol is on round 3b, kill
-      tests only.
+      survivors killed, no MUST-FIX. Three new mutants (A, C, D) survived on correct code. Round 3b (kill tests for A, C, D; tests only)
+      is wip ea4b825: each red on its mutant, green on pristine; all lanes pass. Layout is held at 01:25 because
+      Codex is +1.5 ahead of pace; it is dispatched at the first hourly reading at or behind pace.
     - Viewport: 318f5d2, plus the mutant log 86c827d (30/31 killed; N10 survived and needs a kill test before the
       landing).
     - ADVISOR RULES (01:15):
