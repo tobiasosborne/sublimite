@@ -4,7 +4,38 @@ Read order: this file → `CLAUDE.md` → `docs/PLAN_V2.md`. Beads: `bd` in this
 (prefix `v2`; docs/decisions/wave0-beads-and-oracle-pin.md §1). Push branch `v2` after every verified landing. Wip
 branches: push each at every pause or session end; delete the remote branch once its bead lands on v2 (Tobias, 2026-11-24).
 
-## Session 2 (2026-11-24 evening) — IN PROGRESS (worklog 2026-11-24 "Session 2")
+## PAUSED 2026-11-26 (~12:15 CET): Tobias returns in a couple of days
+Tobias (via the advisor), verbatim: "at the moment we stop work; I will return to this project in a couple of days".
+Nothing is running; no wakes or scheduled tasks are left.
+
+(a) IN FLIGHT, all pushed:
+- Viewport v2-1sg, t3/w2-viewport at 6977a6d:
+  - round 4 at 318f5d2; the mutant log 86c827d (30/31; N10 survived);
+  - 6977a6d is Sol's N10 kill test, CANCELLED mid-step: it touches only tests/viewport_test.c, and red/green is not yet shown.
+- Render v2-jj1, t3/w2-render at ea4b825:
+  - round 3 at 48a3210, Astra's re-check d4e406c (F1–F3 fixed, no MUST-FIX);
+  - round 3b at ea4b825 (kill tests for A, C, D).
+  - It awaits the advisor's read.
+- Layout v2-tk8: not started beyond the parked draft (build/layout-draft/ in the viewport worktree; note docs/decisions/v2-tk8.md).
+- v2-4xk (L2 file round 2 follow-up): the F1 fix round is held for Claude room.
+- Quiet-box benches, done 11:55, both probative: figures in the 12:05 STATE block below; logs under build/ in each worktree.
+- 53 other T3 worktrees were wip-committed locally with "wip: preserved at the 2026-11-26 pause" (these are reviewer and worker
+  leftovers; nothing was discarded). /home/tobias/Projects/sublimite-v1-inspect is dirty (11 files, detached HEAD) and was left
+  untouched (it is a v1 inspection checkout).
+
+(b) RESUME ORDER:
+1. Reboot hygiene: /tmp fixtures and corpus; Xvfb with -noreset.
+2. Quiet-box benches, only if the code changed since 11:55.
+3. Layout to Sol in the viewport worktree, with the N10 kill test (finish 6977a6d: red on the mutant, green on pristine) as its own
+   first commit. Bases: render_types.h verbatim from ea4b825; the edit_change typedef verbatim from the signed edit text.
+4. The v2-4xk F1 fix round on Claude, at Claude 1.0 or more behind pace.
+5. The advisor's viewport and render reads, in ONE batched message.
+
+(c) OPEN QUESTION FOR TOBIAS: how do the two T3 projects (sublimité v2, and the project behind "Project Overview and Master Sync",
+which ran Opus orchestrators overnight) share Claude's weekly room? On 2026-11-26 the other project moved Claude from 20 % to 24 %
+while every v2 Claude job was held.
+
+## Session 2 (2026-11-24 evening) — PAUSED 2026-11-26 (worklog 2026-11-24 "Session 2")
 - BINDING RULE (Tobias, 22:00 CET, verbatim): "work up to but not exceeding pace on any provider. coordinate serial
   work." The advisor's reading, which replaces every earlier lane count:
   - At most one running job per provider. Landings go one at a time, in dependency order.
