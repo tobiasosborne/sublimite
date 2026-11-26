@@ -840,6 +840,18 @@ static void interior_paste(viewport_motion *m)
     interior_walk(m, text, sizeof text);
 }
 
+/* The proof between a and b starts the whole b+mark cluster. Advancing
+ * that proof by one byte would treat the combining mark as independent. */
+static void ascii_pair_proof_offset(viewport_motion *m)
+{
+    viewport_flat f = flat_open(TEXT("ab\xcc\x81"), 0);
+    viewport_frame frame;
+    assert(viewport_plan((viewport_anchor){0}, 80, 20, 10, &frame));
+    viewport_intent in = intent(VIEWPORT_LEFT, f.length, f.length);
+    selection(flat_motion(m, &f, in, frame, 1), 1, 1, false);
+    flat_close(&f);
+}
+
 static void scalar_edges(viewport_motion *m)
 {
     viewport_frame frame;
@@ -897,7 +909,7 @@ int main(int argc, char **argv)
         {"follow", follow_clamp}, {"rejected-word", rejected_word}, {"rejected-select", rejected_select},
         {"synthetic-clip", synthetic_clip}, {"synthetic-wrap", synthetic_wrap}, {"active-proof", active_row_proof},
         {"rank-wake", newer_rank}, {"emoji-endpoint", interior_emoji}, {"paste-endpoint", interior_paste},
-        {"scalar-edges", scalar_edges}
+        {"scalar-edges", scalar_edges}, {"ascii-pair-proof-offset", ascii_pair_proof_offset}
     };
     bool matched = argc == 1;
     if (argc == 1 || (argc == 2 && !strcmp(argv[1], "accept"))) {
