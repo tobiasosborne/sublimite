@@ -107,6 +107,22 @@ branches: push each at every pause or session end; delete the remote branch once
   - Source witness: SIGNED at 9968034 as v2-hy8's contract.
   - New bead v2-4xk (Claude): file's publish/verify results name the changed side (source vs destination). It blocks the
     savectl bead.
+  - STATE 2026-11-26 01:20 (supersedes the queues below where they differ):
+    - Render: round 3 is wip 48a3210 on t3/w2-render. Astra's r3 re-check (d4e406c): F1–F3 FIXED, the four
+      survivors killed, no MUST-FIX. Three new mutants (A, C, D) survived on correct code. Sol is on round 3b, kill
+      tests only.
+    - Viewport: 318f5d2, plus the mutant log 86c827d (30/31 killed; N10 survived and needs a kill test before the
+      landing).
+    - ADVISOR RULES (01:15):
+      - No status messages to the advisor; status goes in HANDOFF only. Message only for a decision the signed texts
+        cannot settle, or for a read, and only while Claude is at least 1.0 behind. One batched message.
+      - Act on worker completions only. Quota is read at most hourly while Claude is at or ahead of pace.
+      - LAYOUT starts once 3b is in, on one Codex lane, while Codex is under 2.0 behind. Sol adds only the edit_change
+        typedef to the edit.h stub, verbatim from the signed edit text. EDIT-CORE's finishing pass replaces the stub.
+    - Claude order once Claude is 1.0 behind:
+      1. the v2-4xk F1 fix round;
+      2. ONE message to the advisor: viewport (the diff, the N10 kill test, the quiet-box bench) and render (the
+         diff, 7b492a0..3b).
   - CLAUDE QUEUE, each at room >= 1.0, one at a time:
     1. L2-1 round 3's re-check, then the advisor's owner read, then the landing with wake-on-drain (1.32) adopted at
        the merge;
