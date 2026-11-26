@@ -124,6 +124,23 @@ branches: push each at every pause or session end; delete the remote branch once
       1. the v2-4xk F1 fix round;
       2. ONE message to the advisor: viewport (the diff, the N10 kill test, the quiet-box bench) and render (the
          diff, 7b492a0..3b).
+  - STATE 2026-11-26 12:05 (the box was rebooted about 11:00, so /tmp is wiped; both worktrees were clean at 86c827d and ea4b825):
+    - QUIET-BOX BENCHES, run by the coordinator at no model quota. Both PROBATIVE (load1 below 2 at start and end, no lane,
+      AC, BAT0 Not charging):
+      - Viewport, 86c827d (viewport.c identical to 318f5d2). Load1 1.53 at start, 1.53 at end.
+        - Ordinary motions: p50 68–151 ns, p99 at most 304 ns.
+        - Worst fixture, the 65,540-byte accepted cluster: p50 268–418 µs, p99 295–512 µs.
+        - Log: <viewport wt>/build/viewport-r4/bench-quiet-1126.log.
+      - Render item 9, ea4b825. Load1 1.69 at start, 1.91 at end.
+        - 360x120 full-runtime: submit-cpu p50/p99 75/137 µs.
+        - 360x300 full-sheet: submit-cpu p50/p99 198/593 µs.
+        - 360x300 full-runtime: submit-cpu p50/p99 235/504 µs, against the 500 µs UI slice (G).
+        - memcpy alone: p99 up to 520 µs.
+        - The p99 at the largest sheet is at or just over the slice. For the advisor's render read.
+        - Log: <render wt>/build/render-r3/bench-quiet-1126.log.
+    - LAYOUT (v2-tk8) is dispatched to Sol at 12:00 in the viewport worktree, on one Codex lane (Codex was 0.8 behind).
+      - Step 1 is the N10 kill test, viewport test file only; I commit it on its own.
+      - render_types.h is copied verbatim from ea4b825.
   - CLAUDE QUEUE, each at room >= 1.0, one at a time:
     1. L2-1 round 3's re-check, then the advisor's owner read, then the landing with wake-on-drain (1.32) adopted at
        the merge;
