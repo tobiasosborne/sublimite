@@ -150,3 +150,23 @@ The Round 3 diff adds 497 and removes 96 text lines for code, build and tests. I
 | `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189` | Passed, exit 0. Export gate, 31 lane fixtures, 6 isolated layer links, 34 sanitizer suites, 10 Law 2 suites and all 64 contract harness records passed. |
 | `nice make -j2 check-tsan` | Passed, exit 0. All 14 threaded suites passed. |
 | `nice make -j2 fuzz-smoke` | Passed, exit 0. All 17 fuzzers replayed their seeds. |
+
+## Round 3b mutation witnesses
+
+Based on 48a3210 and [Astra’s Round 3 re-check](../reviews/wave2-render-astra-r3.md). The three new witnesses run in the existing render unit suite. Production sources stay unchanged. Each mutant was built independently with the same test source and hook settings, from a checkout-local source copy. The complete pristine suite ran after the three red runs.
+
+| Mutant | Named witness | Red on mutant | Green on pristine |
+|---|---|---|---|
+| A, skip first-packet bind | `stock_atlas` | Exit 1. The stock owner retired the frame, then the accepted runtime texel differed from the probe's submitted coverage byte, 63. | Exit 0. The retired scene samples 63 at that texel. |
+| C, leave READY after loss | `untaken_after_loss` | Exit 1. The manual owner claimed the old command after epoch loss reached UNBOUND. The test released it without reading it. | Exit 0. No command could be claimed. |
+| D, keep feedback ready after STOP | `partial_batch_after_loss` | Exit 1. The stock mailbox returned a notice after loss reached UNBOUND. The test had routed only ISSUED before loss. | Exit 0. The mailbox was empty. |
+
+The red and green executions are recorded in `build/round3b/mutation-receipts.log`.
+
+### Final Round 3b lanes
+
+| Command | Result |
+|---|---|
+| `nice make -j2 check CONTRACT_CHECK_DISPLAYS=:180-:189` | Passed, exit 0. Export gate, 31 lane fixtures, 6 isolated layer links, 34 sanitizer suites, 10 Law 2 suites and all 64 contract records passed. |
+| `nice make -j2 check-tsan` | Passed, exit 0. All 14 threaded suites passed. |
+| `nice make -j2 fuzz-smoke` | Passed, exit 0. All 17 fuzzers replayed their seeds. |

@@ -4,10 +4,10 @@
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "render_test:%s:%d: %s\n", __func__, __LINE__, #c); return 1; } } while (0)
 
-static int start(render_fixture *f)
+static int start_with_driver(render_fixture *f, render_driver driver)
 {
     rf_init(f);
-    f->setup.driver = render_test_manual_null();
+    f->setup.driver = driver;
     /* One page per live fixture row is ample for the two tiny scene copies,
      * atlas, packet, metadata and setup. */
     CHECK(base_arena_init(&f->arena, (RF_ROWS + 1u) * os_page_size()) == 0);
@@ -20,6 +20,11 @@ static int start(render_fixture *f)
     render_stats(f->r, &c);
     CHECK(c.state == RENDER_IDLE_FULL);
     return 0;
+}
+
+static int start(render_fixture *f)
+{
+    return start_with_driver(f, render_test_manual_null());
 }
 
 static int stop(render_fixture *f)
@@ -738,10 +743,75 @@ static int stop_with_taken_packet(bool loss)
 static int close_with_taken_packet(void) { return stop_with_taken_packet(false); }
 static int loss_with_taken_packet(void) { return stop_with_taken_packet(true); }
 
+static int stock_atlas(void)
+{
+    render_fixture f;
+    CHECK(start_with_driver(&f, render_driver_null()) == 0);
+    const uint8_t ink = 63; /* Known runtime coverage from Astra's stock_atlas probe. */
+    rf_notify(&f, 0, ink);
+    rf_wide(&f, 0, f.tiles[0].image);
+    rf_offer(&f, RENDER_FULL);
+    f.offer.tile_descriptors = 1;
+    f.offer.tile_bytes = RF_TILE;
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK && rf_finish_public(&f));
+
+    render_sample sample = rf_sample(&f, 0);
+    CHECK(sample.coverage && sample.coverage[0] == ink);
+    return stop(&f);
+}
+
+static int untaken_after_loss(void)
+{
+    render_fixture f;
+    CHECK(start(&f) == 0); /* Explicit owner scheduling keeps the command READY. */
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    CHECK(notice(&f, (render_frame_id){id.epoch, 0}, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) ==
+          RENDER_LOST);
+    render_counters c;
+    render_stats(f.r, &c);
+    CHECK(c.state == RENDER_UNBOUND);
+
+    render_test_owner owner = render_test_owner_get(f.r);
+    const render_packet *old = rf_take(owner);
+    if (old) render_driver_release(owner.port);
+    CHECK(!old);
+    return stop(&f);
+}
+
+static int partial_batch_after_loss(void)
+{
+    render_fixture f;
+    CHECK(start_with_driver(&f, render_driver_null()) == 0);
+    rf_offer(&f, RENDER_FULL);
+    render_frame_id id;
+    CHECK(rf_submit(&f, &id, NULL) == RENDER_OK);
+    CHECK(rf_wait_wake(&f.wake, os_now_ns() + RF_OWNER_DEADLINE_NS));
+    os_wake_drain(&f.wake);
+
+    render_wake wake;
+    CHECK(render_pending(f.r, &wake) && wake.feedback.take);
+    render_notice first;
+    CHECK(wake.feedback.take(wake.feedback.ctx, &first) && first.kind == RENDER_NOTICE_ISSUED);
+    CHECK(render_event(f.r, &first) == RENDER_OK);
+    /* Leave device and presentation notices queued when STOP runs. */
+    CHECK(notice(&f, (render_frame_id){id.epoch, 0}, RENDER_NOTICE_LOST, RENDER_UNTIMED, 0) ==
+          RENDER_LOST);
+    render_counters c;
+    render_stats(f.r, &c);
+    CHECK(c.state == RENDER_UNBOUND);
+    render_notice stale;
+    CHECK(!wake.feedback.take(wake.feedback.ctx, &stale));
+    return stop(&f);
+}
+
 int main(void)
 {
     return lifecycle() || staged_binding() || delivery() || physical_retirement() || bounds() ||
         verify_identity_policy() || backend_poll_stays_off_submit() || wide_right_reserved_refuses() ||
         input_bearing_submit_skips_replay() || command_owner_wake_is_signalled() ||
-        close_with_taken_packet() || loss_with_taken_packet();
+        close_with_taken_packet() || loss_with_taken_packet() || stock_atlas() ||
+        untaken_after_loss() || partial_batch_after_loss();
 }
